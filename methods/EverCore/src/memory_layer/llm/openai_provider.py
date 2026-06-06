@@ -58,9 +58,16 @@ class OpenAIProvider(LLMProvider):
         self.provider_type = (
             provider_type or "openrouter"  # skip-sensitive-check
         ).lower()
-        self._key_rotator = (
-            ApiKeyRotator.get_or_create(api_key) if api_key else ApiKeyRotator([""])
-        )
+        # An empty api_key here would otherwise yield a rotator rotating
+        # an empty string, which silently 401s on every call. Fail loudly
+        # instead so the misconfiguration is obvious in logs.
+        if not api_key:
+            raise ValueError(
+                f"OpenAIProvider requires a non-empty api_key "
+                f"(provider_type={self.provider_type!r}, model={self.model!r}). "
+                f"Check that the *_API_KEY environment variable is set."
+            )
+        self._key_rotator = ApiKeyRotator.get_or_create(api_key)
         self.base_url = base_url
 
         self._validate_model_whitelist(self.provider_type, model)

@@ -7,10 +7,10 @@ from memory_layer.llm.api_key_rotator import ApiKeyRotator
 
 @pytest.fixture(autouse=True)
 def _reset_shared_rotator():
-    """Ensure each test starts with a clean singleton state."""
-    ApiKeyRotator._shared = None
+    """Ensure each test starts with a clean shared-instance cache."""
+    ApiKeyRotator.clear_shared()
     yield
-    ApiKeyRotator._shared = None
+    ApiKeyRotator.clear_shared()
 
 
 class TestApiKeyRotator:
@@ -99,6 +99,40 @@ class TestApiKeyRotatorGetOrCreate:
 
     def test_new_instance_after_clearing_shared(self) -> None:
         r1 = ApiKeyRotator.get_or_create("key-a,key-b")
-        ApiKeyRotator._shared = None
+        ApiKeyRotator.clear_shared()
         r2 = ApiKeyRotator.get_or_create("key-a,key-b")
         assert r1 is not r2
+
+    def test_distinct_key_sets_get_distinct_instances(self) -> None:
+        """Per-key-set cache: two different key sets must not share a rotator.
+
+        Regression: previously the singleton was a single instance pinned
+        to the first key set, so e.g. default Qwen and custom Agnes
+        providers would both end up using whichever key set was registered
+        first, silently breaking the second provider (HTTP 401).
+        """
+        r_qwen = ApiKeyRotator.get_or_create("qwen-key")
+        r_agnes = ApiKeyRotator.get_or_create("agnes-key")
+        r_gemini = ApiKeyRotator.get_or_create("gemini-key-a,gemini-key-b")
+        assert r_qwen is not r_agnes
+        assert r_qwen is not r_gemini
+        assert r_agnes is not r_gemini
+        assert r_qwen.size == 1
+        assert r_agnes.size == 1
+        assert r_gemini.size == 2
+        # Cycle state is independent per rotator
+        assert r_qwen.get_next() == "qwen-key"
+        assert r_agnes.get_next() == "agnes-key"
+
+    def test_same_key_set_returns_same_instance(self) -> None:
+        r1 = ApiKeyRotator.get_or_create("key-a,key-b")
+        r2 = ApiKeyRotator.get_or_create(" key-a , key-b ")  # whitespace normalized
+        r3 = ApiKeyRotator.get_or_create("key-a,key-b,")  # trailing comma ignored
+        assert r1 is r2 is r3
+
+    def test_clear_shared_empties_all_instances(self) -> None:
+        ApiKeyRotator.get_or_create("key-a")
+        ApiKeyRotator.get_or_create("key-b")
+        assert len(ApiKeyRotator._shared) == 2
+        ApiKeyRotator.clear_shared()
+        assert ApiKeyRotator._shared == {}

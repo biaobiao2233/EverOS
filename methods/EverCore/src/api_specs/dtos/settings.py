@@ -52,7 +52,8 @@ class LlmCustomSetting(BaseModel):
     Example:
         {
             "boundary": {"provider": "openai", "model": "gpt-4.1-mini"},
-            "extraction": {"provider": "openrouter", "model": "qwen/qwen3-235b-a22b-2507"}
+            "extraction": {"provider": "openrouter", "model": "qwen/qwen3-235b-a22b-2507"},
+            "profile": {"provider": "openai", "model": "gpt-4o"}
         }
     """
 
@@ -65,6 +66,11 @@ class LlmCustomSetting(BaseModel):
         default=None,
         description="LLM config for memory extraction (high quality model recommended)",
         examples=[{"provider": "openrouter", "model": "qwen/qwen3-235b-a22b-2507"}],
+    )
+    profile: Optional[LlmProviderConfig] = Field(
+        default=None,
+        description="LLM config for user/group profile extraction",
+        examples=[{"provider": "openai", "model": "gpt-4o"}],
     )
     extra: Optional[Dict[str, Any]] = Field(
         default=None, description="Additional task-specific LLM configurations"
@@ -95,6 +101,7 @@ class UpdateSettingsRequest(BaseModel):
                     "provider": "openrouter",
                     "model": "qwen/qwen3-235b-a22b-2507",
                 },
+                "profile": {"provider": "openai", "model": "gpt-4o"},
             }
         ],
     )

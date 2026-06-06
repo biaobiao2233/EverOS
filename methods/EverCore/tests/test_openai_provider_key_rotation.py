@@ -11,10 +11,10 @@ from memory_layer.llm.api_key_rotator import ApiKeyRotator
 
 @pytest.fixture(autouse=True)
 def _reset_shared_rotator():
-    """Ensure each test starts with a clean singleton state."""
-    ApiKeyRotator._shared = None
+    """Ensure each test starts with a clean shared-instance cache."""
+    ApiKeyRotator.clear_shared()
     yield
-    ApiKeyRotator._shared = None
+    ApiKeyRotator.clear_shared()
 
 
 def _success_body(content: str = "hello") -> dict:

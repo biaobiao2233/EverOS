@@ -19,7 +19,8 @@ class ApiKeyRotator:
 
     Spreads rate-limit pressure across multiple keys. Behaves identically
     to a single key when only one key is supplied. Process-level shared
-    instance available via ``get_or_create``.
+    instances available via ``get_or_create``, keyed by the normalized key
+    tuple (so distinct providers with distinct keys get distinct rotators).
 
     Args:
         keys: One or more API keys for rotation.
@@ -28,7 +29,11 @@ class ApiKeyRotator:
         Relies on asyncio single-threaded event loop; not thread-safe.
     """
 
-    _shared: ClassVar["ApiKeyRotator | None"] = None
+    # Per-key-set shared instances. Keyed by the normalized key tuple so
+    # that two providers with different keys (e.g. default Qwen vs. custom
+    # Agnes) each get their own rotator instead of all callers being
+    # silently pinned to the first key set that happened to be created.
+    _shared: ClassVar[dict[tuple[str, ...], "ApiKeyRotator"]] = {}
 
     def __init__(self, keys: Sequence[str]) -> None:
         if not keys:
@@ -62,6 +67,10 @@ class ApiKeyRotator:
             )
         return tuple(self._keys[(start_idx + i) % self.size] for i in range(self.size))
 
+    def get_next(self) -> str:
+        """Return the next key in the rotation (single-key convenience)."""
+        return self.get_rotation()[0]
+
     @property
     def size(self) -> int:
         """Number of API keys in the rotation pool."""
@@ -69,22 +78,29 @@ class ApiKeyRotator:
 
     @classmethod
     def get_or_create(cls, raw: str) -> "ApiKeyRotator":
-        """Get the process-level shared instance, creating it on first call.
+        """Get the process-level shared instance for the given key set, creating it on first call.
 
-        Subsequent calls return the existing instance; ``raw`` is only used
-        for the initial creation and is ignored afterward.
+        The process-level cache is keyed by the normalized key tuple, so
+        different providers (e.g. default Qwen vs. custom Agnes) get
+        distinct rotators. Repeated calls with the same key set return
+        the same instance; calls with a new key set create a new one.
         """
-        if cls._shared is None:
-            keys = [k.strip() for k in raw.split(",") if k.strip()]
-            cls._shared = cls(keys)
-        else:
-            new_keys = tuple(k.strip() for k in raw.split(",") if k.strip())
-            if new_keys != cls._shared._keys:
-                logger.warning(
-                    "ApiKeyRotator: get_or_create called with different keys, "
-                    "returning existing instance (keys are locked at first creation)"
-                )
-        return cls._shared
+        new_keys = tuple(k.strip() for k in raw.split(",") if k.strip())
+        instance = cls._shared.get(new_keys)
+        if instance is None:
+            instance = cls(new_keys)
+            cls._shared[new_keys] = instance
+        return instance
+
+    @classmethod
+    def clear_shared(cls) -> None:
+        """Clear all process-level shared instances.
+
+        Intended for tests and graceful reconfiguration; production code
+        should rarely need this since each unique key set keeps its own
+        rotator.
+        """
+        cls._shared.clear()
 
     def __repr__(self) -> str:
         return f"ApiKeyRotator(size={self.size})"

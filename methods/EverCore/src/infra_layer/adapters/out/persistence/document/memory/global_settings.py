@@ -68,7 +68,8 @@ class LlmCustomSettingModel(BaseModel):
     Example:
         {
             "boundary": {"provider": "openai", "model": "gpt-4.1-mini"},
-            "extraction": {"provider": "openrouter", "model": "qwen/qwen3-235b-a22b-2507"}
+            "extraction": {"provider": "openrouter", "model": "qwen/qwen3-235b-a22b-2507"},
+            "profile": {"provider": "openai", "model": "gpt-4o"}
         }
     """
 
@@ -79,6 +80,10 @@ class LlmCustomSettingModel(BaseModel):
     extraction: Optional[LlmProviderConfigModel] = Field(
         default=None,
         description="LLM config for memory extraction (high quality model recommended)",
+    )
+    profile: Optional[LlmProviderConfigModel] = Field(
+        default=None,
+        description="LLM config for user/group profile extraction",
     )
     extra: Optional[Dict[str, Any]] = Field(
         default=None, description="Additional task-specific LLM configurations"
@@ -91,6 +96,8 @@ class LlmCustomSettingModel(BaseModel):
             result["boundary"] = self.boundary.to_dict()
         if self.extraction:
             result["extraction"] = self.extraction.to_dict()
+        if self.profile:
+            result["profile"] = self.profile.to_dict()
         if self.extra:
             result["extra"] = self.extra
         return result if result else None
@@ -105,19 +112,45 @@ class LlmCustomSettingModel(BaseModel):
         if isinstance(data, dict):
             boundary = LlmProviderConfigModel.from_any(data.get("boundary"))
             extraction = LlmProviderConfigModel.from_any(data.get("extraction"))
+            profile = LlmProviderConfigModel.from_any(data.get("profile"))
             extra = data.get("extra")
-            if boundary is None and extraction is None and extra is None:
+            if (
+                boundary is None
+                and extraction is None
+                and profile is None
+                and extra is None
+            ):
                 return None
-            return cls(boundary=boundary, extraction=extraction, extra=extra)
-        if hasattr(data, "boundary") or hasattr(data, "extraction"):
+            return cls(
+                boundary=boundary,
+                extraction=extraction,
+                profile=profile,
+                extra=extra,
+            )
+        if (
+            hasattr(data, "boundary")
+            or hasattr(data, "extraction")
+            or hasattr(data, "profile")
+        ):
             boundary = LlmProviderConfigModel.from_any(getattr(data, "boundary", None))
             extraction = LlmProviderConfigModel.from_any(
                 getattr(data, "extraction", None)
             )
+            profile = LlmProviderConfigModel.from_any(getattr(data, "profile", None))
             extra = getattr(data, "extra", None)
-            if boundary is None and extraction is None and extra is None:
+            if (
+                boundary is None
+                and extraction is None
+                and profile is None
+                and extra is None
+            ):
                 return None
-            return cls(boundary=boundary, extraction=extraction, extra=extra)
+            return cls(
+                boundary=boundary,
+                extraction=extraction,
+                profile=profile,
+                extra=extra,
+            )
         return None
 
 
