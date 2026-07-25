@@ -3,8 +3,9 @@
 The ``provider`` field on :class:`RerankSettings` selects which concrete
 implementation to build:
 
-    - ``"deepinfra"`` → :class:`DeepInfraRerankProvider`
-    - ``"vllm"``      → :class:`VllmRerankProvider`
+    - ``"deepinfra"``  → :class:`DeepInfraRerankProvider`
+    - ``"vllm"``       → :class:`VllmRerankProvider`
+    - ``"dashscope"``  → :class:`DashScopeRerankProvider`
 
 Adding a new provider = one match arm here + one new file under
 :mod:`everos.component.rerank`.
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 from everos.config import RerankSettings
 
+from .dashscope_provider import DashScopeRerankProvider
 from .deepinfra_provider import DeepInfraRerankProvider
 from .protocol import RerankProvider
 from .vllm_provider import VllmRerankProvider
@@ -63,6 +65,21 @@ def build_rerank_provider(settings: RerankSettings) -> RerankProvider:
         )
     if settings.provider == "vllm":
         return VllmRerankProvider(
+            model=settings.model,
+            api_key=api_key,
+            base_url=settings.base_url,
+            timeout=settings.timeout_seconds,
+            max_retries=settings.max_retries,
+            batch_size=settings.batch_size,
+            max_concurrent=settings.max_concurrent,
+        )
+    if settings.provider == "dashscope":
+        if not api_key:
+            raise ValueError(
+                "DashScope rerank api_key is not configured "
+                "(set EVEROS_RERANK__API_KEY)"
+            )
+        return DashScopeRerankProvider(
             model=settings.model,
             api_key=api_key,
             base_url=settings.base_url,

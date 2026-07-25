@@ -175,7 +175,7 @@ class BaseDailyWriter:
             frontmatter_updates = self._frontmatter_updates(
                 scope_id, bucket, next_count=base_count + len(items)
             )
-            await self._writer._append_entries_unlocked(  # noqa: SLF001
+            await self._writer._append_entries_unlocked(
                 path,
                 rendered,
                 frontmatter_updates=frontmatter_updates,
@@ -227,12 +227,24 @@ class BaseDailyWriter:
                     scope_id, bucket, next_count=count + 1
                 )
 
-            await self._writer._append_entries_unlocked(  # noqa: SLF001
+            await self._writer._append_entries_unlocked(
                 path,
                 [(entry_body, eid)],
                 frontmatter_updates=frontmatter_updates,
             )
             return eid
+
+    async def patch_frontmatter(self, path: Path, updates: Mapping[str, Any]) -> None:
+        """Merge ``updates`` into the frontmatter of an existing daily-log file.
+
+        Delegates to the underlying :class:`MarkdownWriter` so that callers
+        do not need to reach through the private ``_writer`` attribute.
+
+        Args:
+            path: Target markdown file (must exist).
+            updates: Mapping of frontmatter keys to merge.
+        """
+        await self._writer.patch_frontmatter(path, updates)
 
     # ── Hooks (subclass override) ─────────────────────────────────────────
 

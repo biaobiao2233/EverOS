@@ -1,242 +1,195 @@
-"""Hierarchical episode retrieval — two-path recall fused with per-fact eviction.
+"""Heap-expand hierarchy — heap-driven lazy expansion with global top-N competition.
 
-Episode HYBRID search path: combines episode-level hybrid recall (Layer 1)
-with fact-driven MaxSim re-scoring (Layer 2), merges via RRF (Layer 3), then
-runs a single-pass eviction where a fact that outscores its parent episode
-enters top-N in place of the episode (Layer 4).
+Replaces the four-layer serial pipeline (hierarchy.py) with a heap-based
+approach where RRF orders the expansion priority and LR-calibrated scores
+drive the global competition between episodes and their atomic facts.
 
-Uses everalgo operators as pure algorithm primitives; all I/O is injected
-via recaller callbacks.  No changes to the everalgo library are required.
+Pure synchronous module — zero I/O, zero async. Designed for zero-change
+migration to everalgo.
 """
 
 from __future__ import annotations
 
+import heapq
 from typing import TYPE_CHECKING
 
-from everalgo.rank import amaxsim_retrieve
-from everalgo.rank.fusion import rrf
+from everalgo.rank.fusion import cosine_to_lr_score, lr, rrf
 from everalgo.types import Candidate, FactCandidate, ScoredItem
 
-from everos.core.observability.logging import get_logger
-
-from .dto import SearchEpisodeItem
-from .shaper import reshape_hybrid_output
-
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
-    from everos.memory.search.recall.atomic_fact import AtomicFactRecaller
-    from everos.memory.search.recall.episode import EpisodeRecaller
-
-logger = get_logger(__name__)
+    from everalgo.rank.weight import LRCoefs
 
 
-async def hierarchy_retrieve_episodes(
-    query: str,
+def build_ep_to_fact_parents(
+    episodes: list[Candidate],
+) -> dict[str, list[str]]:
+    """Map episode candidate id to possible fact parent_id values.
+
+    Args:
+        episodes: Episode candidate list.
+
+    Returns:
+        Dict mapping episode id to parent_ids (entry_id and/or memcell_id).
+    """
+    result: dict[str, list[str]] = {}
+    for ep in episodes:
+        parents: list[str] = []
+        entry_id = ep.metadata.get("entry_id")
+        if isinstance(entry_id, str) and entry_id:
+            parents.append(entry_id)
+        parent_id = ep.metadata.get("parent_id")
+        if isinstance(parent_id, str) and parent_id and parent_id != entry_id:
+            parents.append(parent_id)
+        if parents:
+            result[ep.id] = parents
+    return result
+
+
+def heap_expand(
     *,
     sparse: list[Candidate],
     dense: list[Candidate],
-    query_vector: list[float],
-    fact_recaller: AtomicFactRecaller,
-    episode_recaller: EpisodeRecaller,
-    where: str,
-    top_k: int,
-    fact_child_candidates: int = 200,
-) -> list[SearchEpisodeItem]:
-    """Run the four-layer hierarchical episode retrieval pipeline.
-
-    Layer 1: RRF fusion over pre-recalled sparse + dense episode candidates.
-    Layer 2: MaxSim re-score via atomic-fact child retrieval (fact cosine ANN
-             → group by parent memcell → episode re-score by best fact).
-    Layer 3: RRF merge of Layer-1 and Layer-2 results, sliced to top_k.
-    Layer 4: Pre-fetch facts for merged episodes, then single-pass eviction
-             (fact outscoring its parent episode enters top-N instead).
+    episode_to_facts: dict[str, list[FactCandidate]],
+    top_k: int = 10,
+    alpha: float = 1.0,
+    rrf_k: int = 60,
+    max_convergence_rounds: int = 10,
+    facts_per_episode: int = 3,
+    lr_coefs: LRCoefs | None = None,
+) -> list[ScoredItem]:
+    """Heap-expand hierarchy: RRF orders expansion, LR scores drive competition.
 
     Args:
-        query: Raw query string passed to amaxsim_retrieve.
-        sparse: BM25 episode candidates from the caller's recall phase.
-        dense: Vector ANN episode candidates from the caller's recall phase.
-        query_vector: Pre-computed query embedding; reused for fact ANN recall
-            and per-fact scoring in facts_for_episodes.
-        fact_recaller: AtomicFactRecaller instance for child retrieval and
-            facts_for_episodes.
-        episode_recaller: EpisodeRecaller instance for MaxSim parent fetch.
-        where: LanceDB filter clause (owner scope, tenant, etc.).
-        top_k: Maximum number of items in the final merged slice before eviction.
-        fact_child_candidates: How many atomic-fact ANN candidates to pull in
-            Layer 2. Default 200.
+        sparse: BM25 episode candidates (descending by BM25 score).
+        dense: Vector ANN episode candidates (descending by cosine).
+        episode_to_facts: Pre-fetched facts per episode, each list sorted
+            by cosine descending.
+        top_k: Maximum items in the final output.
+        alpha: Fact weight in the blend (1.0 = fact score only).
+        rrf_k: RRF constant (default 60).
+        max_convergence_rounds: Stop after this many consecutive rounds
+            with no top-N change.
+        facts_per_episode: Max facts per episode to enter competition.
+        lr_coefs: Override LR coefficients; None uses production defaults.
 
     Returns:
-        Shaped SearchEpisodeItem list (episodes with nested atomic_facts),
-        sorted by score descending.
+        Mixed list of ScoredItem (episodes + atomic_facts), sorted by
+        score descending. Ready for ``reshape_hybrid_output``.
     """
-    # Layer 1 — episode RRF fusion
-    layer1_episodes = rrf(sparse, dense)
-
-    # Layer 2 — MaxSim re-score via atomic-fact child retrieval
-    layer2_episodes = await _maxsim_episode_rescore(
-        query=query,
-        query_vector=query_vector,
-        fact_recaller=fact_recaller,
-        episode_recaller=episode_recaller,
-        where=where,
-        child_candidates=fact_child_candidates,
-    )
-
-    # Layer 3 — RRF merge of episode-level results, slice to top_k
-    merged = rrf(layer1_episodes, layer2_episodes)[:top_k]
-
-    if not merged:
-        logger.info("hierarchy_retrieve_empty_merge", top_k=top_k)
+    if not sparse and not dense:
         return []
 
-    # Layer 4a — pre-fetch facts for merged episodes
-    ep_to_memcell = _build_ep_to_memcell(merged)
-    episode_to_facts = await fact_recaller.facts_for_episodes(
-        ep_to_memcell,
-        where,
-        per_episode=max(top_k * 2, 20),
-        query_vector=query_vector,
-    )
+    # Phase 1 — dual fusion
+    bm25_scores = {c.id: c.score for c in sparse}
+    lr_results = lr(dense, sparse, coefs=lr_coefs)
+    episode_scores = {c.id: c.score for c in lr_results}
+    rrf_results = rrf(sparse, dense, k=rrf_k)
 
-    # Layer 4b — single-pass eviction
-    scored_items = _hierarchy_eviction_pass(merged, episode_to_facts)
+    if not rrf_results:
+        return []
 
-    # Build episode pool for orphan fact parent lookup.
-    # Include layer2_episodes so episodes surfaced only via MaxSim path
-    # (not in the original sparse/dense recall) can still serve as parent.
-    episode_pool = {c.id: c for c in (*sparse, *dense, *layer2_episodes)}
+    # Phase 2 — heap + top-N init
+    heap: list[tuple[float, str]] = []
+    for doc in rrf_results:
+        heapq.heappush(heap, (-doc.score, doc.id))
 
-    return reshape_hybrid_output(scored_items, episode_pool=episode_pool)
+    # topn: {id: (Candidate, lr_score, item_type, source_episode_id)}
+    topn: dict[str, tuple[Candidate | FactCandidate, float, str, str]] = {}
+    for doc in rrf_results[:top_k]:
+        topn[doc.id] = (doc, episode_scores.get(doc.id, 0.0), "episode", doc.id)
 
+    # Phase 3 — heap convergence loop
+    convergence_count = 0
+    while heap and convergence_count < max_convergence_rounds:
+        _, episode_id = heapq.heappop(heap)
+        prev_keys = set(topn.keys())
 
-def _hierarchy_eviction_pass(
-    merged: list[Candidate],
-    episode_to_facts: dict[str, list[FactCandidate]],
-) -> list[ScoredItem]:
-    """Single-pass eviction: fact outscoring its parent episode enters top-N.
+        _expand_one_episode(
+            episode_id,
+            topn=topn,
+            episode_to_facts=episode_to_facts,
+            bm25_scores=bm25_scores,
+            episode_scores=episode_scores,
+            alpha=alpha,
+            facts_per_episode=facts_per_episode,
+            top_k=top_k,
+            lr_coefs=lr_coefs,
+        )
 
-    For each episode in merged order: if its best matching atomic fact scores
-    higher than the episode itself, emit the fact as a ScoredItem
-    (item_type='atomic_fact') and mark the episode as an orphan parent.
-    Otherwise emit the episode directly as item_type='episode'.
+        if set(topn.keys()) == prev_keys:
+            convergence_count += 1
+        else:
+            convergence_count = 0
 
-    Args:
-        merged: RRF-merged episode candidates, ordered by descending score.
-        episode_to_facts: Map from episode_id to its pre-fetched FactCandidates,
-            sorted by cosine similarity descending.
-
-    Returns:
-        Mixed list of ScoredItem instances (episodes and atomic_facts) ready
-        for reshape_hybrid_output.
-    """
-    out: list[ScoredItem] = []
-
-    for episode in merged:
-        facts = episode_to_facts.get(episode.id, [])
-        best_fact = facts[0] if facts else None
-
-        if best_fact is not None and best_fact.score > episode.score:
-            # Fact wins: emit fact; episode becomes orphan parent
-            out.append(
+    # Phase 4 — output
+    sorted_entries = sorted(topn.values(), key=lambda v: v[1], reverse=True)
+    result: list[ScoredItem] = []
+    for item, score, item_type, source_ep_id in sorted_entries:
+        if item_type == "episode":
+            result.append(
                 ScoredItem(
-                    id=best_fact.id,
-                    score=best_fact.score,
-                    item_type="atomic_fact",
-                    metadata=best_fact.metadata,
-                    parent_episode_id=episode.id,
+                    id=item.id,
+                    score=score,
+                    item_type="episode",
+                    metadata=dict(item.metadata),
                 )
-            )
-            logger.debug(
-                "hierarchy_eviction_fact_wins",
-                episode_id=episode.id,
-                fact_id=best_fact.id,
-                fact_score=best_fact.score,
-                episode_score=episode.score,
             )
         else:
-            # Episode wins: emit episode with its metadata intact
-            out.append(
+            result.append(
                 ScoredItem(
-                    id=episode.id,
-                    score=episode.score,
-                    item_type="episode",
-                    metadata=dict(episode.metadata),
-                    parent_episode_id=None,
+                    id=item.id,
+                    score=score,
+                    item_type="atomic_fact",
+                    metadata=dict(item.metadata),
+                    parent_episode_id=source_ep_id,
                 )
             )
-
-    return out
-
-
-# ── Internal helpers ─────────────────────────────────────────────────────
-
-
-async def _maxsim_episode_rescore(
-    *,
-    query: str,
-    query_vector: list[float],
-    fact_recaller: AtomicFactRecaller,
-    episode_recaller: EpisodeRecaller,
-    where: str,
-    child_candidates: int,
-) -> list[Candidate]:
-    """Run amaxsim_retrieve to produce MaxSim-rescored episode candidates.
-
-    Atomic facts serve as child documents (their metadata["parent_id"] is
-    the memcell_id). Episodes are fetched as parents via
-    episode_recaller.fetch_by_parent_ids.
-
-    ``amaxsim_retrieve`` calls ``child_retrieve`` exactly once with the
-    original query string. We reuse the pre-computed ``query_vector`` to
-    avoid a redundant embed call.
-
-    Args:
-        query: Raw query string (passed verbatim to amaxsim_retrieve).
-        query_vector: Pre-computed query embedding; used directly for child
-            ANN recall, bypassing a second embed call.
-        fact_recaller: Provides the child ANN retrieval function.
-        episode_recaller: Provides the parent fetch function.
-        where: LanceDB filter clause.
-        child_candidates: Number of atomic-fact candidates to pull per call.
-
-    Returns:
-        Episode candidates re-scored by their best matching atomic fact.
-    """
-
-    async def child_retrieve(_q: str, n: int) -> Sequence[Candidate]:
-        # amaxsim_retrieve calls this exactly once with the original query string.
-        # Reuse the pre-computed query_vector instead of re-embedding.
-        return await fact_recaller.dense_recall(query_vector, where, limit=n)
-
-    async def parent_fetch(memcell_ids: list[str]) -> list[Candidate]:
-        return await episode_recaller.fetch_by_parent_ids(memcell_ids, where)
-
-    return await amaxsim_retrieve(
-        query,
-        child_retrieve=child_retrieve,
-        parent_fetch=parent_fetch,
-        top_n=50,
-        child_candidates=child_candidates,
-    )
-
-
-def _build_ep_to_memcell(episodes: list[Candidate]) -> dict[str, str]:
-    """Extract episode_id → memcell_id mapping from episode candidates.
-
-    Episodes store their source memcell id in metadata["parent_id"].
-    Entries missing or having a non-string parent_id are silently skipped
-    (they will receive no facts during Layer 4).
-
-    Args:
-        episodes: Merged episode candidate list.
-
-    Returns:
-        Dict mapping episode LanceDB id to memcell id.
-    """
-    result: dict[str, str] = {}
-    for ep in episodes:
-        mc_id = ep.metadata.get("parent_id")
-        if isinstance(mc_id, str) and mc_id:
-            result[ep.id] = mc_id
     return result
+
+
+def _expand_one_episode(
+    episode_id: str,
+    *,
+    topn: dict[str, tuple[Candidate | FactCandidate, float, str, str]],
+    episode_to_facts: dict[str, list[FactCandidate]],
+    bm25_scores: dict[str, float],
+    episode_scores: dict[str, float],
+    alpha: float,
+    facts_per_episode: int,
+    top_k: int,
+    lr_coefs: LRCoefs | None,
+) -> None:
+    """Expand one episode's facts and compete with top-N in place."""
+    # Pre-fetch 2× candidates so LR scoring can filter to the best N.
+    facts = episode_to_facts.get(episode_id, [])[: facts_per_episode * 2]
+    if not facts:
+        return
+
+    parent_bm25 = bm25_scores.get(episode_id, 0.0)
+    parent_lr = episode_scores.get(episode_id, 0.0)
+
+    scored: list[tuple[float, FactCandidate]] = []
+    for fact in facts:
+        child_lr = cosine_to_lr_score(fact.score, parent_bm25, coefs=lr_coefs)
+        blended = alpha * child_lr + (1.0 - alpha) * parent_lr
+        scored.append((blended, fact))
+
+    scored.sort(key=lambda t: t[0], reverse=True)
+    top_facts = scored[:facts_per_episode]
+
+    min_topn_score = min((v[1] for v in topn.values()), default=0.0) if topn else 0.0
+    any_entered = False
+
+    for fact_score, fact in top_facts:
+        if fact_score <= 0.0:
+            continue
+        if len(topn) < top_k or fact_score > min_topn_score:
+            topn[fact.id] = (fact, fact_score, "atomic_fact", episode_id)
+            any_entered = True
+            if len(topn) > top_k:
+                worst_id = min(topn, key=lambda k: topn[k][1])
+                del topn[worst_id]
+            min_topn_score = min((v[1] for v in topn.values()), default=0.0)
+
+    if any_entered and episode_id in topn:
+        del topn[episode_id]

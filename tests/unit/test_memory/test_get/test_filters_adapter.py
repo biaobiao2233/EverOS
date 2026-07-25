@@ -28,8 +28,15 @@ def test_no_filters_emits_base_clause() -> None:
     where = compile_filters_for_get(None, owner_id="u1", owner_type="user")
     assert where == (
         "owner_id = 'u1' AND owner_type = 'user' "
-        "AND app_id = 'default' AND project_id = 'default'"
+        "AND app_id = 'default' AND project_id = 'default' "
+        "AND deprecated_by IS NULL"
     )
+
+
+def test_no_filters_agent_omits_deprecated_by() -> None:
+    """Agent tables lack ``deprecated_by`` — clause must be absent."""
+    where = compile_filters_for_get(None, owner_id="bot", owner_type="agent")
+    assert "deprecated_by" not in where
 
 
 def test_owner_id_quote_is_escaped() -> None:
@@ -37,7 +44,8 @@ def test_owner_id_quote_is_escaped() -> None:
     where = compile_filters_for_get(None, owner_id="o'reilly", owner_type="user")
     assert where == (
         "owner_id = 'o''reilly' AND owner_type = 'user' "
-        "AND app_id = 'default' AND project_id = 'default'"
+        "AND app_id = 'default' AND project_id = 'default' "
+        "AND deprecated_by IS NULL"
     )
 
 
@@ -50,8 +58,8 @@ def test_flat_multi_field_renders_implicit_and() -> None:
     assert "owner_type = 'user'" in where
     assert "session_id = 'sess_a'" in where
     assert "parent_id = 'mc_x'" in where
-    # 4 base scope clauses + 2 filter fields = 6 clauses → 5 ' AND ' joins.
-    assert where.count(" AND ") == 5
+    # 5 base scope clauses + 2 filter fields = 7 clauses → 6 ' AND ' joins.
+    assert where.count(" AND ") == 6
 
 
 def test_reserved_owner_id_in_filters_raises() -> None:

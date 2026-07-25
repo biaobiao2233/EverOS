@@ -1,4 +1,4 @@
-# EverOS HTTP API (v1)
+# EverOS HTTP API (v2)
 
 Human-readable reference for the EverOS HTTP API. Schema names, types
 and validation constraints mirror the OpenAPI spec served at
@@ -26,10 +26,12 @@ business semantics the raw spec does not carry.
   - [SearchMethod](#searchmethod)
   - [GetMemoryType](#getmemorytype)
 - [Endpoints](#endpoints)
-  - [POST /api/v1/memory/add](#post-apiv1memoryadd)
-  - [POST /api/v1/memory/flush](#post-apiv1memoryflush)
-  - [POST /api/v1/memory/search](#post-apiv1memorysearch)
-  - [POST /api/v1/memory/get](#post-apiv1memoryget)
+  - [POST /api/v2/memory/add](#post-apiv1memoryadd)
+  - [POST /api/v2/memory/flush](#post-apiv1memoryflush)
+  - [POST /api/v2/memory/search](#post-apiv1memorysearch)
+  - [POST /api/v2/memory/get](#post-apiv1memoryget)
+  - [POST /api/v2/ome/trigger](#post-apiv1ometrigger)
+  - [Knowledge endpoints](#knowledge-endpoints)
 - [OpenAPI spec source](#openapi-spec-source)
 
 ## Overview
@@ -40,12 +42,21 @@ business semantics the raw spec does not carry.
 |---|---|---|
 | Host | `127.0.0.1` (loopback only) | `EVEROS_API__HOST` env var or `--host` flag |
 | Port | `8000` | `EVEROS_API__PORT` env var or `--port` flag |
-| Version prefix | `/api/v1` | — |
+| Version prefix | `/api/v2` | — |
 
-All business endpoints documented here live under `/api/v1/memory/`.
-The operational endpoints `GET /health` and `GET /metrics` exist but
-are intentionally outside this reference — they are runtime probes for
-deployment, not part of the application contract.
+Business endpoints live under `/api/v2/memory/`, `/api/v2/ome/`, and
+`/api/v2/knowledge/`. Knowledge endpoints have their own dedicated
+reference at [docs/knowledge.md](knowledge.md) and are cross-referenced
+below. The operational endpoints `GET /health` and `GET /metrics` exist
+but are intentionally outside this reference — they are runtime probes
+for deployment, not part of the application contract.
+
+`/api/v2` is the canonical prefix, aligned with the EverOS Cloud API. Every
+business endpoint is **also** served under `/api/v1`, which is retained as a
+permanent, backward-compatible alias: the two prefixes resolve to the same
+handlers with identical request/response contracts. Existing `/api/v1`
+integrations keep working unchanged; new integrations should use `/api/v2`.
+Swap the prefix in any example below to reach the same endpoint under v1.
 
 ### Content type
 
@@ -129,7 +140,7 @@ storage. This is the same rule users see when reading rendered output:
   e.g. `alice_ep_20260528_00000001` for an episode, `alice_af_...`
   for an atomic fact. See
   [storage_layout.md §4](storage_layout.md) for the encoding.
-- **All endpoints are POST** for `/api/v1/memory/*` even when the
+- **All endpoints are POST** for `/api/v2/memory/*` even when the
   semantics look like a read (`/search`, `/get`) — the request bodies
   are too rich (filters, methods, paging) to encode in a query string.
 
@@ -166,28 +177,41 @@ the top level (mirroring the success envelope) alongside a nested
 {
   "request_id": "<32-char hex>",
   "error": {
-    "code": "HTTP_ERROR",
-    "message": "Value error, exactly one of user_id / agent_id must be provided",
+    "code": "NOT_FOUND",
+    "message": "Document 'abc123' not found",
     "timestamp": "2026-06-01T12:24:46+00:00",
-    "path": "/api/v1/memory/search"
+    "path": "/api/v2/knowledge/documents/abc123"
   }
 }
 ```
 
-| HTTP | `error.code` | `error.message` | When |
+### error.code values
+
+`error.code` is a machine-readable `ErrorCode` enum. Clients can switch
+on this value to decide retry / display / routing behaviour without
+parsing the human-readable `message` field.
+
+| `error.code` | HTTP | Retryable? | When |
 |---|---|---|---|
-| `415 Unsupported Media Type` | `HTTP_ERROR` | the parse-failure reason | `/add` only — a `ContentItem` could not be parsed (unsupported modality for the configured multimodal LLM, or a payload that cannot be fetched / dispatched) |
-| `422 Unprocessable Entity` | `HTTP_ERROR` | the **first** validation error (see below) | Request-body validation failure. Also covers `/search` / `/get` filter-DSL compile errors — the compile reason rides in `message` |
-| `500 Internal Server Error` | `SYSTEM_ERROR` | `"Internal server error"` (fixed; internal details are logged, never leaked) | Unhandled exception caught by the global handler |
+| `NOT_FOUND` | `404` | No | Requested resource does not exist |
+| `CONFLICT` | `409` | No | Operation conflicts with existing state (e.g. duplicate document) |
+| `INVALID_INPUT` | `422` | No | Request-body validation failure. Also covers `/search` / `/get` filter-DSL compile errors — the compile reason rides in `message` |
+| `EXTRACTION_EMPTY` | `422` | No | Document extraction produced no topics (empty or whitespace-only content) |
+| `BAD_REQUEST` | `400` | No | Path traversal attempt or other malformed input |
+| `UNSUPPORTED_FORMAT` | `415` | No | File format or modality not supported (e.g. unsupported `ContentItem` type, missing `ext` for `base64`) |
+| `EXTERNAL_SERVICE_UNAVAILABLE` | `503` | **Yes** | An external service (LLM, embedding, rerank) returned an error or timed out |
+| `CAPABILITY_UNAVAILABLE` | `503` | No | A required server-side capability is missing (e.g. `everos[multimodal]` extra not installed, LibreOffice absent) — requires admin action, not retry |
+| `CONFIGURATION_ERROR` | `500` | No | A required configuration is missing or invalid (e.g. embedding model not set) |
+| `INTERNAL_ERROR` | `500` | No | Unhandled exception (internal details are logged, never leaked) |
 
 ### error object
 
 | Field | Type | Description |
 |---|---|---|
-| `code` | `string` | `"HTTP_ERROR"` for 4xx (validation / business / `HTTPException`); `"SYSTEM_ERROR"` for 5xx |
-| `message` | `string` | Human-readable reason. For `422`, **only the first** validation error is surfaced, formatted `"<msg>: <dotted-loc>"` with the leading `body` segment stripped (e.g. `"Field required: messages"`); a model-level validator with no field location surfaces just `"<msg>"` (e.g. the XOR example above) |
+| `code` | `string` | One of the `ErrorCode` values listed above |
+| `message` | `string` | Human-readable reason. For `INVALID_INPUT` from request validation, **only the first** validation error is surfaced, formatted `"<msg>: <dotted-loc>"` with the leading `body` segment stripped (e.g. `"Field required: messages"`); a model-level validator with no field location surfaces just `"<msg>"` (e.g. `"Value error, exactly one of user_id / agent_id must be provided"`) |
 | `timestamp` | `string` | ISO-8601 with timezone offset (display tz) |
-| `path` | `string` | Request path, e.g. `/api/v1/memory/add` |
+| `path` | `string` | Request path, e.g. `/api/v2/memory/add` |
 
 > Unlike FastAPI's default, the full per-field validation array is **not**
 > returned — only the first error's message. A client that needs the
@@ -357,7 +381,7 @@ A node is a JSON object whose keys are one of:
 |---|---|---|
 | `AND` | `array<FilterNode>` | All child nodes must match. Omit if not needed |
 | `OR` | `array<FilterNode>` | At least one child node must match. Omit if not needed |
-| *<allowed field>* | scalar or operator map | Predicate on that field — see [Allowed fields](#filter-allowed-fields) and [Operators](#filter-operators) |
+| *<allowed field>* | scalar or operator map | Predicate on that field — see [Allowed fields](#allowed-fields) and [Operators](#operators) |
 
 `AND`, `OR`, and scalar predicates **mix freely at the same level**;
 they are implicitly joined with `AND`. A node with only scalar keys is
@@ -461,7 +485,7 @@ require `agent_id`. The mismatching combinations are rejected with
 
 ## Endpoints
 
-### POST /api/v1/memory/add
+### POST /api/v2/memory/add
 
 Append a batch of messages to a session buffer. The server
 accumulates messages until the boundary detector decides the session
@@ -517,8 +541,8 @@ correlation.
 #### cURL example
 
 ```bash
-TS=$(date +%s)
-curl -X POST http://127.0.0.1:8000/api/v1/memory/add \
+TS=$(( $(date +%s) * 1000 ))
+curl -X POST http://127.0.0.1:8000/api/v2/memory/add \
   -H 'Content-Type: application/json' \
   -d "{
     \"session_id\": \"demo-002\",
@@ -544,7 +568,7 @@ Response (real capture):
 }
 ```
 
-### POST /api/v1/memory/flush
+### POST /api/v2/memory/flush
 
 Force the boundary detector to decide **now** for the given session
 buffer. The LLM runs extraction (one call) regardless of whether the
@@ -586,7 +610,7 @@ sync is still asynchronous — see
 #### cURL example
 
 ```bash
-curl -X POST http://127.0.0.1:8000/api/v1/memory/flush \
+curl -X POST http://127.0.0.1:8000/api/v2/memory/flush \
   -H 'Content-Type: application/json' \
   -d '{"session_id":"demo-002","app_id":"default","project_id":"default"}'
 ```
@@ -603,7 +627,7 @@ extraction LLM call):
 }
 ```
 
-### POST /api/v1/memory/search
+### POST /api/v2/memory/search
 
 Hybrid retrieval over the memory store. Combines BM25, dense vector
 ANN, optional scalar filtering, optional cross-encoder rerank, and
@@ -621,6 +645,7 @@ optional final LLM rerank. Returns ranked items grouped by kind.
 | `method` | [SearchMethod](#searchmethod) | no | `"hybrid"` | — |
 | `top_k` | `integer` | no | `-1` | `-1` or `1..100` |
 | `radius` | `number \| null` | no | `null` | `0.0 ≤ x ≤ 1.0` if set |
+| `min_score` | `number \| null` | no | `null` | `0.0 ≤ x ≤ 1.0` if set |
 | `include_profile` | `boolean` | no | `false` | — |
 | `enable_llm_rerank` | `boolean` | no | `false` | — |
 | `filters` | [FilterNode](#filternode-filter-dsl) `\| null` | no | `null` | — |
@@ -660,13 +685,17 @@ radius:
 3. With `top_k>0` and no caller-supplied `radius`, no threshold is
    applied (`null`).
 
+**`min_score`** — Optional **post-fusion relevance floor** in
+`[0.0, 1.0]`. Results below this score are evicted after fusion,
+independent of `radius` (which is a per-recall cosine threshold).
+
 **`include_profile`** — When `user_id` is set, also fetch the user's
 profile and include it in `data.profiles`. The profile is not
 ranked; `score` is `null`. Ignored when `agent_id` is set.
 
 **`enable_llm_rerank`** — Opt-in LLM rerank pass for
 `method: "hybrid"`. Applies to `agent_case` and `agent_skill` fusion
-only; the episode hierarchy path has built-in fact eviction and
+only; the episode hybrid path has built-in fact eviction and
 ignores this flag. Adds one LLM call per request. Ignored by
 `keyword` / `vector` (no fusion to rerank) and `agentic` (uses its
 own cross-encoder loop).
@@ -793,7 +822,7 @@ attribution, so `session_id` is the only meaningful query dimension.
 | `sender_id` | `string` | Original sender id from `/add` |
 | `sender_name` | `string \| null` | Original sender name; `null` if not provided |
 | `role` | `"user" \| "assistant" \| "tool"` | Original role |
-| `content` | `string \| array<object>` | `string` for the single-text shorthand, `array` of opaque content items for the original multimodal payload (mirrors [MessageItem.content](#addmessage)) |
+| `content` | `string \| array<object>` | `string` for the single-text shorthand, `array` of opaque content items for the original multimodal payload (mirrors [MessageItem.content](#messageitem)) |
 | `timestamp` | `string` | ISO-8601 with timezone offset — see [Conventions](#conventions) |
 | `tool_calls` | `array<object> \| null` | Original tool_calls payload if any |
 | `tool_call_id` | `string \| null` | Original tool_call_id if any |
@@ -801,7 +830,7 @@ attribution, so `session_id` is the only meaningful query dimension.
 #### cURL example
 
 ```bash
-curl -X POST http://127.0.0.1:8000/api/v1/memory/search \
+curl -X POST http://127.0.0.1:8000/api/v2/memory/search \
   -H 'Content-Type: application/json' \
   -d '{
     "user_id": "alice",
@@ -849,7 +878,7 @@ Response (real capture):
 }
 ```
 
-### POST /api/v1/memory/get
+### POST /api/v2/memory/get
 
 Paginated listing of memory records of a given kind for a single
 owner. No ranking — ordering is `sort_by` × `sort_order` only. Used
@@ -981,7 +1010,7 @@ Same shape as [SearchAgentSkillItem](#searchagentskillitem) **minus**
 #### cURL example
 
 ```bash
-curl -X POST http://127.0.0.1:8000/api/v1/memory/get \
+curl -X POST http://127.0.0.1:8000/api/v2/memory/get \
   -H 'Content-Type: application/json' \
   -d '{
     "user_id": "alice",
@@ -1020,6 +1049,63 @@ Response (real capture):
     }
 }
 ```
+
+### POST /api/v2/ome/trigger
+
+Manually trigger a registered OME strategy.
+
+#### Request body
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | `string` | yes | — | Strategy name (e.g. `reflect_episodes`) |
+| `timeout` | `float` | no | `120.0` | Max seconds to wait for completion |
+| `force` | `bool` | no | `false` | Bypass the `enabled` gate in `ome.toml` |
+
+#### Response body
+
+`200 OK` returns:
+
+| Field | Type | Notes |
+|---|---|---|
+| `status` | `"ok" \| "timeout"` | Whether the strategy completed within the timeout |
+| `name` | `string` | Echoes the requested strategy name |
+
+#### Errors
+
+- `404` — strategy name not found in the OME registry.
+
+#### cURL example
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v2/ome/trigger \
+  -H 'Content-Type: application/json' \
+  -d '{"name": "reflect_episodes", "force": true}'
+```
+
+---
+
+### Knowledge endpoints
+
+The knowledge base subsystem (`/api/v2/knowledge/*`) provides document
+upload, CRUD, and hybrid search. These endpoints are fully documented
+in their own reference: **[docs/knowledge.md](knowledge.md)**.
+
+Summary of available routes:
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v2/knowledge/documents` | Upload and extract a document |
+| `GET` | `/api/v2/knowledge/documents` | List documents (paginated) |
+| `GET` | `/api/v2/knowledge/documents/{doc_id}` | Get a single document |
+| `PUT` | `/api/v2/knowledge/documents/{doc_id}` | Replace a document |
+| `PATCH` | `/api/v2/knowledge/documents/{doc_id}` | Partial update |
+| `DELETE` | `/api/v2/knowledge/documents/{doc_id}` | Delete a document |
+| `GET` | `/api/v2/knowledge/topics/{topic_id}` | Get a single topic |
+| `POST` | `/api/v2/knowledge/search` | Hybrid search over topics |
+| `GET` | `/api/v2/knowledge/categories` | List taxonomy categories |
+
+---
 
 ## OpenAPI spec source
 

@@ -22,12 +22,14 @@ from __future__ import annotations
 import asyncio
 import traceback
 from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from structlog.contextvars import bound_contextvars
 
 from everos.component.utils.datetime import get_utc_now
 from everos.core.observability.logging import get_logger
+from everos.core.observability.tracing import memory_span, use_traceparent
 from everos.infra.ome._dispatch._state import _CURRENT_STRATEGY
 from everos.infra.ome._stores.run_record import RunRecordStore
 from everos.infra.ome.decorator import StrategyMeta
@@ -35,14 +37,18 @@ from everos.infra.ome.events import BaseEvent
 from everos.infra.ome.exceptions import EmitNotDeclaredError, StrategyContractError
 from everos.infra.ome.records import RunRecord
 
+if TYPE_CHECKING:
+    from everos.infra.ome.engine import OfflineEngine
+
 logger = get_logger(__name__)
 
 
 class _RunCtx:
-    """Per-invocation context handed to ``meta.func(event, ctx)``.
+    """Implements :class:`~everos.infra.ome.context.StrategyContext` Protocol.
 
-    Carries ``run_id``, a strategy-scoped logger, and the ``emit``
-    callback that enforces the declared ``emits=[...]`` contract.
+    Carries ``run_id``, a strategy-scoped logger, the ``emit``
+    callback that enforces the declared ``emits=[...]`` contract,
+    and engine-delegated helpers for event/run queries.
     """
 
     def __init__(
@@ -52,12 +58,14 @@ class _RunCtx:
         strategy_name: str,
         emit_hook: Callable[[BaseEvent], Awaitable[None]],
         declared_emits: frozenset[type[BaseEvent]],
+        engine: OfflineEngine,
     ) -> None:
         self.run_id = run_id
         self.logger = get_logger("ome.strategy")
         self._emit_hook = emit_hook
         self._declared = declared_emits
         self._strategy_name = strategy_name
+        self._engine = engine
 
     async def emit(self, event: BaseEvent) -> None:
         if type(event) not in self._declared:
@@ -66,6 +74,19 @@ class _RunCtx:
                 event=event,
             )
         await self._emit_hook(event)
+
+    async def wait_for_event(
+        self,
+        event_id: str,
+        *,
+        timeout: float = 120.0,  # noqa: ASYNC109
+    ) -> list[RunRecord]:
+        """Poll until all runs for ``event_id`` reach a terminal status."""
+        return await self._engine.wait_for_event(event_id, timeout=timeout)
+
+    async def list_runs_by_event_id(self, event_id: str) -> list[RunRecord]:
+        """Return all run records triggered by ``event_id``."""
+        return await self._engine.list_runs_by_event_id(event_id)
 
 
 class Runner:
@@ -78,11 +99,13 @@ class Runner:
         engine_sem: asyncio.Semaphore,
         emit_hook: Callable[[BaseEvent], Awaitable[None]],
         on_dead_letter: Callable[[RunRecord], None] | None = None,
+        engine: OfflineEngine,
     ) -> None:
         self._rec = run_record_store
         self._sem = engine_sem
         self._emit_hook = emit_hook
         self._on_dead_letter = on_dead_letter
+        self._engine = engine
 
     async def run(
         self,
@@ -91,6 +114,7 @@ class Runner:
         *,
         run_id: str,
         max_retries_snapshot: int,
+        traceparent: str | None = None,
     ) -> None:
         """Execute ``meta.func(event, ctx)`` with the attempt retry loop.
 
@@ -119,6 +143,7 @@ class Runner:
                     event_topic=event_topic,
                     event_payload=event_payload,
                     max_retries_snapshot=max_retries_snapshot,
+                    traceparent=traceparent,
                 )
                 if terminated:
                     return
@@ -133,6 +158,7 @@ class Runner:
         event_topic: str,
         event_payload: str,
         max_retries_snapshot: int,
+        traceparent: str | None = None,
     ) -> bool:
         """Run one attempt; return ``True`` if a terminal state was
         written (success / dead-letter or persistence failure), ``False``
@@ -143,6 +169,7 @@ class Runner:
             strategy_name=meta.name,
             emit_hook=self._emit_hook,
             declared_emits=meta.emits,
+            engine=self._engine,
         )
         with bound_contextvars(  # type: ignore[arg-type]  # structlog typed as Generator; @contextmanager wraps at runtime (structlog/contextvars.py:170)
             strategy_name=meta.name,
@@ -156,18 +183,35 @@ class Runner:
                 event_topic=event_topic,
                 event_payload=event_payload,
                 max_retries_snapshot=max_retries_snapshot,
+                event_id=event.event_id,
             ):
                 return True  # mark_running failed; abort run, no DB row exists
             try:
                 token = _CURRENT_STRATEGY.set(meta)
                 try:
-                    await meta.func(event, ctx)
+                    # Continue the triggering request's trace when a traceparent
+                    # was carried across the APScheduler boundary; otherwise the
+                    # agent span roots its own trace (e.g. cron / recovery).
+                    with (
+                        use_traceparent(traceparent),
+                        memory_span(
+                            f"everos.ome.{meta.name}",
+                            observation_type="agent",
+                            metadata={
+                                "strategy": meta.name,
+                                "run_id": current_run_id,
+                                "attempt": attempt,
+                                "event_topic": event_topic,
+                            },
+                        ),
+                    ):
+                        await meta.func(event, ctx)
                 finally:
                     _CURRENT_STRATEGY.reset(token)
             except StrategyContractError as e:
                 await self._terminate_dead_letter(current_run_id, _format_error(e))
                 return True
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 err = _format_error(e)
                 if attempt < max_retries_snapshot:
                     await self._rec.mark_failed(
@@ -194,6 +238,7 @@ class Runner:
         event_topic: str,
         event_payload: str,
         max_retries_snapshot: int,
+        event_id: str,
     ) -> bool:
         """Persist this attempt as RUNNING; return ``False`` on write failure.
 
@@ -210,8 +255,9 @@ class Runner:
                 event_topic=event_topic,
                 event_payload=event_payload,
                 max_retries_snapshot=max_retries_snapshot,
+                event_id=event_id,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception(
                 "mark_running_failed",
                 run_id=run_id,
@@ -238,7 +284,7 @@ class Runner:
             return
         try:
             self._on_dead_letter(rec)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("on_dead_letter_failed")
 
 

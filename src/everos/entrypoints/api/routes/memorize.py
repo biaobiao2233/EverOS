@@ -1,4 +1,4 @@
-"""POST /api/v1/memory/add and /api/v1/memory/flush.
+"""POST /api/v2/memory/add and /api/v2/memory/flush.
 
 DTOs follow the v1 API brief (01_v1_api_brief.md §2 / §3). Routes are
 thin adapters: validate the DTO, dump to dict, hand to service. No
@@ -10,31 +10,48 @@ server-side and does not expose this endpoint).
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Request
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
-from everos.core.errors import MultimodalError
-from everos.core.observability.tracing import gen_request_id
+from everos.entrypoints.api.utils import extract_request_id
 from everos.service import memorize
 
-router = APIRouter(prefix="/api/v1/memory", tags=["memory"])
+router = APIRouter(prefix="/memory", tags=["memory"])
 
 
 # ── Path-safe identifier ────────────────────────────────────────────────────
-# ``app_id`` / ``project_id`` become directory segments under the memory
-# root, so they must reject ``.`` and ``..`` (path traversal). The basic
-# character whitelist is enforced via ``pattern`` (pydantic_core uses the
-# Rust regex engine, which does NOT support lookaround), and the two
-# reserved tokens are filtered out with a follow-up ``AfterValidator``.
-_PATH_SAFE_CHARSET = r"^[a-zA-Z0-9_.-]+$"
+# ``app_id`` / ``project_id`` / ``sender_id`` all become directory segments
+# under the memory root (``sender_id`` flows through to ``owner_id`` and is
+# joined into the daily-log write path), so they must reject ``.`` and ``..``
+# (path traversal). The basic character whitelist is enforced via ``pattern``
+# (pydantic_core uses the Rust regex engine, which does NOT support
+# lookaround), and the two reserved tokens are filtered out with a follow-up
+# ``AfterValidator``.
+#
+# ``@`` and ``+`` are admitted so real-world ids survive (email-style
+# ``user@example.com``, plus-addressing ``user+tag``); both are legal,
+# non-separator filename chars on every target filesystem (incl. NTFS, whose
+# reserved set is ``< > : " / \ | ? *``). The genuinely path-dangerous chars
+# (``/`` ``\`` NUL) stay out of the whitelist, and ``.``/``..`` stay blocked
+# by the token filter; the markdown writer's ``_ensure_within_root`` is the
+# final backstop regardless.
+_PATH_SAFE_CHARSET = r"^[a-zA-Z0-9_.@+-]+$"
 _PATH_TRAVERSAL_TOKENS = frozenset({".", ".."})
+
+
+_PATH_SAFE_RE = re.compile(_PATH_SAFE_CHARSET)
 
 
 def _reject_path_traversal(value: str) -> str:
     if value in _PATH_TRAVERSAL_TOKENS:
         raise ValueError("'.' and '..' are reserved (path traversal)")
+    if not _PATH_SAFE_RE.match(value):
+        raise ValueError(
+            "Only alphanumerics, underscore, dot, hyphen, @, and + are allowed"
+        )
     return value
 
 
@@ -70,7 +87,15 @@ class ContentItemDTO(BaseModel):
 
 
 class MessageItemDTO(BaseModel):
-    sender_id: str = Field(..., min_length=1)
+    # ``sender_id`` becomes ``owner_id`` and then a directory segment on the
+    # episode write path, so it carries the same path-safety guard as
+    # ``app_id`` / ``project_id`` (charset whitelist + ``.``/``..`` rejection).
+    sender_id: PathSafeId = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        pattern=_PATH_SAFE_CHARSET,
+    )
     sender_name: str | None = None
     role: Literal["user", "assistant", "tool"]
     timestamp: int = Field(
@@ -145,11 +170,8 @@ async def add_memory(
     request: Request,
 ) -> SuccessEnvelope[AddResponseData]:
     """Add messages into the user-memory + agent-memory pipelines."""
-    request_id = getattr(request.state, "request_id", None) or _gen_request_id()
-    try:
-        result = await memorize(req.model_dump())
-    except MultimodalError as exc:
-        raise HTTPException(status_code=415, detail=str(exc)) from exc
+    request_id = extract_request_id(request)
+    result = await memorize(req.model_dump())
     return SuccessEnvelope(
         request_id=request_id,
         data=AddResponseData(
@@ -169,7 +191,7 @@ async def flush_memory(
     [OSS-only] — cloud edition decides boundary timing server-side and
     does not expose this endpoint.
     """
-    request_id = getattr(request.state, "request_id", None) or _gen_request_id()
+    request_id = extract_request_id(request)
     result = await memorize(
         {
             "session_id": req.session_id,
@@ -188,8 +210,3 @@ async def flush_memory(
         request_id=request_id,
         data=FlushResponseData(status=status),
     )
-
-
-def _gen_request_id() -> str:
-    """Fallback request id when no middleware set one."""
-    return gen_request_id()

@@ -16,8 +16,8 @@ import structlog.testing
 from everalgo.clustering import Cluster as AlgoCluster
 
 from everos.infra.ome.testing import FakeStrategyContext
+from everos.memory._partition_locks import _reset_for_tests
 from everos.memory.events import AgentCaseExtracted, SkillClusterUpdated
-from everos.memory.strategies._partition_locks import _reset_for_tests
 from everos.memory.strategies.trigger_skill_clustering import (
     trigger_skill_clustering,
 )
@@ -47,7 +47,7 @@ def _event(
 
 
 async def test_strategy_meta_is_attached() -> None:
-    meta = trigger_skill_clustering._ome_strategy_meta  # type: ignore[attr-defined]
+    meta = trigger_skill_clustering.meta
     assert meta.name == "trigger_skill_clustering"
     assert AgentCaseExtracted in meta.trigger.on
     assert meta.emits == frozenset({SkillClusterUpdated})
@@ -116,7 +116,7 @@ async def test_creates_new_cluster_when_no_existing(
         await trigger_skill_clustering(_event(), ctx)
 
     # cluster_by_llm called with the size-1 new cluster + empty existing.
-    args, kwargs = mock_cluster.call_args
+    args, _kwargs = mock_cluster.call_args
     new_cluster, existing = args
     assert isinstance(new_cluster, AlgoCluster)
     assert new_cluster.id == "cl_newxxxx0001"
@@ -163,7 +163,7 @@ async def test_merges_into_existing_cluster_when_algo_matches() -> None:
         preview=["earlier intent"],
         members=["ac_20260517_0000"],
     )
-    # Simulate evercore _merge: id passes through from existing, members appended.
+    # Simulate everalgo _merge: id passes through from existing, members appended.
     merged_cluster = AlgoCluster(
         id="cl_existing0001",
         centroid=np.array([0.17] * 1024, dtype=np.float32),

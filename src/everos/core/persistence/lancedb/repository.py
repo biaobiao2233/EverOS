@@ -78,7 +78,7 @@ class LanceRepoBase[T: BaseLanceTable]:
     reads stay unlocked so search QPS is not impacted by writers.
 
     Locks live in a class-level dict keyed by table name and are never
-    evicted (mirrors :mod:`everos.memory.strategies._partition_locks`
+    evicted (mirrors :mod:`everos.memory._partition_locks`
     on bpo-28427 — a lock with pending waiters must outlive any dict
     entry that points to it).
     """
@@ -111,7 +111,7 @@ class LanceRepoBase[T: BaseLanceTable]:
         a module-level lock surviving across tests fails with "bound to
         a different event loop". The production cascade worker runs on
         one loop forever and does not need this hook. Mirrors
-        :func:`everos.memory.strategies._partition_locks._reset_for_tests`.
+        :func:`everos.memory._partition_locks._reset_for_tests`.
         """
         cls._table_locks.clear()
 
@@ -176,25 +176,39 @@ class LanceRepoBase[T: BaseLanceTable]:
     async def optimize(self, *, cleanup_older_than: dt.timedelta | None = None) -> None:
         """Compact fragments + merge new data into the FTS / vector indexes.
 
-        LanceDB's ``merge_insert`` writes new data into a fresh fragment.
-        The FTS (BM25) index built by :meth:`ensure_fts_indexes` only
-        covers fragments visible at index-build time, so rows written
-        after the initial build can become **invisible to BM25 queries**
-        until ``optimize()`` runs and merges those fragments into the
-        index segment that the query engine reads.
+        ``optimize()`` is a **performance + storage-hygiene** operation,
+        **not** a correctness/visibility one. LanceDB's ``merge_insert``
+        writes new data into a fresh fragment that the FTS / vector
+        indexes don't cover yet; queries stay correct regardless because
+        LanceDB transparently brute-force flat-scans that unindexed tail
+        and unions it with the indexed hits. Verified on lancedb 0.30.2:
+        after ``create_index`` + ``merge_insert`` (no ``optimize()``), a
+        ``nearest_to_text`` for a token present only in the new rows
+        returns those rows immediately.
 
-        Symptom this guards against (verified on LoCoMo conv0): after
-        steady-state cascade ingest, ``nearest_to_text("any_common_word")``
-        returns 0 hits even though the column literally contains the
-        token in 100% of rows — the new fragments simply hadn't been
-        indexed.
+        (Older lancedb — at/below the ``>=0.13.0`` floor this repo once
+        pinned — did **not** flat-scan the FTS tail, so post-build rows
+        were genuinely invisible to BM25 until ``optimize()``; that is
+        the behaviour the historical LoCoMo-conv0 note described. The
+        flat-scan fallback closed that gap, so optimize is now purely
+        about keeping that tail small.)
+
+        What ``optimize()`` actually buys on the current stack:
+
+        - **Query speed** — the unindexed tail is flat-scanned on every
+          query; merging it into the index keeps that scan bounded as
+          ingest accumulates.
+        - **Storage hygiene** — with ``cleanup_older_than`` it prunes
+          replaced fragments / stale manifests / dead index files,
+          bounding the on-disk file count (and FD usage at scan time).
 
         Cascade triggers this through a per-kind throttle + trailing
         edge scheduler (``CascadeWorker._schedule_optimize``): at most
-        one run per ~1s window per kind, decoupled from the drain
+        one run per throttle window per kind, decoupled from the drain
         loop, with a 60s heartbeat sweep as a safety net. Cost is
         O(N) data-rewrite per optimized fragment; the throttle is how
-        we cap it under sustained write pressure.
+        we cap it under sustained write pressure. Because visibility no
+        longer depends on it, the throttle window can be generous.
 
         Args:
             cleanup_older_than: When set, also prune (physically delete)
@@ -426,6 +440,29 @@ class LanceRepoBase[T: BaseLanceTable]:
         if where is not None:
             q = q.where(where)
         return await q.limit(limit).to_list()
+
+    # ── Update ─────────────────────────────────────────────────────────────
+
+    async def update(
+        self,
+        updates: dict[str, Any],
+        *,
+        where: str,
+    ) -> None:
+        """Partial column update for rows matching ``where``.
+
+        Wraps ``AsyncTable.update`` — sets specific column values without
+        rewriting the full row. Useful for lightweight metadata patches
+        (e.g. setting ``deprecated_by``) where a full embed+upsert cycle
+        is unnecessary.
+
+        Args:
+            updates: Column-name to new-value mapping.
+            where: SQL-like predicate scoping the update.
+        """
+        table = await self._table()
+        async with self._write_lock(self.table_name):
+            await table.update(updates, where=where)
 
     # ── Delete ─────────────────────────────────────────────────────────────
 

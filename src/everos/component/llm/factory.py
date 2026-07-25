@@ -28,7 +28,7 @@ def build_llm_provider(settings: LLMSettings) -> LLMClient:
     Raises:
         ValueError: If ``api_key`` or ``base_url`` is unset.
     """
-    if settings.api_key is None:
+    if not settings.api_key or not settings.api_key.get_secret_value():
         raise ValueError(
             "LLM api_key is not configured "
             "(set EVEROS_LLM__API_KEY or [llm] api_key in user toml)"

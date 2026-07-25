@@ -36,7 +36,7 @@ class Episode(BaseLanceTable):
     app_id: str = "default"
     project_id: str = "default"
     """App / project scope (default ``"default"``); cascade fills from md path."""
-    session_id: str
+    session_id: str | None = None
     timestamp: _dt.datetime
 
     parent_type: str = ParentType.MEMCELL.value
@@ -75,4 +75,10 @@ class Episode(BaseLanceTable):
     NOT in the hash so editing them doesn't waste an embedding call.
     See ``16_cascade_impl_design.md`` §3.3."""
 
+    deprecated_by: str | None = None
+    """Soft-delete marker set by Reflection when this episode is
+    consolidated into a cluster. Value is the cluster entry_id that
+    supersedes this row. ``NULL`` means the row is still active."""
+
     vector: Vector(_DIM)  # type: ignore[valid-type]
+    subject_vector: Vector(_DIM) | None = None  # type: ignore[valid-type]

@@ -59,7 +59,7 @@ def _get_embedding() -> EmbeddingProvider | None:
     from everos.config import load_settings
 
     cfg = load_settings().embedding
-    if not cfg.model or cfg.api_key is None:
+    if not cfg.model or not cfg.api_key or not cfg.api_key.get_secret_value():
         logger.warning(
             "embedding_not_configured",
             hint="set [embedding] model / api_key to enable vector / hybrid search",
@@ -82,10 +82,11 @@ def _get_reranker() -> RerankProvider | None:
     from everos.config import load_settings
 
     cfg = load_settings().rerank
-    if not cfg.model or not cfg.base_url:
+    has_key = cfg.api_key and cfg.api_key.get_secret_value()
+    if not cfg.model or not cfg.base_url or not has_key:
         logger.warning(
             "rerank_not_configured",
-            hint="set [rerank] model / base_url to enable agentic search",
+            hint="set [rerank] model / api_key / base_url to enable agentic search",
         )
         _reranker = None
     else:
@@ -104,15 +105,24 @@ def _get_llm_client() -> LLMClient | None:
     from everos.component.llm import build_llm_provider
     from everos.config import load_settings
 
-    cfg = load_settings().llm
-    if cfg.api_key is None or not cfg.base_url:
+    settings = load_settings()
+    cfg = settings.llm
+    if not cfg.api_key or not cfg.api_key.get_secret_value() or not cfg.base_url:
         logger.warning(
             "llm_not_configured",
             hint="set [llm] api_key / base_url to enable hybrid / agentic search",
         )
         _llm_client = None
     else:
-        _llm_client = build_llm_provider(cfg)
+        client = build_llm_provider(cfg)
+        # Record token usage for the hybrid/agentic path, mirroring
+        # get_llm_client() — otherwise the heaviest LLM spend (query
+        # decomposition + rerank judge) is invisible in Langfuse.
+        if settings.observability.enabled:
+            from everos.component.llm._usage_client import UsageRecordingClient
+
+            client = UsageRecordingClient(client)
+        _llm_client = client
         logger.info("search_llm_built", model=cfg.model)
     _llm_resolved = True
     return _llm_client

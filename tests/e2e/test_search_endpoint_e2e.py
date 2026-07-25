@@ -17,7 +17,7 @@ Coverage matrix (see 21_test_taxonomy_debate.md context):
 - include_profile (true / false)
 - filter DSL: session_id eq / timestamp range / sender_id in /
   parent_id (= memcell bridge) / top-level OR / nested AND-OR
-- MRAG fact embedding: hybrid method embeds atomic_facts that share
+- Hierarchical fact eviction: hybrid method embeds atomic_facts that share
   the matched episode's memcell parent
 
 Methods other than ``keyword`` require ``EMBEDDING_*`` creds in .env —
@@ -76,7 +76,7 @@ async def client(
     from everos.core.persistence.sqlite import SQLModel as _SQLModel
     from everos.infra.persistence.sqlite import sqlite_manager
 
-    monkeypatch.setenv("EVEROS_MEMORY__ROOT", str(tmp_path))
+    monkeypatch.setenv("EVEROS_ROOT", str(tmp_path))
     load_settings.cache_clear()
 
     # Lance: reset connection + cached table handles.
@@ -352,10 +352,9 @@ async def test_vector_search_returns_episode_hits(
 ) -> None:
     """``method=vector`` embeds the query and ranks by cosine.
 
-    Seeds atomic_facts alongside episodes because the default
-    ``vector_strategy = "maxsim_atomic"`` (config/default.toml) walks
+    Seeds atomic_facts alongside episodes because the MaxSim path walks
     atomic_fact ANN → max-pool by parent_id → fetch episodes; an
-    episode-only corpus would return 0 hits under that strategy.
+    episode-only corpus would return 0 hits.
     """
     await _seed_episodes(_eps_for_owner(search_seed, "caroline"))
     await _seed_atomic_facts(_facts_for_owner(search_seed, "caroline"))
@@ -370,7 +369,7 @@ async def test_vector_search_returns_episode_hits(
     for ep in data["episodes"]:
         assert ep["user_id"] == "caroline"
         assert ep["score"] > 0  # cosine similarity in [0, 1]
-        # vector path doesn't run MRAG, so no nested facts.
+        # vector path doesn't run hierarchical fact eviction, so no nested facts.
         assert ep["atomic_facts"] == []
 
 
@@ -543,7 +542,7 @@ async def test_hybrid_with_llm_rerank_returns_hits(
 ) -> None:
     """``method=hybrid`` + ``enable_llm_rerank=true`` runs the phase-5 LLM pass.
 
-    Default hybrid stops after MRAG / LR fusion; opting in adds one
+    Default hybrid stops after hierarchical eviction / LR fusion; opting in adds one
     ``chat`` call that re-ranks the top-K. The route must accept the
     flag and still return well-formed episodes.
     """
@@ -1045,16 +1044,16 @@ async def test_search_filter_no_match_returns_empty(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 7. MRAG fact embedding — the memcell-bridge contract
+# 7. Hierarchical fact eviction — the memcell-bridge contract
 # ═══════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.slow
 @pytest.mark.live_llm
-async def test_search_hybrid_mrag_path_runs_with_memcell_facts(
+async def test_search_hybrid_hierarchical_eviction_with_memcell_facts(
     client: AsyncClient, search_seed: dict
 ) -> None:
-    """HYBRID + MRAG path executes end-to-end with shared-memcell facts seeded.
+    """HYBRID + hierarchical eviction end-to-end with memcell facts.
 
     Verifies the wiring:
     - hybrid recall over episodes returns hits
@@ -1065,7 +1064,7 @@ async def test_search_hybrid_mrag_path_runs_with_memcell_facts(
        asserted because ``atomic_fact_recaller.facts_for_episodes``
        currently emits ``FactCandidate(score=0.0)`` for every prefetched
        fact (it's a parent_id lookup, not a query-aware recall). The
-       MRAG ``_expand_heap`` skips facts with non-positive scores, so
+       Hierarchical eviction ``_expand_heap`` skips facts with non-positive scores, so
        they never promote into the top-N. Once facts get a real
        query-aware relevance score (e.g. by running a separate dense
        recall on atomic_fact too), tighten this assertion to verify
@@ -1099,14 +1098,14 @@ async def test_search_hybrid_mrag_path_runs_with_memcell_facts(
 
 @pytest.mark.slow
 @pytest.mark.live_llm
-async def test_hybrid_mrag_injects_facts_with_alpha_zero(
+async def test_hybrid_hierarchical_eviction_injects_facts_with_alpha_zero(
     client: AsyncClient,
     search_seed: dict,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """MRAG end-to-end fact injection, exercised with ``alpha=0``.
+    """Hierarchical eviction end-to-end fact injection, exercised with ``alpha=0``.
 
-    Companion to :func:`test_search_hybrid_mrag_path_runs_with_memcell_facts`.
+    Companion to :func:`test_search_hybrid_hierarchical_eviction_with_memcell_facts`.
     The sibling asserts the contract under prod defaults
     (``alpha=1`` × ``fact.score=0`` → final ≤ 0 → fact never enters the
     top-N). This test patches ``RankConfig.alpha=0`` so facts inherit
@@ -1139,7 +1138,9 @@ async def test_hybrid_mrag_injects_facts_with_alpha_zero(
     assert data["episodes"], "hybrid should return at least one episode"
 
     facts_attached = sum(len(ep["atomic_facts"]) for ep in data["episodes"])
-    assert facts_attached >= 1, "alpha=0 should let MRAG promote ≥1 fact into the top-N"
+    assert facts_attached >= 1, (
+        "alpha=0 should let hierarchical eviction promote >=1 fact"
+    )
 
     # Memcell-bridge invariant — every attached fact's parent_id must
     # match its host episode's parent_id.
@@ -1306,10 +1307,10 @@ async def test_vector_search_with_session_filter(
     recall query (not bypassed by the dense path). Half the seed gets
     a target session, half gets another; only target hits may come back.
 
-    The default ``vector_strategy = "maxsim_atomic"`` filters atomic_facts
-    first (then max-pools to episodes), so the per-episode session_id
-    mutation has to propagate to each fact via its parent memcell id —
-    otherwise the where clause drops every fact and recall returns 0.
+    The MaxSim path filters atomic_facts first (then max-pools to
+    episodes), so the per-episode session_id mutation has to propagate
+    to each fact via its parent memcell id — otherwise the where clause
+    drops every fact and recall returns 0.
     """
     base = _eps_for_owner(search_seed, "caroline")
     facts = _facts_for_owner(search_seed, "caroline")

@@ -37,7 +37,7 @@ async def client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> AsyncIterator[AsyncClient]:
     """FastAPI app with no lifespan; middleware stack is wired by ``create_app``."""
-    monkeypatch.setenv("EVEROS_MEMORY__ROOT", str(tmp_path))
+    monkeypatch.setenv("EVEROS_ROOT", str(tmp_path))
     load_settings.cache_clear()
 
     app = create_app(lifespan_providers=[])
@@ -110,6 +110,26 @@ async def test_metrics_counter_increments_on_request(client: AsyncClient) -> Non
     after = _counter_value(after_resp.text, "/api/v1/memory/get", "422")
 
     assert after - before == 1.0, f"counter not bumped: {before} → {after}"
+
+
+async def test_v1_and_v2_recorded_under_distinct_path_labels(
+    client: AsyncClient,
+) -> None:
+    """v1 and v2 alias hits must NOT collapse into one metric label.
+
+    Both prefixes resolve to the same handler, but the ``path`` label must
+    keep the ``/api/vN`` prefix so existing dashboards keep working and
+    per-version traffic stays distinguishable. (Regression guard: the leaf
+    route only carries its router-relative path, so the label must be built
+    from the full request path, not ``route.path``.)
+    """
+    await client.post("/api/v1/memory/get", json={})
+    await client.post("/api/v2/memory/get", json={})
+
+    dump = (await client.get("/metrics")).text
+    recorded = _all_recorded_paths(dump)
+    assert "/api/v1/memory/get" in recorded, recorded
+    assert "/api/v2/memory/get" in recorded, recorded
 
 
 async def test_metrics_skip_paths_not_recorded(client: AsyncClient) -> None:

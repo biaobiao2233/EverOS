@@ -17,6 +17,16 @@ def test_no_filters_emits_base_clause() -> None:
     where = compile_filters(None, owner_id="alice", owner_type="user")
     assert where == (
         "owner_id = 'alice' AND owner_type = 'user' "
+        "AND app_id = 'default' AND project_id = 'default' "
+        "AND deprecated_by IS NULL"
+    )
+
+
+def test_no_filters_agent_omits_deprecated_by() -> None:
+    where = compile_filters(None, owner_id="bot_42", owner_type="agent")
+    assert "deprecated_by" not in where
+    assert where == (
+        "owner_id = 'bot_42' AND owner_type = 'agent' "
         "AND app_id = 'default' AND project_id = 'default'"
     )
 
@@ -240,5 +250,19 @@ def test_empty_and_array_skips_combinator() -> None:
     where = compile_filters(node, owner_id="alice", owner_type="user")
     assert where == (
         "owner_id = 'alice' AND owner_type = 'user' "
-        "AND app_id = 'default' AND project_id = 'default'"
+        "AND app_id = 'default' AND project_id = 'default' "
+        "AND deprecated_by IS NULL"
     )
+
+
+# ── Deprecated exclusion ──────────────────────────────────────────────
+
+
+def test_compile_filters_excludes_deprecated_by_for_user() -> None:
+    result = compile_filters(None, owner_id="u_a", owner_type="user")
+    assert "deprecated_by IS NULL" in result
+
+
+def test_compile_filters_omits_deprecated_by_for_agent() -> None:
+    result = compile_filters(None, owner_id="agent_1", owner_type="agent")
+    assert "deprecated_by" not in result

@@ -36,7 +36,7 @@ def build_embedding_provider(
             "Embedding model is not configured "
             "(set EVEROS_EMBEDDING__MODEL or [embedding] model in user toml)"
         )
-    if settings.api_key is None:
+    if not settings.api_key or not settings.api_key.get_secret_value():
         raise ValueError(
             "Embedding api_key is not configured (set EVEROS_EMBEDDING__API_KEY)"
         )

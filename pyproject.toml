@@ -1,6 +1,6 @@
 [project]
 name = "everos"
-version = "1.0.0"
+version = "1.2.0"
 description = "EverOS — local-first markdown memory framework for AI agents and user chats; lightweight, dev-friendly, small-team"
 license = {text = "Apache-2.0"}
 readme = "README.md"
@@ -10,18 +10,20 @@ authors = [
 ]
 keywords = ["memory", "ai-agent", "markdown", "lancedb", "rag", "everos"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
 ]
+
 dependencies = [
     # Core data validation & config
     "pydantic>=2.7.1",
     "pydantic-settings>=2.0.0",
-    "python-dotenv>=1.0.1",
 
     # Storage stack (md-first three-piece set)
     "lancedb>=0.13.0",            # Vector + BM25 + scalar filter (Arrow-based)
@@ -39,17 +41,19 @@ dependencies = [
 
     # Web framework (entrypoints/api)
     "fastapi>=0.104.0",
+    "python-multipart>=0.0.7",    # Required by FastAPI for Form / UploadFile endpoints
     "uvicorn[standard]>=0.24.0",
 
     # Observability (core/observability)
     "structlog>=24.0.0",
     "prometheus-client>=0.20.0",
 
-    # CLI
+    # CLI + TUI
     "typer>=0.12.0",
+    "textual>=8.2.7",
 
     # Tokenization (BM25 Chinese support)
-    "jieba==0.42.1",
+    "jieba>=0.42.1,<1.0",
 
     # OME (Offline Memory Evolution) async scheduler & file I/O
     "apscheduler>=3.10.4,<4.0",   # async strategy scheduler chassis
@@ -58,15 +62,26 @@ dependencies = [
     "anyio>=4.0",                  # Async file I/O (anyio.Path, to_thread.run_sync) for the markdown layer
 
     # Algorithm library (everalgo monorepo, published on PyPI).
-    "everalgo-core==0.2.0",
-    "everalgo-boundary==0.2.0",
-    "everalgo-user-memory==0.2.0",
-    "everalgo-agent-memory==0.2.0",
-    "everalgo-rank==0.3.0",
+    "everalgo-user-memory==0.3.1",
+    "everalgo-agent-memory==0.3.1",
+    "everalgo-rank==0.4.1",
+    "everalgo-knowledge==0.1.1",
 ]
 
 [project.optional-dependencies]
-multimodal = ["everalgo-parser[svg]>=0.1.0"]  # [svg] bundles cairosvg → SVG works by default
+multimodal = ["everalgo-parser[svg]>=0.2.1"]  # [svg] bundles cairosvg → SVG works by default
+# Native OpenTelemetry tracing export. Optional — EverOS never imports these
+# unless [observability] is enabled. Install with: pip install everos[otel]
+otel = [
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.27.0",
+]
+
+[project.urls]
+Homepage = "https://evermind.ai"
+Repository = "https://github.com/EverMind-AI/EverOS"
+Changelog = "https://github.com/EverMind-AI/EverOS/blob/main/CHANGELOG.md"
+"Bug Tracker" = "https://github.com/EverMind-AI/EverOS/issues"
 
 [build-system]
 requires = ["hatchling"]
@@ -83,16 +98,14 @@ packages = ["src/everos"]
 # things like CLAUDE.md, .claude/, CI configs, or IDE settings. New top-level
 # files default to NOT-shipped — you have to opt them in here.
 #
-# exclude is kept as belt-and-suspenders for build artefacts that CI may
-# generate inside the project tree (e.g. UV_CACHE_DIR=.uv-cache).
+# exclude is kept as belt-and-suspenders for build artefacts that CI generates
+# inside the project tree (UV_CACHE_DIR=.uv-cache in .gitlab-ci.yml).
 [tool.hatch.build.targets.sdist]
 include = [
     "/src",
     "/tests",
-    "/data",
     "/docs",
     "/pyproject.toml",
-    "/uv.lock",
     "/README.md",
     "/QUICKSTART.md",
     "/CHANGELOG.md",
@@ -120,14 +133,20 @@ target-version = "py312"
 extend-exclude = ["src_old"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "UP", "B", "SIM", "ASYNC"]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "ASYNC", "RUF"]
+ignore = [
+    "RUF001",  # ambiguous Unicode in strings (intentional × – symbols)
+    "RUF002",  # ambiguous Unicode in docstrings
+    "RUF003",  # ambiguous Unicode in comments
+    "RUF012",  # mutable class attribute default (SQLModel requires this)
+]
 
 [tool.ruff.lint.per-file-ignores]
 # LoCoMo benchmark embeds LLM prompts (ANSWER_PROMPT / JUDGE_*_PROMPT) and
 # verbose argparse help strings as multi-line string literals. Line breaks
 # would change what the LLM actually sees or noise the --help output, so
 # E501 is silenced for this file only.
-"tests/test_locomo.py" = ["E501"]
+"benchmarks/run.py" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -135,6 +154,21 @@ python_files = ["test_*.py"]
 python_functions = ["test_*"]
 asyncio_mode = "auto"
 addopts = "-v --tb=short -m 'not slow and not live_llm'"
+filterwarnings = [
+    "error",
+    # jieba 0.42.1: unescaped backslashes in regex strings (upstream
+    # unmaintained; no fix available).  Python 3.12 emits
+    # SyntaxWarning for invalid escape sequences.
+    "ignore:invalid escape sequence:SyntaxWarning",
+    # aiosqlite teardown: connection-worker thread and Connection.__del__
+    # raise after pytest closes the event loop.  Upstream issue
+    # (aiosqlite + pytest-asyncio); we cannot fix their lifecycle.
+    "ignore:Exception in thread.*_connection_worker_thread:pytest.PytestUnhandledThreadExceptionWarning",
+    # aiosqlite + asyncio teardown: Connection.__del__ and
+    # BaseEventLoop.__del__ fire after pytest closes the event loop.
+    # Upstream lifecycle issue; we cannot fix their cleanup order.
+    "ignore:Exception ignored.*:pytest.PytestUnraisableExceptionWarning",
+]
 markers = [
     "slow: runs that take >=10s (regardless of dependency); CI default excludes these. Run with `pytest -m slow`.",
     "live_llm: requires real LLM / embedder / reranker credentials from .env; burns tokens. CI default excludes. Run with `pytest -m live_llm`.",
@@ -144,6 +178,15 @@ markers = [
 source = ["src/everos"]
 branch = true
 omit = ["**/__init__.py"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+exclude_lines = [
+    "if TYPE_CHECKING:",
+    "@abstractmethod",
+    "pragma: no cover",
+]
 
 [tool.importlinter]
 root_packages = ["everos"]
@@ -218,4 +261,8 @@ dev = [
     "pre-commit>=4.0.0",
     "ipdb>=0.13.13",
     "pyinstrument>=5.0.0",
+    # Tracing tests must actually run (no skip-when-absent), so the optional
+    # [otel] stack is always present in the dev / CI environment.
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.27.0",
 ]

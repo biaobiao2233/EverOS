@@ -153,7 +153,7 @@ def _apply_one_strategy(
         if _needs_aps_reschedule(meta.trigger, new_trigger):
             _maybe_reschedule_aps(engine, name, new_trigger)
         registry.replace(name, new_meta)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         # User-fixable config error (typo / type mismatch / APS runtime
         # failure) — log + skip this strategy's atomic group, never the loop.
         logger.warning(
@@ -207,6 +207,11 @@ class ConfigReloader:
         """Fire-and-forget the watch loop. Idempotent: raises on double-start."""
         if self._path is None:
             return
+        if not self._path.exists():
+            raise FileNotFoundError(
+                f"{self._path} not found. "
+                "Run `everos init` to create configuration files."
+            )
         if self._task is not None and not self._task.done():
             raise RuntimeError("ConfigReloader already started")
         self._task = asyncio.create_task(self._loop())
@@ -223,12 +228,12 @@ class ConfigReloader:
         """Initial load + per-FS-change reload; survives single-iteration failures."""
         try:
             await self._load_once()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("config_reload_iteration_failed")
         async for _changes in awatch(self._path, debounce=self._debounce_ms):
             try:
                 await self._load_once()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("config_reload_iteration_failed")
 
     async def _load_once(self) -> None:

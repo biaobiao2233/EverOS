@@ -1,4 +1,4 @@
-"""Public DTOs for ``POST /api/v1/memory/search``.
+"""Public DTOs for ``POST /api/v2/memory/search``.
 
 Contract per the final design:
 
@@ -56,7 +56,7 @@ class FilterNode(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    """Request body for ``POST /api/v1/memory/search``.
+    """Request body for ``POST /api/v2/memory/search``.
 
     Callers identify the memory owner via ``user_id`` XOR ``agent_id`` —
     exactly one must be set. Internally the manager + compile_filters keep
@@ -80,12 +80,20 @@ class SearchRequest(BaseModel):
     method: SearchMethod = SearchMethod.HYBRID
     top_k: int = -1
     radius: float | None = Field(default=None, ge=0.0, le=1.0)
+    min_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    """Post-fusion relevance floor for the episode HYBRID path.
+
+    Applied after heap-expand against the LR-calibrated score in ``[0, 1]``:
+    items scoring below this value are dropped. Independent of ``radius``
+    (which gates raw cosine at recall time); ``None`` disables the floor.
+    Only the episode hybrid path consumes it — other methods ignore it.
+    """
     include_profile: bool = False
     enable_llm_rerank: bool = Field(
         default=False,
         description=(
             "Opt-in LLM rerank pass for HYBRID. Applies to agent_case "
-            "and agent_skill fusion only; the episode hierarchy path "
+            "and agent_skill fusion only; the episode hybrid path "
             "has built-in fact eviction and ignores this flag. "
             "Ignored by keyword / vector / agentic."
         ),
@@ -148,7 +156,8 @@ class SearchEpisodeItem(BaseModel):
     """Owning user (``None`` only on malformed cascade rows)."""
     app_id: str = "default"
     project_id: str = "default"
-    session_id: str
+    session_id: str | None = None
+    """``None`` for merged episodes (Reflection aggregation products)."""
     timestamp: _dt.datetime
     sender_ids: list[str] = Field(default_factory=list)
     summary: str

@@ -83,7 +83,7 @@ class _StubEmbedder(EmbeddingProvider):
 async def cascade_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> AsyncIterator[MemoryRoot]:
-    monkeypatch.setenv("EVEROS_MEMORY__ROOT", str(tmp_path))
+    monkeypatch.setenv("EVEROS_ROOT", str(tmp_path))
     monkeypatch.setenv("EVEROS_EMBEDDING__MODEL", "stub-model")
     monkeypatch.setenv("EVEROS_EMBEDDING__BASE_URL", "http://stub.invalid/v1")
     monkeypatch.setenv("EVEROS_EMBEDDING__API_KEY", "stub-key")
@@ -93,6 +93,7 @@ async def cascade_runtime(
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
     await ensure_business_indexes()
+    (tmp_path / "ome.toml").write_text("# test\n")
     yield MemoryRoot.default()
     await dispose_connection()
     await dispose_engine()
@@ -214,12 +215,12 @@ _KIND_CASES: list[_DailyLogKindCase] = [
 
 async def _wait_path_done(md_path: str, *, deadline: float = 15.0) -> None:
     async with asyncio.timeout(deadline):
-        while True:  # noqa: ASYNC110 - polling cascade state
+        while True:
             row = await md_change_state_repo.get_by_id(md_path)
             if row is not None:
                 break
             await asyncio.sleep(0.05)
-        while True:  # noqa: ASYNC110 - polling cascade state
+        while True:
             row = await md_change_state_repo.get_by_id(md_path)
             if row is not None and row.status in ("done", "failed"):
                 break
