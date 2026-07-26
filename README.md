@@ -1,8 +1,14 @@
-> [!WARNING]
-> **This is a personal archive fork, not an active contribution.**
-> The `main` branch follows current upstream EverOS. A pre-rewrite bug-fix
-> branch is retained for historical reference; see
-> [FORK_ARCHIVE.md](FORK_ARCHIVE.md).
+> [!IMPORTANT]
+> **Production-optimized fork / 生产优化版已开源**
+>
+> The default `main` branch continues to track current upstream EverOS. The
+> production-derived implementation is published separately on
+> **[`production-optimized`](https://github.com/biaobiao2233/EverOS/tree/production-optimized)**
+> so its older upstream base is not silently mixed into the 1.2.x line.
+>
+> 完整的原版差异、每个处理环节所用组件、幂等与崩溃恢复设计、Antigravity
+> CLI 文本处理方式、安全边界和已知限制见
+> **[生产优化说明](https://github.com/biaobiao2233/EverOS/blob/production-optimized/PRODUCTION_OPTIMIZED.md)**。
 
 <div align="center" id="readme-top">
 
