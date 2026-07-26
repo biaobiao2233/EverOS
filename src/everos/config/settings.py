@@ -113,19 +113,33 @@ class LLMSettings(BaseModel):
     """LLM client configuration.
 
     Read by the service layer when lazily constructing the LLM client
-    handed to algo extractors. Provider-agnostic field names — the
-    project follows the OpenAI API protocol so any OpenAI-compatible
-    endpoint plugs in via ``base_url``.
+    handed to algo extractors. ``openai`` uses an OpenAI-compatible HTTP
+    endpoint. ``agy_cli`` invokes the official locally authenticated
+    Antigravity CLI without exposing it as a reverse proxy.
 
     Env binding (via parent ``Settings``):
+        EVEROS_LLM__PROVIDER
         EVEROS_LLM__MODEL
         EVEROS_LLM__API_KEY
         EVEROS_LLM__BASE_URL
+        EVEROS_LLM__AGY_EXECUTABLE
+        EVEROS_LLM__AGY_WORKDIR
+        EVEROS_LLM__AGY_AGENT
+        EVEROS_LLM__AGY_MODEL
+        EVEROS_LLM__AGY_TIMEOUT_SECONDS
+        EVEROS_LLM__AGY_MAX_CONCURRENCY
     """
 
+    provider: Literal["openai", "agy_cli"] = "openai"
     model: str = "gpt-4o-mini"
     api_key: SecretStr | None = None
     base_url: str | None = None
+    agy_executable: str = "agy"
+    agy_workdir: Path = Path("~/.local/share/everos/agy-worker")
+    agy_agent: str = "everos-text"
+    agy_model: str | None = None
+    agy_timeout_seconds: float = Field(default=300.0, gt=0)
+    agy_max_concurrency: int = Field(default=1, ge=1, le=1)
 
 
 class MultimodalSettings(BaseModel):

@@ -30,10 +30,12 @@ not need to manage either.
 # ``create_all`` without callers having to import each model module.
 from . import tables as tables  # noqa: F401
 from .repos import QueueSummary as QueueSummary
+from .repos import canonical_json as canonical_json
 from .repos import cluster_repo as cluster_repo
 from .repos import conversation_status_repo as conversation_status_repo
 from .repos import md_change_state_repo as md_change_state_repo
 from .repos import memcell_repo as memcell_repo
+from .repos import memory_operation_repo as memory_operation_repo
 from .repos import mint_cluster_id as mint_cluster_id
 from .repos import unprocessed_buffer_repo as unprocessed_buffer_repo
 from .sqlite_manager import dispose_engine as dispose_engine
@@ -44,6 +46,7 @@ from .tables import ClusterMember as ClusterMember
 from .tables import ConversationStatus as ConversationStatus
 from .tables import MdChangeState as MdChangeState
 from .tables import Memcell as Memcell
+from .tables import MemoryOperation as MemoryOperation
 from .tables import UnprocessedBuffer as UnprocessedBuffer
 
 __all__ = [
@@ -52,8 +55,10 @@ __all__ = [
     "ConversationStatus",
     "MdChangeState",
     "Memcell",
+    "MemoryOperation",
     "QueueSummary",
     "UnprocessedBuffer",
+    "canonical_json",
     "cluster_repo",
     "conversation_status_repo",
     "dispose_engine",
@@ -61,6 +66,7 @@ __all__ = [
     "get_session_factory",
     "md_change_state_repo",
     "memcell_repo",
+    "memory_operation_repo",
     "mint_cluster_id",
     "unprocessed_buffer_repo",
 ]

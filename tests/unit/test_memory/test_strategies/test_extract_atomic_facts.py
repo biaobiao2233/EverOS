@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import importlib
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import structlog.testing
@@ -74,10 +74,13 @@ async def test_extracts_once_and_fans_out_per_sender(
     entries pointing at the same fact bodies.
 
     Per-owner batching: the strategy collects each sender's full fact
-    list and issues one :meth:`append_entries` per owner (not N single
+    list and issues one :meth:`append_entries_once` per owner (not N single
     appends), so the call shape is one batch call per sender.
     """
     monkeypatch.setattr(mod, "_writer", None, raising=False)
+    prompt_loader = MagicMock()
+    prompt_loader.load.return_value = "strict atomic fact prompt"
+    monkeypatch.setattr(mod, "_prompt_loader", prompt_loader, raising=False)
     generic_facts = [
         _fact(None, "alice mentioned a weekend trip to tokyo"),
         _fact(None, "bob said he needs hiking gear"),
@@ -97,7 +100,7 @@ async def test_extracts_once_and_fans_out_per_sender(
         structlog.testing.capture_logs() as captured,
     ):
         mock_cls.return_value.aextract = AsyncMock(return_value=generic_facts)
-        mock_wcls.return_value.append_entries = AsyncMock(return_value=[])
+        mock_wcls.return_value.append_entries_once = AsyncMock()
 
         await extract_atomic_facts(_event(), FakeStrategyContext())
 
@@ -105,11 +108,13 @@ async def test_extracts_once_and_fans_out_per_sender(
     assert mock_cls.return_value.aextract.await_count == 1
     call = mock_cls.return_value.aextract.call_args
     assert call.kwargs["sender_id"] is None
+    assert call.kwargs["prompt"] == "strict atomic fact prompt"
+    prompt_loader.load.assert_called_once_with("atomic_fact_extract")
 
     # 2 senders → 2 batch calls; each batch carries this sender's 2 facts
     # (same generic body re-used).
-    assert mock_wcls.return_value.append_entries.call_count == 2
-    batch_calls = mock_wcls.return_value.append_entries.call_args_list
+    assert mock_wcls.return_value.append_entries_once.call_count == 2
+    batch_calls = mock_wcls.return_value.append_entries_once.call_args_list
     batched_owners = sorted(c.args[0] for c in batch_calls)
     assert batched_owners == ["u_alice", "u_bob"]
     # Flatten items across batches: (owner, fact_text) pairs.
@@ -130,6 +135,40 @@ async def test_extracts_once_and_fans_out_per_sender(
     record = matching[0]
     assert record["count"] == 4
     assert sorted(record["owner_ids"]) == ["u_alice", "u_bob"]
+
+
+async def test_caps_verbose_extraction_at_twelve_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facts = [_fact(None, f"fact {i}") for i in range(14)]
+    monkeypatch.setattr(mod, "_writer", None, raising=False)
+    monkeypatch.setattr(mod, "_prompt_loader", MagicMock(), raising=False)
+
+    with (
+        patch(
+            "everos.memory.strategies.extract_atomic_facts.get_llm_client",
+            return_value=object(),
+        ),
+        patch(
+            "everos.memory.strategies.extract_atomic_facts.AtomicFactExtractor"
+        ) as mock_cls,
+        patch(
+            "everos.memory.strategies.extract_atomic_facts.AtomicFactWriter"
+        ) as mock_wcls,
+        structlog.testing.capture_logs() as captured,
+    ):
+        mock_cls.return_value.aextract = AsyncMock(return_value=facts)
+        mock_wcls.return_value.append_entries_once = AsyncMock()
+        await extract_atomic_facts(_event(), FakeStrategyContext())
+
+    assert mock_wcls.return_value.append_entries_once.call_count == 2
+    assert all(
+        len(call.args[1]) == mod.MAX_FACTS_PER_MEMCELL
+        for call in mock_wcls.return_value.append_entries_once.call_args_list
+    )
+    cap_logs = [e for e in captured if e.get("event") == "atomic_facts_capped"]
+    assert cap_logs[0]["extracted"] == 14
+    assert cap_logs[0]["kept"] == 12
 
 
 async def test_writes_md_for_each_fact(
@@ -154,7 +193,7 @@ async def test_writes_md_for_each_fact(
         ) as mock_wcls,
     ):
         mock_cls.return_value.aextract = AsyncMock(return_value=facts)
-        mock_wcls.return_value.append_entries = AsyncMock(return_value=[])
+        mock_wcls.return_value.append_entries_once = AsyncMock()
 
         event = UserPipelineStarted(
             memcell_id="mc_a",
@@ -175,8 +214,8 @@ async def test_writes_md_for_each_fact(
         await extract_atomic_facts(event, FakeStrategyContext())
 
     # Single sender (u_alice) → one batch call with 2 items.
-    assert mock_wcls.return_value.append_entries.call_count == 1
-    batch_call = mock_wcls.return_value.append_entries.call_args
+    assert mock_wcls.return_value.append_entries_once.call_count == 1
+    batch_call = mock_wcls.return_value.append_entries_once.call_args
     assert batch_call.args[0] == "u_alice"
     items = batch_call.args[1]
     assert len(items) == 2
@@ -213,11 +252,11 @@ async def test_skips_when_memcell_has_no_messages(
         structlog.testing.capture_logs() as captured,
     ):
         mock_cls.return_value.aextract = AsyncMock(return_value=[])
-        mock_wcls.return_value.append_entries = AsyncMock(return_value=[])
+        mock_wcls.return_value.append_entries_once = AsyncMock()
         ctx = FakeStrategyContext()
         await extract_atomic_facts(event, ctx)
 
     matching = [e for e in captured if e.get("event") == "atomic_facts_extracted"]
     assert matching, "log line should still fire (count=0)"
     assert matching[0]["count"] == 0
-    mock_wcls.return_value.append_entries.assert_not_called()
+    mock_wcls.return_value.append_entries_once.assert_not_called()

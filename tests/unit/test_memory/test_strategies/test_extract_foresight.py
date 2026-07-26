@@ -91,7 +91,7 @@ async def test_extracts_per_sender(
                 [_foresight("u_bob", "buy plane tickets")],
             ]
         )
-        mock_wcls.return_value.append_entries = AsyncMock(return_value=[])
+        mock_wcls.return_value.append_entries_once = AsyncMock()
 
         await extract_foresight(_event(), FakeStrategyContext())
 
@@ -105,9 +105,9 @@ async def test_extracts_per_sender(
 
     # Per-owner batching: one batch call per owner; here each owner has 1
     # foresight, so two batches each carrying 1 item.
-    assert mock_wcls.return_value.append_entries.call_count == 2
+    assert mock_wcls.return_value.append_entries_once.call_count == 2
     batched_owners = sorted(
-        c.args[0] for c in mock_wcls.return_value.append_entries.call_args_list
+        c.args[0] for c in mock_wcls.return_value.append_entries_once.call_args_list
     )
     assert batched_owners == ["u_alice", "u_bob"]
 
@@ -152,7 +152,7 @@ async def test_writes_md_for_each_foresight(
         ) as mock_wcls,
     ):
         mock_cls.return_value.aextract = AsyncMock(return_value=foresights)
-        mock_wcls.return_value.append_entries = AsyncMock(return_value=[])
+        mock_wcls.return_value.append_entries_once = AsyncMock()
 
         event = UserPipelineStarted(
             memcell_id="mc_a",
@@ -173,8 +173,8 @@ async def test_writes_md_for_each_foresight(
         await extract_foresight(event, FakeStrategyContext())
 
     # Single sender (u_alice) → one batch call with both foresights.
-    assert mock_wcls.return_value.append_entries.call_count == 1
-    batch_call = mock_wcls.return_value.append_entries.call_args
+    assert mock_wcls.return_value.append_entries_once.call_count == 1
+    batch_call = mock_wcls.return_value.append_entries_once.call_args
     assert batch_call.args[0] == "u_alice"
     items = batch_call.args[1]
     assert len(items) == 2
@@ -221,11 +221,11 @@ async def test_skips_when_memcell_has_no_messages(
         structlog.testing.capture_logs() as captured,
     ):
         mock_cls.return_value.aextract = AsyncMock(return_value=[])
-        mock_wcls.return_value.append_entries = AsyncMock(return_value=[])
+        mock_wcls.return_value.append_entries_once = AsyncMock()
         ctx = FakeStrategyContext()
         await extract_foresight(event, ctx)
 
     matching = [e for e in captured if e.get("event") == "foresights_extracted"]
     assert matching, "log line should still fire (count=0)"
     assert matching[0]["count"] == 0
-    mock_wcls.return_value.append_entries.assert_not_called()
+    mock_wcls.return_value.append_entries_once.assert_not_called()

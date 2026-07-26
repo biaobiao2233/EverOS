@@ -19,11 +19,26 @@
 # src/everos/config/default.toml.
 
 # ── LLM ───────────────────────────────────────────────
-# OpenAI-protocol chat-completions endpoint used by the algo extractors.
+# Text model used by the algo extractors. This default uses an
+# OpenAI-compatible chat-completions endpoint.
 [llm]
+provider = "openai"
 model    = "gpt-4o-mini"
-api_key  = "sk-..."
+api_key  = ""
 base_url = "https://api.openai.com/v1"
+
+# Alternative: use an officially installed, locally authenticated
+# Antigravity CLI as a sandboxed text processor. Do not configure api_key or
+# base_url for this provider. The prompt travels over stdin, not argv.
+#
+# [llm]
+# provider                = "agy_cli"
+# agy_executable          = "agy"
+# agy_workdir             = "~/.local/share/everos/agy-worker"
+# agy_agent               = "everos-text"
+# agy_model               = "gemini-3.5-flash-medium"
+# agy_timeout_seconds     = 300.0
+# agy_max_concurrency     = 1
 
 # ── Embedding ─────────────────────────────────────────
 [embedding]

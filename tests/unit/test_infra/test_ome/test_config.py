@@ -48,6 +48,24 @@ def test_aps_jobstore_path_respects_explicit_value(tmp_path: object) -> None:
     assert c.aps_jobstore_path == aps
 
 
+def test_ome_config_rejects_same_db_for_ome_and_aps(tmp_path: object) -> None:
+    from pathlib import Path
+
+    shared = Path(str(tmp_path)) / "shared.db"
+    with pytest.raises(ValidationError, match="different file"):
+        OMEConfig(jobstore_path=shared, aps_jobstore_path=shared)
+
+
+def test_ome_config_rejects_canonical_alias_for_same_db(tmp_path: object) -> None:
+    from pathlib import Path
+
+    root = Path(str(tmp_path))
+    ome = root / "ome.db"
+    aliased = root / "unused" / ".." / "ome.db"
+    with pytest.raises(ValidationError, match="different file"):
+        OMEConfig(jobstore_path=ome, aps_jobstore_path=aliased)
+
+
 def test_ome_config_rejects_unknown_field() -> None:
     with pytest.raises(ValidationError):
         OMEConfig(unknown_field=1)  # type: ignore[call-arg]

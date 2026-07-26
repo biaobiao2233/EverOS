@@ -34,6 +34,9 @@ short-circuits low-quality cases internally via its own
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from everalgo.agent_memory import AgentSkillExtractor
 from everalgo.types import AgentCase as AlgoAgentCase
 from everalgo.types import AgentSkill as AlgoAgentSkill
@@ -65,6 +68,7 @@ from everos.infra.persistence.markdown import (
 )
 from everos.infra.persistence.sqlite import cluster_repo
 from everos.memory.events import SkillClusterUpdated
+from everos.memory.prompt_slots import PromptLoader
 from everos.memory.strategies._partition_locks import get_partition_lock
 
 logger = get_logger(__name__)
@@ -97,6 +101,35 @@ class _CaseNotYetIndexedError(RuntimeError):
 
 
 _writer: AgentSkillWriter | None = None
+_prompt_loader: PromptLoader | None = None
+
+_SKILL_SAFETY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "private_key_material",
+        re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", re.I),
+    ),
+    ("openai_style_secret", re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}")),
+    ("github_token", re.compile(r"\b(?:ghp|github_pat)_[A-Za-z0-9_]{20,}\b")),
+    ("aws_access_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("sshpass_plaintext_password", re.compile(r"\bsshpass\s+-p\b", re.I)),
+    (
+        "ssh_host_verification_disabled",
+        re.compile(r"StrictHostKeyChecking\s*=\s*no", re.I),
+    ),
+    (
+        "ssh_known_hosts_disabled",
+        re.compile(r"UserKnownHostsFile\s*=\s*/dev/null", re.I),
+    ),
+    ("world_writable_permissions", re.compile(r"\bchmod\s+777\b", re.I)),
+    (
+        "tls_verification_disabled",
+        re.compile(
+            r"NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*0|"
+            r"\bverify\s*=\s*False\b|--no-check-certificate",
+            re.I,
+        ),
+    ),
+)
 
 
 def _get_writer() -> AgentSkillWriter:
@@ -104,6 +137,23 @@ def _get_writer() -> AgentSkillWriter:
     if _writer is None:
         _writer = AgentSkillWriter(root=MemoryRoot.default())
     return _writer
+
+
+def _get_prompt_loader() -> PromptLoader:
+    global _prompt_loader
+    if _prompt_loader is None:
+        config_root = Path(__file__).resolve().parents[2] / "config"
+        _prompt_loader = PromptLoader(config_root)
+    return _prompt_loader
+
+
+def _skill_rejection_reason(skill: AlgoAgentSkill) -> str | None:
+    """Return a content-free rule id when a generated skill is unsafe."""
+    text = "\n".join((skill.name, skill.description, skill.content))
+    for rule_id, pattern in _SKILL_SAFETY_PATTERNS:
+        if pattern.search(text):
+            return rule_id
+    return None
 
 
 @offline_strategy(
@@ -152,15 +202,31 @@ async def extract_agent_skill(event: SkillClusterUpdated, ctx: StrategyContext) 
 
         # 5. Run the LLM extractor → add / update / retire skill operations.
         extractor = AgentSkillExtractor(llm=get_llm_client())
+        prompt_loader = _get_prompt_loader()
         emitted_skills = await extractor.aextract(
             _to_algo_case(target_lance),
             existing_relevant_skills=[_to_algo_skill(s) for s in existing_lance],
             supporting_cases=[_to_algo_case(c) for c in supporting_lance],
+            prompt_success=prompt_loader.load("agent_skill_success"),
+            prompt_failure=prompt_loader.load("agent_skill_failure"),
         )
 
         # 6. Write each emitted skill back to its SKILL.md.
         writer = _get_writer()
+        persisted = 0
+        rejected = 0
         for skill in emitted_skills:
+            rejection_reason = _skill_rejection_reason(skill)
+            if rejection_reason is not None:
+                rejected += 1
+                logger.warning(
+                    "agent_skill_rejected_by_safety_gate",
+                    case_entry_id=event.case_entry_id,
+                    cluster_id=event.cluster_id,
+                    agent_id=event.agent_id,
+                    safety_rule=rejection_reason,
+                )
+                continue
             await _persist_skill(
                 writer,
                 skill,
@@ -169,12 +235,15 @@ async def extract_agent_skill(event: SkillClusterUpdated, ctx: StrategyContext) 
                 app_id=event.app_id,
                 project_id=event.project_id,
             )
+            persisted += 1
     logger.info(
         "agent_skills_extracted",
         case_entry_id=event.case_entry_id,
         cluster_id=event.cluster_id,
         agent_id=event.agent_id,
         emitted=len(emitted_skills),
+        persisted=persisted,
+        rejected=rejected,
     )
 
 

@@ -81,8 +81,10 @@ def reconcile(
                 )
             )
             continue
-        # Skip when the row is already done and mtime hasn't moved.
-        if prior.status == "done" and prior.mtime == item.mtime:
+        # Same file version is already known to the cascade queue.
+        # Let pending/processing rows finish instead of re-enqueueing
+        # the same mtime every scanner sweep.
+        if prior.mtime == item.mtime:
             continue
         decisions.append(
             ReconcileDecision(

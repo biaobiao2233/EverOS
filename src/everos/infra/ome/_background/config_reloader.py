@@ -204,7 +204,13 @@ class ConfigReloader:
         self._task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
-        """Fire-and-forget the watch loop. Idempotent: raises on double-start."""
+        """Fire-and-forget the change-only watch loop.
+
+        The owner must call :meth:`load_once` before starting the watcher when
+        it needs a startup snapshot.  Separating the two phases lets OME apply
+        TOML overrides while APScheduler is paused, then watch without racing
+        a duplicate initial load after scheduler resume.
+        """
         if self._path is None:
             return
         if self._task is not None and not self._task.done():
@@ -220,18 +226,14 @@ class ConfigReloader:
             self._task = None
 
     async def _loop(self) -> None:
-        """Initial load + per-FS-change reload; survives single-iteration failures."""
-        try:
-            await self._load_once()
-        except Exception:  # noqa: BLE001
-            logger.exception("config_reload_iteration_failed")
+        """Reload on filesystem changes; survive single-iteration failures."""
         async for _changes in awatch(self._path, debounce=self._debounce_ms):
             try:
-                await self._load_once()
+                await self.load_once()
             except Exception:  # noqa: BLE001
                 logger.exception("config_reload_iteration_failed")
 
-    async def _load_once(self) -> None:
+    async def load_once(self) -> None:
         """Read TOML off the loop, parse + validate, apply overrides."""
 
         def _read_and_parse() -> TomlRoot:

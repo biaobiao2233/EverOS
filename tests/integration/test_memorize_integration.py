@@ -17,6 +17,7 @@ strategy dispatch correctness already has its own coverage in
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import sqlite3
@@ -32,8 +33,13 @@ from everalgo.llm.types import ChatResponse
 from everalgo.testing.fake_llm import FakeLLMClient
 from sqlmodel import SQLModel
 
-from everos.core.persistence import MemoryRoot
-from everos.service.memorize import MemorizeResult, memorize
+from everos.core.persistence import MarkdownReader, MemoryRoot
+from everos.service.memorize import (
+    MemorizeResult,
+    MemoryOperationConflictError,
+    get_memory_operation_status,
+    memorize,
+)
 
 # ---------------------------------------------------------------------------
 # Canned LLM responses
@@ -688,3 +694,146 @@ async def test_same_session_multi_add_concatenates(
     assert len(rows) == 1  # one cell from the flush
     ids = json.loads(rows[0]["message_ids_json"])
     assert len(ids) == 6  # all 6 messages folded in
+
+
+# ---------------------------------------------------------------------------
+# Durable operation ledger
+# ---------------------------------------------------------------------------
+
+
+async def test_operation_resumes_after_memcell_commit_without_duplicate(
+    tmp_path: Path,
+    memorize_env: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await memorize_env(mode="chat", fake_llm=_make_fake_llm(boundary_responses=[[]]))
+    svc = importlib.import_module("everos.service.memorize")
+    real_pipeline = svc._get_user_pipeline()
+
+    class _FailOnce:
+        calls = 0
+
+        async def run(self, *args: Any, **kwargs: Any):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("simulated interruption after boundary commit")
+            return await real_pipeline.run(*args, **kwargs)
+
+    flaky = _FailOnce()
+    monkeypatch.setattr(svc, "_get_user_pipeline", lambda: flaky)
+    operation_id = "evop1-flush-" + "a" * 64
+    payload = {
+        "operation_id": operation_id,
+        "session_id": "op_resume",
+        "messages": [
+            _user("remember this", 1_700_000_000_000),
+            _assistant("ack", 1_700_000_001_000),
+        ],
+    }
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        await memorize(payload, is_final=True)
+    assert len(_memcell_rows(tmp_path)) == 1
+    failed = await get_memory_operation_status(operation_id)
+    assert failed is not None
+    assert failed.state == "failed"
+    assert failed.stage == "memcells_committed"
+    assert failed.retryable is True
+
+    resumed = await memorize(payload, is_final=True)
+    assert resumed.operation_id == operation_id
+    assert resumed.replayed is False
+    assert len(_memcell_rows(tmp_path)) == 1
+    assert len(_episode_paths(tmp_path)) == 1
+    parsed = await MarkdownReader.read(_episode_paths(tmp_path)[0])
+    assert len(parsed.entries) == 1
+
+    replay = await memorize(payload, is_final=True)
+    assert replay.operation_id == operation_id
+    assert replay.replayed is True
+    assert replay.message_count == resumed.message_count
+    assert len(_memcell_rows(tmp_path)) == 1
+    parsed = await MarkdownReader.read(_episode_paths(tmp_path)[0])
+    assert len(parsed.entries) == 1
+
+
+async def test_operation_id_conflict_is_rejected(
+    memorize_env: Callable[..., Any],
+) -> None:
+    await memorize_env(mode="chat", fake_llm=_make_fake_llm(boundary_responses=[[]]))
+    operation_id = "evop1-flush-" + "b" * 64
+    first = {
+        "operation_id": operation_id,
+        "session_id": "op_conflict",
+        "messages": [_user("first", 1_700_000_000_000)],
+    }
+    await memorize(first, is_final=True)
+
+    changed = {
+        **first,
+        "messages": [_user("changed", 1_700_000_000_000)],
+    }
+    with pytest.raises(MemoryOperationConflictError, match="different request"):
+        await memorize(changed, is_final=True)
+
+
+async def test_concurrent_same_operation_converges_to_one_result(
+    tmp_path: Path,
+    memorize_env: Callable[..., Any],
+) -> None:
+    await memorize_env(mode="chat", fake_llm=_make_fake_llm(boundary_responses=[[]]))
+    payload = {
+        "operation_id": "evop1-flush-" + "c" * 64,
+        "session_id": "op_concurrent",
+        "messages": [
+            _user("one request", 1_700_000_000_000),
+            _assistant("one result", 1_700_000_001_000),
+        ],
+    }
+
+    first, second = await asyncio.gather(
+        memorize(payload, is_final=True),
+        memorize(payload, is_final=True),
+    )
+    assert sorted([first.replayed, second.replayed]) == [False, True]
+    assert len(_memcell_rows(tmp_path)) == 1
+    assert len(_episode_paths(tmp_path)) == 1
+
+
+async def test_waiter_timeout_does_not_fail_the_active_operation_receipt(
+    tmp_path: Path,
+    memorize_env: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await memorize_env(mode="chat", fake_llm=_make_fake_llm(boundary_responses=[[]]))
+    monkeypatch.setenv("EVEROS_MEMORIZE__SESSION_LOCK_TIMEOUT_SECONDS", "0.05")
+    from everos.config import load_settings
+    from everos.service._session_lock import scoped_session_lock
+
+    load_settings.cache_clear()
+    operation_id = "evop1-flush-" + "d" * 64
+    payload = {
+        "operation_id": operation_id,
+        "session_id": "op_waiter_timeout",
+        "messages": [
+            _user("lease owner", 1_700_000_000_000),
+            _assistant("ack", 1_700_000_001_000),
+        ],
+    }
+
+    async with scoped_session_lock(MemoryRoot.default(), "op_waiter_timeout"):
+        with pytest.raises(TimeoutError):
+            await memorize(payload, is_final=True)
+
+    waiting = await get_memory_operation_status(operation_id)
+    assert waiting is not None
+    assert waiting.state == "running"
+    assert waiting.stage == "claimed"
+    assert waiting.error_code is None
+
+    monkeypatch.setenv("EVEROS_MEMORIZE__SESSION_LOCK_TIMEOUT_SECONDS", "5")
+    load_settings.cache_clear()
+    completed = await memorize(payload, is_final=True)
+    assert completed.operation_id == operation_id
+    assert completed.status == "extracted"
+    assert len(_memcell_rows(tmp_path)) == 1

@@ -26,7 +26,12 @@ from __future__ import annotations
 from everalgo.agent_memory import AgentCaseExtractor
 
 from everos.component.llm import get_llm_client
-from everos.component.utils.datetime import from_timestamp, to_iso_format
+from everos.component.utils.datetime import (
+    from_iso_format,
+    from_timestamp,
+    to_iso_format,
+    to_timestamp_ms,
+)
 from everos.core.observability.logging import get_logger
 from everos.core.persistence import MemoryRoot
 from everos.infra.ome.context import StrategyContext
@@ -80,6 +85,7 @@ async def extract_agent_case(event: AgentPipelineStarted, ctx: StrategyContext) 
     #    AgentCaseExtracted → downstream trigger_skill_clustering.
     algo_case = algo_cases[0]
     writer = _get_writer()
+    source_date = from_timestamp(event.memcell.timestamp).date()
     for agent_id in agent_ids:
         case = AgentCase.from_algo(
             algo_case,
@@ -88,20 +94,25 @@ async def extract_agent_case(event: AgentPipelineStarted, ctx: StrategyContext) 
             parent_id=event.memcell_id,
         )
         inline, sections = _agent_case_to_entry_body(case)
-        eid = await writer.append_entry(
+        append = await writer.append_entry_once(
             case.owner_id,
+            parent_id=event.memcell_id,
             inline=inline,
             sections=sections,
+            date=source_date,
             app_id=event.app_id,
             project_id=event.project_id,
         )
+        stored = append.entries[0]
         await ctx.emit(
             AgentCaseExtracted(
                 memcell_id=event.memcell_id,
-                case_entry_id=eid.format(),
-                task_intent=case.task_intent,
-                quality_score=case.quality_score,
-                case_timestamp_ms=case.timestamp,
+                case_entry_id=stored.marker_id,
+                task_intent=stored.sections["TaskIntent"],
+                quality_score=float(stored.inline["quality_score"]),
+                case_timestamp_ms=to_timestamp_ms(
+                    from_iso_format(stored.inline["timestamp"])
+                ),
                 agent_id=case.owner_id,
                 app_id=event.app_id,
                 project_id=event.project_id,

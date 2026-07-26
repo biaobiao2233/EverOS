@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
+from apscheduler.schedulers.base import STATE_PAUSED
+from pydantic import ValidationError
 
+from everos.component.utils.datetime import get_utc_now
 from everos.infra.ome.config import OMEConfig
 from everos.infra.ome.context import StrategyContext
 from everos.infra.ome.decorator import offline_strategy
-from everos.infra.ome.engine import OfflineEngine
+from everos.infra.ome.engine import OfflineEngine, _runner_entry
 from everos.infra.ome.events import BaseEvent
 from everos.infra.ome.exceptions import (
     EngineLockHeldError,
@@ -35,6 +40,49 @@ class _B(BaseEvent):
 @pytest.fixture
 def cfg(tmp_path: Path) -> OMEConfig:
     return OMEConfig(jobstore_path=tmp_path / "ome.db", config_watch=False)
+
+
+def test_engine_id_is_stable_for_logical_jobstore(tmp_path: Path) -> None:
+    first_cfg = OMEConfig(jobstore_path=tmp_path / "ome.db", config_watch=False)
+    same_cfg = OMEConfig(jobstore_path=(tmp_path / "." / "ome.db"), config_watch=False)
+    other_cfg = OMEConfig(jobstore_path=tmp_path / "other.db", config_watch=False)
+
+    assert (
+        OfflineEngine(config=first_cfg)._engine_id
+        == OfflineEngine(config=same_cfg)._engine_id
+    )
+    assert (
+        OfflineEngine(config=first_cfg)._engine_id
+        != OfflineEngine(config=other_cfg)._engine_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_rebinds_legacy_persisted_runner_job(cfg: OMEConfig) -> None:
+    first = OfflineEngine(config=cfg)
+    await first.start()
+    first._scheduler.add_job(
+        _runner_entry,
+        trigger="date",
+        run_date=get_utc_now() + timedelta(hours=1),
+        args=["legacy-random-engine", "s", "legacy-job", "x:E", "{}", 1],
+        id="legacy-job",
+        replace_existing=True,
+        misfire_grace_time=None,
+    )
+    await first.stop()
+
+    restarted = OfflineEngine(config=cfg)
+    await restarted.start()
+    try:
+        job = restarted._scheduler.get_job("legacy-job")
+        assert job is not None
+        assert job.args[0] == restarted._engine_id
+        assert restarted._active_runs == 1
+        restarted._scheduler.remove_job("legacy-job")
+        restarted._recompute_active_runs()
+    finally:
+        await restarted.stop()
 
 
 @pytest.mark.asyncio
@@ -75,6 +123,155 @@ async def test_engine_lock_prevents_double_open(cfg: OMEConfig) -> None:
             await engine2.start()
     finally:
         await engine1.stop()
+
+
+@pytest.mark.asyncio
+async def test_engine_lock_prevents_two_ome_dbs_sharing_one_aps_db(
+    tmp_path: Path,
+) -> None:
+    """The APS SQLite file is a shared mutable resource and needs its own lock.
+
+    The failed second start first acquires its private OME lock (path sorting
+    makes ``ome-2`` precede ``shared``), so starting a third engine on that OME
+    DB also proves partial-acquisition cleanup released every handle.
+    """
+
+    shared_aps = tmp_path / "shared.aps.db"
+    first = OfflineEngine(
+        config=OMEConfig(
+            jobstore_path=tmp_path / "ome-1.db",
+            aps_jobstore_path=shared_aps,
+            config_watch=False,
+        )
+    )
+    second = OfflineEngine(
+        config=OMEConfig(
+            jobstore_path=tmp_path / "ome-2.db",
+            aps_jobstore_path=shared_aps,
+            config_watch=False,
+        )
+    )
+    await first.start()
+    try:
+        with pytest.raises(EngineLockHeldError):
+            await second.start()
+        assert second._lock_handles == []
+        assert second._lock_handle is None
+
+        third = OfflineEngine(
+            config=OMEConfig(
+                jobstore_path=tmp_path / "ome-2.db",
+                aps_jobstore_path=tmp_path / "third.aps.db",
+                config_watch=False,
+            )
+        )
+        await third.start()
+        await third.stop()
+    finally:
+        await first.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("strategy_name", "event_topic", "event_payload", "max_retries", "error"),
+    [
+        ("missing", _E.topic(), _E().model_dump_json(), 0, KeyError),
+        ("s", "not-a-topic", "{}", 0, ValueError),
+        ("s", _E.topic(), '{"unknown": true}', 0, ValidationError),
+        ("s", _E.topic(), _E().model_dump_json(), -1, ValueError),
+        ("s", _E.topic(), _E().model_dump_json(), "1", TypeError),
+    ],
+)
+async def test_recovery_validates_before_adding_aps_job(
+    cfg: OMEConfig,
+    strategy_name: str,
+    event_topic: str,
+    event_payload: str,
+    max_retries: Any,
+    error: type[Exception],
+) -> None:
+    @offline_strategy(name="s", trigger=Immediate(on=[_E]), emits=[])
+    async def s(event: _E, ctx: StrategyContext) -> None:
+        return None
+
+    engine = OfflineEngine(config=cfg)
+    engine.register(s)
+    engine._scheduler = MagicMock()
+
+    with pytest.raises(error):
+        await engine._enqueue_recovery_job(
+            strategy_name,
+            "replacement-id",
+            event_topic,
+            event_payload,
+            max_retries,
+        )
+    engine._scheduler.add_job.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_invalid_recovery_keeps_source_row_running(cfg: OMEConfig) -> None:
+    engine = OfflineEngine(config=cfg)
+    await engine._storage.init()
+    engine._init_components()
+    engine._scheduler = MagicMock()
+    assert engine._run_record_store is not None
+    await engine._run_record_store.mark_running(
+        run_id="orphan",
+        strategy_name="removed_strategy",
+        attempt=0,
+        event_topic=_E.topic(),
+        event_payload=_E().model_dump_json(),
+        max_retries_snapshot=1,
+    )
+
+    with pytest.raises(RuntimeError, match="orphan"):
+        await engine._run_crash_recovery()
+
+    source = await engine._run_record_store.get("orphan")
+    assert source is not None
+    assert source.status == RunStatus.RUNNING
+    engine._scheduler.add_job.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_initial_toml_load_finishes_before_scheduler_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from everos.infra.ome import engine as engine_mod
+
+    calls: list[str] = []
+
+    class RecordingReloader:
+        def __init__(self, *, engine: OfflineEngine, **_kwargs: Any) -> None:
+            self._engine = engine
+
+        async def load_once(self) -> None:
+            assert self._engine._scheduler.state == STATE_PAUSED
+            calls.append("load")
+
+        def start(self) -> None:
+            assert self._engine._scheduler.state != STATE_PAUSED
+            calls.append("watch")
+
+        async def stop(self) -> None:
+            return None
+
+    monkeypatch.setattr(engine_mod, "ConfigReloader", RecordingReloader)
+    config_path = tmp_path / "ome.toml"
+    config_path.write_text("", encoding="utf-8")
+    engine = OfflineEngine(
+        config=OMEConfig(
+            jobstore_path=tmp_path / "ome.db",
+            config_path=config_path,
+            config_watch=True,
+        )
+    )
+    await engine.start()
+    try:
+        assert calls == ["load", "watch"]
+    finally:
+        await engine.stop()
 
 
 @pytest.mark.asyncio

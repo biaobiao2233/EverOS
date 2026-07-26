@@ -206,6 +206,45 @@ async def test_merges_into_existing_cluster_when_algo_matches() -> None:
     assert emitted[0].cluster_id == "cl_existing0001"
 
 
+async def test_replay_member_short_circuits_without_mutating_cluster() -> None:
+    """A repeated case event re-emits its link but never increments count."""
+    ctx = FakeStrategyContext()
+    existing_cluster = AlgoCluster(
+        id="cl_existing0001",
+        centroid=np.array([0.15] * 1024, dtype=np.float32),
+        count=9,
+        last_ts=1_700_000_000_000,
+        preview=["stable preview"],
+        members=["ac_20260517_0001"],
+    )
+
+    with (
+        patch(
+            "everos.memory.strategies.trigger_skill_clustering.get_embedder"
+        ) as mock_embedder,
+        patch(
+            "everos.memory.strategies.trigger_skill_clustering.cluster_repo"
+        ) as mock_repo,
+        patch(
+            "everos.memory.strategies.trigger_skill_clustering.cluster_by_llm"
+        ) as mock_cluster,
+    ):
+        mock_repo.list_for_owner = AsyncMock(return_value=[existing_cluster])
+        mock_repo.upsert_with_members = AsyncMock(return_value=None)
+
+        await trigger_skill_clustering(_event(), ctx)
+
+    mock_embedder.assert_not_called()
+    mock_cluster.assert_not_called()
+    mock_repo.upsert_with_members.assert_not_called()
+    assert len(ctx.emitted) == 1
+    emitted = ctx.emitted[0]
+    assert isinstance(emitted, SkillClusterUpdated)
+    assert emitted.case_entry_id == "ac_20260517_0001"
+    assert emitted.cluster_id == "cl_existing0001"
+    assert emitted.agent_id == "agent_42"
+
+
 # ── partition lock (agent_id-level serialisation) ────────────────────────
 
 

@@ -50,17 +50,45 @@ async def trigger_profile_clustering(
     # different space's run must not serialise on (or merge into) this one.
     partition = f"{event.app_id}:{event.project_id}:{event.owner_id}"
     async with get_partition_lock("trigger_profile_clustering", partition):
-        # 1. Embed the episode_text into a vector.
-        vector_list = await get_embedder().embed(event.episode_text)
-        vector = np.asarray(vector_list, dtype=np.float32)
-
-        # 2. Load this user's existing user-memory clusters (scoped to space).
+        # 1. Load this user's existing clusters and short-circuit a replay.
         existing = await cluster_repo.list_for_owner(
             event.owner_id,
             "user_memory",
             app_id=event.app_id,
             project_id=event.project_id,
         )
+        matches = [
+            cluster for cluster in existing if event.memcell_id in cluster.members
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"memcell {event.memcell_id!r} belongs to multiple user clusters"
+            )
+        if matches:
+            cluster = matches[0]
+            assert cluster.id is not None
+            # Re-emit so a crash after cluster commit but before downstream
+            # dispatch repairs the missing link without merging twice.
+            await ctx.emit(
+                ProfileClusterUpdated(
+                    memcell_id=event.memcell_id,
+                    cluster_id=cluster.id,
+                    owner_id=event.owner_id,
+                    app_id=event.app_id,
+                    project_id=event.project_id,
+                )
+            )
+            logger.info(
+                "profile_cluster_replay_short_circuit",
+                memcell_id=event.memcell_id,
+                cluster_id=cluster.id,
+                owner_id=event.owner_id,
+            )
+            return
+
+        # 2. Embed the episode_text into a vector.
+        vector_list = await get_embedder().embed(event.episode_text)
+        vector = np.asarray(vector_list, dtype=np.float32)
 
         # 3. Build a size-1 cluster for the fresh memcell (id minted upfront).
         new_cluster = AlgoCluster(

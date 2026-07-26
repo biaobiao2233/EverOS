@@ -40,14 +40,18 @@ from everalgo.types import (
     ToolCallResult,
 )
 from everalgo.types import ToolCall as AlgoToolCall
+from sqlalchemy import delete, select
 
 from everos.component.utils.datetime import from_timestamp, to_timestamp_ms
 from everos.core.observability.logging import get_logger
+from everos.core.persistence.sqlite import session_scope
 from everos.infra.persistence.sqlite import (
+    ConversationStatus,
     Memcell,
+    MemoryOperation,
     UnprocessedBuffer,
     conversation_status_repo,
-    memcell_repo,
+    get_session_factory,
     unprocessed_buffer_repo,
 )
 from everos.memory import CanonicalMessage, IngestResult, ToolCall
@@ -102,6 +106,7 @@ async def prepare_cells(
     prompt_loader: PromptLoader,
     hard_token_limit: int,
     hard_msg_limit: int,
+    operation_id: str | None = None,
 ) -> BoundaryOutcome:
     """Run the boundary stage end-to-end and persist tail back to buffer."""
     app_id = ingested.app_id
@@ -173,20 +178,17 @@ async def prepare_cells(
         )
         for i, (cell, memcell_id) in enumerate(zip(cells, memcell_ids, strict=True))
     ]
-    await memcell_repo.insert_many(rows)
-
     last_cell_ts = max((cell.timestamp for cell in cells), default=0)
-    if last_cell_ts:
-        await conversation_status_repo.touch_last_memcell_ts(
-            ingested.session_id,
-            _TRACK,
-            from_timestamp(last_cell_ts),
-            app_id=app_id,
-            project_id=project_id,
-        )
-
     tail_canonical = _slice_tail(merged, tail)
-    await _replace_buffer(ingested.session_id, tail_canonical, app_id, project_id)
+    await _commit_cells_and_tail(
+        rows=rows,
+        session_id=ingested.session_id,
+        app_id=app_id,
+        project_id=project_id,
+        tail=tail_canonical,
+        last_cell_ts=last_cell_ts,
+        operation_id=operation_id,
+    )
 
     return BoundaryOutcome(
         cells=cells,
@@ -335,6 +337,74 @@ def _to_conversation_item(m: CanonicalMessage) -> ConversationItem:
 
 
 # ── Buffer + status helpers ───────────────────────────────────────────────
+
+
+async def _commit_cells_and_tail(
+    *,
+    rows: list[Memcell],
+    session_id: str,
+    app_id: str,
+    project_id: str,
+    tail: list[CanonicalMessage],
+    last_cell_ts: int,
+    operation_id: str | None,
+) -> None:
+    """Atomically commit MemCells, consume the buffer, and checkpoint an op.
+
+    Previously these were three independent transactions.  A pipeline error
+    could therefore leave committed MemCells plus a consumed buffer without a
+    durable receipt telling a retry what to resume.  Keeping the business rows
+    and the operation stage in one SQLite transaction closes that ambiguity.
+    """
+
+    tail_rows = [_canonical_to_row(message, app_id, project_id) for message in tail]
+    async with session_scope(get_session_factory()) as session:
+        session.add_all(rows)
+
+        if last_cell_ts:
+            stmt = select(ConversationStatus).where(
+                ConversationStatus.app_id == app_id,
+                ConversationStatus.project_id == project_id,
+                ConversationStatus.session_id == session_id,
+                ConversationStatus.track == _TRACK,
+            )
+            status = (await session.execute(stmt)).scalars().first()
+            if status is None:
+                status = ConversationStatus(
+                    app_id=app_id,
+                    project_id=project_id,
+                    session_id=session_id,
+                    track=_TRACK,
+                    last_memcell_ts=from_timestamp(last_cell_ts),
+                )
+                session.add(status)
+            else:
+                status.last_memcell_ts = from_timestamp(last_cell_ts)
+
+        await session.execute(
+            delete(UnprocessedBuffer).where(
+                UnprocessedBuffer.app_id == app_id,
+                UnprocessedBuffer.project_id == project_id,
+                UnprocessedBuffer.session_id == session_id,
+                UnprocessedBuffer.track == _TRACK,
+            )
+        )
+        if tail_rows:
+            session.add_all(tail_rows)
+
+        if operation_id is not None:
+            operation = await session.get(MemoryOperation, operation_id)
+            if operation is None:
+                raise KeyError(f"memory operation not found: {operation_id}")
+            operation.stage = "memcells_committed"
+            operation.memcell_ids_json = json.dumps(
+                [row.memcell_id for row in rows],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+
+        await session.commit()
 
 
 async def _replace_buffer(

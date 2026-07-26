@@ -55,12 +55,26 @@ cache_size_kb = 2048
 # read_consistency_seconds = 5.0
 
 [llm]
-# Provider-agnostic OpenAI-protocol client config. Override via env:
-#   EVEROS_LLM__MODEL, EVEROS_LLM__API_KEY, EVEROS_LLM__BASE_URL
+# Text extraction provider. ``openai`` uses an OpenAI-compatible endpoint.
+# ``agy_cli`` uses a locally installed and authenticated official Antigravity
+# CLI without exposing the account through a reverse proxy.
+# Override via env:
+#   EVEROS_LLM__PROVIDER, EVEROS_LLM__MODEL,
+#   EVEROS_LLM__API_KEY, EVEROS_LLM__BASE_URL
 # Or via a ``.env`` file next to the project root (auto-loaded).
+provider = "openai"
 model = "gpt-4o-mini"
 # api_key = ""
 # base_url = ""
+#
+# Antigravity CLI example:
+# provider = "agy_cli"
+# agy_executable = "agy"
+# agy_workdir = "~/.local/share/everos/agy-worker"
+# agy_agent = "everos-text"
+# agy_model = "gemini-3.5-flash-medium"
+# agy_timeout_seconds = 300.0
+# agy_max_concurrency = 1
 
 [multimodal]
 # Independent LLM for multimodal parsing (everalgo-parser); must accept

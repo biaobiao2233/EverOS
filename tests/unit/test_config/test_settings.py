@@ -31,6 +31,24 @@ def test_load_settings_defaults_from_toml() -> None:
     assert s.sqlite.journal_size_limit_bytes == 64 * 1024 * 1024
     assert s.sqlite.cache_size_kb == 2048
     assert s.lancedb.read_consistency_seconds is None
+    assert s.llm.provider == "openai"
+    assert s.llm.agy_max_concurrency == 1
+
+
+def test_agy_cli_settings_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("EVEROS_LLM__PROVIDER", "agy_cli")
+    monkeypatch.setenv("EVEROS_LLM__AGY_EXECUTABLE", "/opt/agy")
+    monkeypatch.setenv("EVEROS_LLM__AGY_WORKDIR", "/srv/everos-agent")
+    monkeypatch.setenv("EVEROS_LLM__AGY_AGENT", "everos-text")
+    monkeypatch.setenv("EVEROS_LLM__AGY_MODEL", "flash")
+    monkeypatch.setenv("EVEROS_LLM__AGY_TIMEOUT_SECONDS", "90")
+    s = Settings()
+    assert s.llm.provider == "agy_cli"
+    assert s.llm.agy_executable == "/opt/agy"
+    assert s.llm.agy_workdir == Path("/srv/everos-agent")
+    assert s.llm.agy_agent == "everos-text"
+    assert s.llm.agy_model == "flash"
+    assert s.llm.agy_timeout_seconds == 90
 
 
 def test_env_overrides_toml(monkeypatch: pytest.MonkeyPatch) -> None:

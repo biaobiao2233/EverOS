@@ -78,6 +78,30 @@ def test_apply_overrides_replaces_enabled(fake_engine: MagicMock) -> None:
     assert reg.get("s").enabled is False
 
 
+@pytest.mark.asyncio
+async def test_load_once_applies_snapshot_without_starting_watcher(
+    tmp_path: Path, fake_engine: MagicMock
+) -> None:
+    config_path = tmp_path / "ome.toml"
+    config_path.write_text(
+        "[strategies.s]\nenabled = false\nmax_retries = 7\n",
+        encoding="utf-8",
+    )
+    reg = StrategyRegistry()
+    reg.register(_make("s", enabled=True, max_retries=1))
+    reloader = ConfigReloader(
+        config_path=config_path,
+        registry=reg,
+        engine=fake_engine,
+    )
+
+    await reloader.load_once()
+
+    assert reg.get("s").enabled is False
+    assert reg.get("s").max_retries == 7
+    assert reloader._task is None
+
+
 def test_apply_overrides_max_retries(fake_engine: MagicMock) -> None:
     reg = StrategyRegistry()
     reg.register(_make("s", max_retries=1))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -106,7 +107,7 @@ async def test_atomic_facts_round_trip(
         await extract_atomic_facts(_event_for("u_alice"), FakeStrategyContext())
 
     reader = AtomicFactReader(root=MemoryRoot(root=tmp_path))
-    path = reader.path_for("u_alice")
+    path = reader.path_for("u_alice", dt.date(2023, 11, 14))
     assert path.is_file(), f"expected md at {path}"
     content = path.read_text(encoding="utf-8")
     assert "alice likes hiking" in content
@@ -148,7 +149,7 @@ async def test_foresights_round_trip(
         await extract_foresight(_event_for("u_alice"), FakeStrategyContext())
 
     reader = ForesightReader(root=MemoryRoot(root=tmp_path))
-    path = reader.path_for("u_alice")
+    path = reader.path_for("u_alice", dt.date(2023, 11, 14))
     assert path.is_file(), f"expected md at {path}"
     content = path.read_text(encoding="utf-8")
     assert "plans trip to tokyo" in content
@@ -192,7 +193,7 @@ async def test_agent_case_round_trip(
         await extract_agent_case(_agent_event(), FakeStrategyContext())
 
     reader = AgentCaseReader(root=MemoryRoot(root=tmp_path))
-    path = reader.path_for("agent_42")
+    path = reader.path_for("agent_42", dt.date(2023, 11, 14))
     assert path.is_file(), f"expected md at {path}"
     content = path.read_text(encoding="utf-8")
     assert "summarise the doc" in content

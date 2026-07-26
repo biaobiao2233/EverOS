@@ -6,6 +6,7 @@ import pytest
 from pydantic import SecretStr
 
 from everos.component.llm import build_llm_provider
+from everos.component.llm.agy_cli_provider import AgyCLIProvider
 from everos.component.llm.openai_provider import OpenAIProvider
 from everos.config.settings import LLMSettings
 
@@ -26,3 +27,14 @@ def test_builds_openai_provider() -> None:
     s = LLMSettings(model="m", api_key=SecretStr("k"), base_url="https://x")
     p = build_llm_provider(s)
     assert isinstance(p, OpenAIProvider)
+
+
+def test_builds_agy_cli_without_http_credentials(tmp_path) -> None:
+    s = LLMSettings(
+        provider="agy_cli",
+        api_key=None,
+        base_url=None,
+        agy_workdir=tmp_path,
+    )
+    p = build_llm_provider(s)
+    assert isinstance(p, AgyCLIProvider)

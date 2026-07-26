@@ -3,9 +3,9 @@
 Cells / memcell_ids / message_id-mapping / sender lists are produced by
 :mod:`everos.service._boundary` (which also writes the single
 ``memcell`` sqlite row per cell). This pipeline only handles the
-user-perspective output: Episode md + ``UserPipelineStarted`` emit (one
-per cell, fired at the start of ``run`` so atomic_fact / foresight /
-clustering strategies run in parallel with the in-pipeline Episode work).
+user-perspective output: append-once Episode md followed by one
+``UserPipelineStarted`` emit per cell.  The ordering is deliberate: derived
+facts must not get ahead of the canonical Episode when a process dies.
 
 Run inside ``service.memorize`` via ``asyncio.gather`` alongside
 :class:`AgentMemoryPipeline` (the latter only in ``mode="agent"``).
@@ -18,7 +18,12 @@ from typing import TYPE_CHECKING
 from everalgo.types import MemCell as AlgoMemCell
 from everalgo.user_memory import EpisodeExtractor
 
-from everos.component.utils.datetime import from_timestamp, to_iso_format
+from everos.component.utils.datetime import (
+    from_iso_format,
+    from_timestamp,
+    to_iso_format,
+    to_timestamp_ms,
+)
 from everos.core.observability.logging import get_logger
 from everos.memory import Episode, IngestResult, PipelineOutcome
 from everos.memory.events import EpisodeExtracted, UserPipelineStarted
@@ -62,7 +67,7 @@ class UserMemoryPipeline:
         memcell_ids: list[str],
         per_cell_all_senders: list[list[str]],
     ) -> PipelineOutcome:
-        """Emit UserPipelineStarted per cell, then extract Episodes + write md."""
+        """Persist Episodes once, then emit downstream events per cell."""
         if not cells:
             return PipelineOutcome(track=_TRACK, status="accumulated", message_count=0)
         if self._ep_ext is None:
@@ -72,18 +77,6 @@ class UserMemoryPipeline:
             )
             return PipelineOutcome(track=_TRACK, status="skipped", message_count=0)
 
-        # Emit upfront so OME-async strategies (atomic_fact / foresight /
-        # cluster) start in parallel with the in-pipeline Episode work; they
-        # consume the MemCell directly and do not depend on Episode output.
-        for cell, memcell_id in zip(cells, memcell_ids, strict=True):
-            await self._emit_pipeline_started(
-                memcell_id=memcell_id,
-                session_id=ingested.session_id,
-                app_id=ingested.app_id,
-                project_id=ingested.project_id,
-                cell=cell,
-            )
-
         episode_prompt = self._prompt_loader.load("episode_extract")
         md_paths: list[str] = []
         msg_count = 0
@@ -92,53 +85,66 @@ class UserMemoryPipeline:
         ):
             msg_count += len(cell.items)
             user_senders = _unique_user_senders(cell)
-            if not user_senders:
-                continue
-            # One generic LLM call per cell (sender_id=None drives the algo's
-            # whole-memcell EPISODE_GENERATION_PROMPT — explicitly cheaper
-            # than the per-user fan-out per the algo's docstring). Fan-out
-            # is then md-only: every user sender owns a copy of the same
-            # narrative under its own owner_id path.
-            algo_ep = await self._ep_ext.aextract(
-                cell, sender_id=None, prompt=episode_prompt
-            )
-            for sender_id in user_senders:
-                ep = Episode.from_algo(
-                    algo_ep,
-                    owner_id=sender_id,
-                    session_id=ingested.session_id,
-                    sender_ids=all_senders,
-                    parent_id=memcell_id,
+            if user_senders:
+                # One generic LLM call per cell.  Fan-out is md-only: every
+                # user sender owns a copy under its own scope.
+                algo_ep = await self._ep_ext.aextract(
+                    cell, sender_id=None, prompt=episode_prompt
                 )
-                inline, sections = _episode_to_entry_body(ep)
-                eid = await self._episode_writer.append_entry(
-                    ep.owner_id,
-                    inline=inline,
-                    sections=sections,
-                    app_id=ingested.app_id,
-                    project_id=ingested.project_id,
-                )
-                md_paths.append(
-                    str(
-                        self._episode_writer.path_for(
-                            ep.owner_id,
-                            eid.date,
+                source_date = from_timestamp(cell.timestamp).date()
+                for sender_id in user_senders:
+                    ep = Episode.from_algo(
+                        algo_ep,
+                        owner_id=sender_id,
+                        session_id=ingested.session_id,
+                        sender_ids=all_senders,
+                        parent_id=memcell_id,
+                    )
+                    inline, sections = _episode_to_entry_body(ep)
+                    append = await self._episode_writer.append_entry_once(
+                        ep.owner_id,
+                        parent_id=memcell_id,
+                        inline=inline,
+                        sections=sections,
+                        date=source_date,
+                        app_id=ingested.app_id,
+                        project_id=ingested.project_id,
+                    )
+                    eid = append.entry_ids[0]
+                    stored = append.entries[0]
+                    md_paths.append(
+                        str(
+                            self._episode_writer.path_for(
+                                ep.owner_id,
+                                eid.date,
+                                app_id=ingested.app_id,
+                                project_id=ingested.project_id,
+                            )
+                        )
+                    )
+                    # Emit on both create and replay.  If markdown committed
+                    # just before a crash, this repairs the missing outbox.
+                    await self._engine.emit(
+                        EpisodeExtracted(
+                            memcell_id=memcell_id,
+                            episode_entry_id=stored.marker_id,
+                            episode_text=stored.sections["Content"],
+                            episode_timestamp_ms=to_timestamp_ms(
+                                from_iso_format(stored.inline["timestamp"])
+                            ),
+                            owner_id=ep.owner_id,
                             app_id=ingested.app_id,
                             project_id=ingested.project_id,
                         )
                     )
-                )
-                await self._engine.emit(
-                    EpisodeExtracted(
-                        memcell_id=memcell_id,
-                        episode_entry_id=eid.format(),
-                        episode_text=ep.episode,
-                        episode_timestamp_ms=ep.timestamp,
-                        owner_id=ep.owner_id,
-                        app_id=ingested.app_id,
-                        project_id=ingested.project_id,
-                    )
-                )
+
+            await self._emit_pipeline_started(
+                memcell_id=memcell_id,
+                session_id=ingested.session_id,
+                app_id=ingested.app_id,
+                project_id=ingested.project_id,
+                cell=cell,
+            )
 
         return PipelineOutcome(
             track=_TRACK,

@@ -136,6 +136,49 @@
         }
       }
     },
+    "/api/v1/memory/operations/{operation_id}": {
+      "get": {
+        "tags": [
+          "memory"
+        ],
+        "summary": "Memory Operation Status",
+        "description": "Inspect a write receipt without returning conversation content.",
+        "operationId": "memory_operation_status_api_v1_memory_operations__operation_id__get",
+        "parameters": [
+          {
+            "name": "operation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Operation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_MemoryOperationStatus_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/memory/search": {
       "post": {
         "tags": [
@@ -236,6 +279,28 @@
               "extracted"
             ],
             "title": "Status"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "replayed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replayed"
           }
         },
         "type": "object",
@@ -381,6 +446,28 @@
               "no_extraction"
             ],
             "title": "Status"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id"
+          },
+          "replayed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replayed"
           }
         },
         "type": "object",
@@ -827,7 +914,7 @@
             "type": "string",
             "maxLength": 128,
             "minLength": 1,
-            "pattern": "^[a-zA-Z0-9_.-]+$",
+            "pattern": "^[a-zA-Z0-9_.@+-]+$",
             "title": "App Id",
             "default": "default"
           },
@@ -835,7 +922,7 @@
             "type": "string",
             "maxLength": 128,
             "minLength": 1,
-            "pattern": "^[a-zA-Z0-9_.-]+$",
+            "pattern": "^[a-zA-Z0-9_.@+-]+$",
             "title": "Project Id",
             "default": "default"
           },
@@ -847,6 +934,19 @@
             "maxItems": 500,
             "minItems": 1,
             "title": "Messages"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^evop1-add-[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id",
+            "description": "Optional caller-stable idempotency key."
           }
         },
         "type": "object",
@@ -868,7 +968,7 @@
             "type": "string",
             "maxLength": 128,
             "minLength": 1,
-            "pattern": "^[a-zA-Z0-9_.-]+$",
+            "pattern": "^[a-zA-Z0-9_.@+-]+$",
             "title": "App Id",
             "default": "default"
           },
@@ -876,9 +976,22 @@
             "type": "string",
             "maxLength": 128,
             "minLength": 1,
-            "pattern": "^[a-zA-Z0-9_.-]+$",
+            "pattern": "^[a-zA-Z0-9_.@+-]+$",
             "title": "Project Id",
             "default": "default"
+          },
+          "operation_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^evop1-flush-[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Operation Id",
+            "description": "Optional caller-stable idempotency key."
           }
         },
         "type": "object",
@@ -887,11 +1000,104 @@
         ],
         "title": "MemorizeFlushRequest"
       },
+      "MemoryOperationStatus": {
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "title": "Operation Id"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "add",
+              "flush"
+            ],
+            "title": "Kind"
+          },
+          "app_id": {
+            "type": "string",
+            "title": "App Id"
+          },
+          "project_id": {
+            "type": "string",
+            "title": "Project Id"
+          },
+          "session_id": {
+            "type": "string",
+            "title": "Session Id"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "running",
+              "completed",
+              "failed"
+            ],
+            "title": "State"
+          },
+          "stage": {
+            "type": "string",
+            "enum": [
+              "claimed",
+              "memcells_committed",
+              "sync_dispatch_completed"
+            ],
+            "title": "Stage"
+          },
+          "memcell_count": {
+            "type": "integer",
+            "title": "Memcell Count"
+          },
+          "retryable": {
+            "type": "boolean",
+            "title": "Retryable"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          },
+          "response": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response"
+          }
+        },
+        "type": "object",
+        "required": [
+          "operation_id",
+          "kind",
+          "app_id",
+          "project_id",
+          "session_id",
+          "state",
+          "stage",
+          "memcell_count",
+          "retryable"
+        ],
+        "title": "MemoryOperationStatus",
+        "description": "Safe, content-free view exposed by the operation query endpoint."
+      },
       "MessageItemDTO": {
         "properties": {
           "sender_id": {
             "type": "string",
+            "maxLength": 128,
             "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_.@+-]+$",
             "title": "Sender Id"
           },
           "sender_name": {
@@ -1474,6 +1680,23 @@
           "data"
         ],
         "title": "SuccessEnvelope[FlushResponseData]"
+      },
+      "SuccessEnvelope_MemoryOperationStatus_": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/MemoryOperationStatus"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "data"
+        ],
+        "title": "SuccessEnvelope[MemoryOperationStatus]"
       },
       "ToolCallDTO": {
         "properties": {

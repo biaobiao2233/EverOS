@@ -41,6 +41,7 @@ from everos.memory.strategies.extract_agent_skill import (
     _resolve_query_vector,
     _select_existing_skills,
     _select_supporting_cases,
+    _skill_rejection_reason,
     extract_agent_skill,
 )
 
@@ -118,13 +119,18 @@ def _lance_skill(
     return skill
 
 
-def _algo_skill(name: str = "summarise_doc") -> AlgoAgentSkill:
+def _algo_skill(
+    name: str = "summarise_doc",
+    *,
+    description: str | None = None,
+    content: str = "full body of the skill",
+) -> AlgoAgentSkill:
     return AlgoAgentSkill(
         id="dummyuuid",
         cluster_id="",  # caller will post-stamp
         name=name,
-        description=f"how to {name}",
-        content="full body of the skill",
+        description=description or f"how to {name}",
+        content=content,
         confidence=0.7,
         maturity_score=0.5,
         source_case_ids=["ac_20260517_0001"],
@@ -180,6 +186,10 @@ async def test_extracts_and_persists_with_cluster_id_stamped(
     supporting = [_lance_case("ac_20260517_0000")]
     existing = [_lance_skill(name="old_skill", source_case_ids=["ac_20260517_0000"])]
     emitted = [_algo_skill(name="summarise_doc"), _algo_skill(name="batch_then_synth")]
+    module = importlib.import_module("everos.memory.strategies.extract_agent_skill")
+    prompt_loader = MagicMock()
+    prompt_loader.load.side_effect = lambda name: f"prompt:{name}"
+    monkeypatch.setattr(module, "_prompt_loader", prompt_loader, raising=False)
 
     with (
         patch(
@@ -212,8 +222,7 @@ async def test_extracts_and_persists_with_cluster_id_stamped(
         mock_skill_repo.find_in_cluster = AsyncMock(return_value=existing)
         mock_extractor_cls.return_value.aextract = AsyncMock(return_value=emitted)
         mock_writer_cls.return_value.write_main = AsyncMock(return_value=None)
-        mod = importlib.import_module("everos.memory.strategies.extract_agent_skill")
-        monkeypatch.setattr(mod, "_writer", None, raising=False)
+        monkeypatch.setattr(module, "_writer", None, raising=False)
 
         await extract_agent_skill(_event(), FakeStrategyContext())
 
@@ -227,6 +236,8 @@ async def test_extracts_and_persists_with_cluster_id_stamped(
     assert [c.id for c in extractor_call.kwargs["supporting_cases"]] == [
         "ac_20260517_0000"
     ]
+    assert extractor_call.kwargs["prompt_success"] == "prompt:agent_skill_success"
+    assert extractor_call.kwargs["prompt_failure"] == "prompt:agent_skill_failure"
 
     write_calls = mock_writer_cls.return_value.write_main.call_args_list
     assert len(write_calls) == 2
@@ -239,6 +250,32 @@ async def test_extracts_and_persists_with_cluster_id_stamped(
         assert fm.name == expected.name
         assert fm.confidence == expected.confidence
         assert call.kwargs["body"] == expected.content
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("Use sshpass -p hunter2 ssh host", "sshpass_plaintext_password"),
+        ("ssh -o StrictHostKeyChecking=no host", "ssh_host_verification_disabled"),
+        ("Run chmod 777 /srv/app", "world_writable_permissions"),
+        ("Set verify=False for the request", "tls_verification_disabled"),
+        ("Token sk-" + ("a" * 32), "openai_style_secret"),
+    ],
+)
+def test_skill_safety_gate_rejects_high_confidence_patterns(
+    content: str, expected: str
+) -> None:
+    assert _skill_rejection_reason(_algo_skill(content=content)) == expected
+
+
+def test_skill_safety_gate_allows_safe_placeholder_and_verification() -> None:
+    skill = _algo_skill(
+        content=(
+            "## Steps\n1. Read the token from <TOKEN_ENV>.\n"
+            "2. Verify the SSH host fingerprint before connecting."
+        )
+    )
+    assert _skill_rejection_reason(skill) is None
 
 
 # ── _select_existing_skills routing (cluster size × vector availability) ─

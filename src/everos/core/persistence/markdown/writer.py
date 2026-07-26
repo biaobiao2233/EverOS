@@ -48,6 +48,8 @@ from typing import Any
 
 import anyio
 
+from everos.core.errors import PathTraversalError
+
 from ..memory_root import MemoryRoot
 from .entries import EntryId
 from .frontmatter import dump_frontmatter
@@ -57,9 +59,8 @@ from .reader import MarkdownReader
 class MarkdownWriter:
     """Atomic writer for markdown files inside a memory-root.
 
-    The ``memory_root`` reference is held to enable future enforcement that
-    targets stay within the configured root; current writes do not depend on
-    it for the rename itself (same-dir temp file).
+    Every target must resolve inside ``memory_root.root``. This containment
+    check is a defense-in-depth backstop for caller-derived path segments.
     """
 
     def __init__(self, memory_root: MemoryRoot) -> None:
@@ -89,12 +90,22 @@ class MarkdownWriter:
         """
         # Resolve to an absolute canonical path so aliases (relative vs.
         # absolute, symlinks) share the same lock object.
-        key = Path(path).resolve()
+        key = self._ensure_within_root(Path(path))
         lock = self._path_locks.get(key)
         if lock is None:
             lock = asyncio.Lock()
             self._path_locks[key] = lock
         return lock
+
+    def _ensure_within_root(self, target: Path) -> Path:
+        """Reject a write target that resolves outside the memory root."""
+        root = self._memory_root.root
+        resolved = target.resolve()
+        if not resolved.is_relative_to(root):
+            raise PathTraversalError(
+                f"write target escapes the memory root: {resolved} not under {root}"
+            )
+        return resolved
 
     async def write(self, path: Path, content: str) -> Path:
         """Atomically write ``content`` to ``path``.
@@ -108,7 +119,7 @@ class MarkdownWriter:
         Returns:
             ``path`` (resolved as written).
         """
-        target = Path(path)
+        target = self._ensure_within_root(Path(path))
         await anyio.Path(target.parent).mkdir(parents=True, exist_ok=True)
         tmp = target.parent / f".{target.name}.tmp.{uuid.uuid4().hex}"
         try:
@@ -196,7 +207,7 @@ class MarkdownWriter:
         Returns:
             ``path`` (resolved as written).
         """
-        target = Path(path)
+        target = self._ensure_within_root(Path(path))
         async with self.lock_for(target):
             return await self._append_entries_unlocked(
                 target,
@@ -223,7 +234,8 @@ class MarkdownWriter:
         reentrant, so calling this without holding the lock yourself
         breaks the safety contract.
         """
-        target = Path(path)
+        # Canonicalize before even reading an existing path outside the root.
+        target = self._ensure_within_root(Path(path))
 
         # 1. Load existing markdown (or initialise empty).
         if await anyio.Path(target).is_file():

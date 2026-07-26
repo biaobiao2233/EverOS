@@ -6,6 +6,7 @@ as StartupValidationError instead of being silently ignored.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Annotated, Self
 
@@ -121,9 +122,9 @@ class OMEConfig(BaseModel):
         int,
         Field(
             gt=0,
-            description="A run lingering in RUNNING longer than this is "
-            "treated as crashed, marked CRASHED, and re-enqueued with a "
-            "fresh run_id.",
+            description="Compatibility timeout for direct crash-recovery "
+            "scans. Engine startup holds the single-instance lock and "
+            "therefore recovers every pre-existing RUNNING row immediately.",
         ),
     ] = 1800
     config_path: Path | None = Field(
@@ -153,5 +154,15 @@ class OMEConfig(BaseModel):
         if self.aps_jobstore_path is None:
             self.aps_jobstore_path = self.jobstore_path.with_name(
                 self.jobstore_path.stem + ".aps.db"
+            )
+        # APScheduler uses synchronous SQLAlchemy while OME uses aiosqlite;
+        # sharing one SQLite file reintroduces cross-driver lock contention.
+        # Compare canonical paths so aliases such as ``foo/../ome.db`` (and
+        # case-only aliases on Windows) cannot bypass the invariant.
+        jobstore_key = os.path.normcase(str(self.jobstore_path.resolve(strict=False)))
+        aps_key = os.path.normcase(str(self.aps_jobstore_path.resolve(strict=False)))
+        if jobstore_key == aps_key:
+            raise ValueError(
+                "aps_jobstore_path must resolve to a different file than jobstore_path"
             )
         return self

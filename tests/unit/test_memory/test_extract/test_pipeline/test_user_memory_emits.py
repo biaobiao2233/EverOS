@@ -8,6 +8,10 @@ from everalgo.types import ChatMessage, MemCell
 from everalgo.types import Episode as AlgoEpisode
 
 from everos.core.persistence import EntryId
+from everos.infra.persistence.markdown.writers.base import (
+    AppendOnceEntry,
+    AppendOnceResult,
+)
 from everos.memory import IngestResult
 from everos.memory.events import EpisodeExtracted, UserPipelineStarted
 from everos.memory.extract.pipeline.user_memory import UserMemoryPipeline
@@ -69,8 +73,19 @@ async def test_emit_episode_extracted_after_md_write() -> None:
     """Each per-sender Episode write emits EpisodeExtracted with the md entry id."""
     engine = _CapturingEngine()
     episode_writer = MagicMock()
-    episode_writer.append_entry = AsyncMock(
-        return_value=EntryId(prefix="ep", date=_dt.date(2026, 5, 17), seq=1)
+    eid = EntryId(prefix="ep", date=_dt.date(2026, 5, 17), seq=1)
+    episode_writer.append_entry_once = AsyncMock(
+        return_value=AppendOnceResult(
+            entries=(
+                AppendOnceEntry(
+                    entry_id=eid,
+                    marker_id=eid.format(),
+                    inline={"timestamp": "2023-11-14T22:13:20+00:00"},
+                    sections={"Content": "they said hello"},
+                ),
+            ),
+            created=True,
+        )
     )
     episode_writer.path_for = MagicMock(
         return_value="users/u1/episodes/episode-2026-05-17.md"

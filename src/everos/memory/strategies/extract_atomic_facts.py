@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping
+from pathlib import Path
 
 from everalgo.user_memory import AtomicFactExtractor
 
@@ -39,10 +40,19 @@ from everos.infra.ome.triggers import Immediate
 from everos.infra.persistence.markdown import AtomicFactWriter
 from everos.memory.events import UserPipelineStarted
 from everos.memory.models import AtomicFact
+from everos.memory.prompt_slots import PromptLoader
 
 logger = get_logger(__name__)
 
+MAX_FACTS_PER_MEMCELL = 12
+"""Hard ceiling after the prompt's normal 3-8 fact target.
+
+The extra headroom preserves complex architecture and incident conversations,
+while preventing a single verbose extraction from flooding retrieval.
+"""
+
 _writer: AtomicFactWriter | None = None
+_prompt_loader: PromptLoader | None = None
 
 
 def _get_writer() -> AtomicFactWriter:
@@ -50,6 +60,14 @@ def _get_writer() -> AtomicFactWriter:
     if _writer is None:
         _writer = AtomicFactWriter(root=MemoryRoot.default())
     return _writer
+
+
+def _get_prompt_loader() -> PromptLoader:
+    global _prompt_loader
+    if _prompt_loader is None:
+        config_root = Path(__file__).resolve().parents[2] / "config"
+        _prompt_loader = PromptLoader(config_root)
+    return _prompt_loader
 
 
 @offline_strategy(
@@ -76,7 +94,21 @@ async def extract_atomic_facts(
 
     # 2. Run the LLM extractor once (algo prompt is subject-agnostic).
     extractor = AtomicFactExtractor(llm=get_llm_client())
-    algo_facts = await extractor.aextract(memcell, sender_id=None)
+    prompt = _get_prompt_loader().load("atomic_fact_extract")
+    algo_facts = await extractor.aextract(
+        memcell,
+        sender_id=None,
+        prompt=prompt,
+    )
+    if len(algo_facts) > MAX_FACTS_PER_MEMCELL:
+        logger.warning(
+            "atomic_facts_capped",
+            memcell_id=event.memcell_id,
+            session_id=event.session_id,
+            extracted=len(algo_facts),
+            kept=MAX_FACTS_PER_MEMCELL,
+        )
+        algo_facts = algo_facts[:MAX_FACTS_PER_MEMCELL]
 
     # 3. Fan the fact list out to one domain AtomicFact per (sender, algo_fact).
     facts: list[AtomicFact] = [
@@ -98,11 +130,17 @@ async def extract_atomic_facts(
     for fact in facts:
         by_owner[fact.owner_id].append(_atomic_fact_to_entry_body(fact))
 
-    # 5. Write each owner's full list with one batched append_entries.
+    # 5. Write each owner's full list once for this source memcell.
     writer = _get_writer()
+    source_date = from_timestamp(event.memcell.timestamp).date()
     for owner_id, items in by_owner.items():
-        await writer.append_entries(
-            owner_id, items, app_id=event.app_id, project_id=event.project_id
+        await writer.append_entries_once(
+            owner_id,
+            items,
+            parent_id=event.memcell_id,
+            date=source_date,
+            app_id=event.app_id,
+            project_id=event.project_id,
         )
 
     logger.info(

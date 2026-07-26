@@ -32,7 +32,18 @@ import pytest
 from everos.memory.cascade.errors import RecoverableError, UnrecoverableError
 from everos.memory.cascade.handlers import Handler, HandlerDeps
 from everos.memory.cascade.types import HandlerOutcome
-from everos.memory.cascade.worker import CascadeWorker
+from everos.memory.cascade.worker import (
+    DEFAULT_OPTIMIZE_MIN_INTERVAL_SECONDS,
+    DEFAULT_OPTIMIZE_PRUNE_INTERVAL_SECONDS,
+    CascadeWorker,
+    _KindOptimizerState,
+)
+
+
+def test_default_prune_window_bounds_bulk_import_disk_growth() -> None:
+    """Keep local retention below the measured small-disk safety limit."""
+    assert DEFAULT_OPTIMIZE_MIN_INTERVAL_SECONDS >= 10.0
+    assert DEFAULT_OPTIMIZE_PRUNE_INTERVAL_SECONDS <= 60.0
 
 
 @dataclass
@@ -433,14 +444,10 @@ async def test_optimize_failure_does_not_crash_drain_loop(
     assert patched_repo.failed == []
 
 
-async def test_heartbeat_schedules_every_handler_kind(
+async def test_idle_heartbeat_does_not_schedule_optimize(
     patched_repo: _FakeRepo,
 ) -> None:
-    """The heartbeat sweeps all kinds, even ones nobody wrote to.
-
-    Drives the heartbeat manually via a short interval and asserts
-    that ``optimize`` ran for both kinds at least once.
-    """
+    """An idle daemon must not manufacture index versions every minute."""
     fake_a = _FakeLanceRepo()
     fake_b = _FakeLanceRepo()
     w = CascadeWorker(
@@ -456,8 +463,27 @@ async def test_heartbeat_schedules_every_handler_kind(
     # Let at least one heartbeat tick happen.
     await asyncio.sleep(0.12)
     await w.stop()
-    assert fake_a.optimize_calls, "heartbeat should have scheduled episode"
-    assert fake_b.optimize_calls, "heartbeat should have scheduled atomic_fact"
+    assert fake_a.optimize_calls == []
+    assert fake_b.optimize_calls == []
+
+
+async def test_heartbeat_recovers_dirty_state_with_lost_task(
+    patched_repo: _FakeRepo,
+) -> None:
+    """Heartbeat restarts real pending optimizer work after task loss."""
+    fake = _FakeLanceRepo()
+    w = CascadeWorker(
+        {"episode": _OkHandlerWithRepo(fake)},
+        retry_backoff_seconds=0,
+        optimize_min_interval_seconds=0.01,
+        optimize_heartbeat_seconds=0.05,
+        optimize_rebuild_interval_seconds=10.0,
+    )
+    w._optimizer_states["episode"] = _KindOptimizerState(dirty=True)
+    await w.start()
+    await asyncio.sleep(0.12)
+    await w.stop()
+    assert fake.optimize_calls, "dirty state should be recovered"
 
 
 async def test_optimize_prunes_on_first_call_then_throttles(
@@ -564,10 +590,10 @@ async def test_rebuild_failure_does_not_crash_daemon(
         optimize_rebuild_interval_seconds=10.0,
     )
     await w.start()
-    # Give startup rebuild a chance to throw, then heartbeat to keep optimizing.
+    # Give startup rebuild and an idle heartbeat a chance to run.
     await asyncio.sleep(0.12)
-    # Optimize should still progress despite rebuild errors.
-    assert fake.optimize_calls, "heartbeat optimize should run even when rebuild fails"
+    assert w._task is not None and not w._task.done()
+    assert fake.optimize_calls == [], "idle heartbeat must not force optimize"
     await w.stop()
     # Worker is still alive (stop() returned cleanly).
     assert w._task is None

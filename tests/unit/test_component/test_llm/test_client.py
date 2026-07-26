@@ -45,7 +45,8 @@ def test_raises_when_api_key_missing(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_raises_when_base_url_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     _reset_singleton(monkeypatch)
-    _patch_settings(monkeypatch, api_key="sk-test", base_url=None)
+    test_key = "sk-test"
+    _patch_settings(monkeypatch, api_key=test_key, base_url=None)
 
     with pytest.raises(LLMNotConfiguredError, match="EVEROS_LLM__BASE_URL"):
         _client_mod.get_llm_client()
@@ -53,12 +54,31 @@ def test_raises_when_base_url_missing(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_returns_singleton_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     _reset_singleton(monkeypatch)
-    _patch_settings(monkeypatch, api_key="sk-test", base_url="https://example.test")
+    test_key = "sk-test"
+    _patch_settings(monkeypatch, api_key=test_key, base_url="https://example.test")
     sentinel = object()
-    monkeypatch.setattr(_client_mod, "build_client", lambda cfg: sentinel)
+    monkeypatch.setattr(_client_mod, "build_llm_provider", lambda cfg: sentinel)
 
     first = _client_mod.get_llm_client()
     second = _client_mod.get_llm_client()
 
     assert first is sentinel
     assert first is second
+
+
+def test_agy_cli_needs_no_http_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    _reset_singleton(monkeypatch)
+    cfg = Settings(
+        llm=LLMSettings(
+            provider="agy_cli",
+            api_key=None,
+            base_url=None,
+            agy_workdir=tmp_path,
+        )
+    )
+    monkeypatch.setattr(_client_mod, "load_settings", lambda: cfg)
+    sentinel = object()
+    monkeypatch.setattr(_client_mod, "build_llm_provider", lambda value: sentinel)
+    assert _client_mod.get_llm_client() is sentinel

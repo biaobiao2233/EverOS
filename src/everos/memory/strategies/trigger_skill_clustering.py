@@ -66,17 +66,43 @@ async def trigger_skill_clustering(
             )
             return
 
-        # 2. Embed the case's task_intent into a vector.
-        vector_list = await get_embedder().embed(event.task_intent)
-        vector = np.asarray(vector_list, dtype=np.float32)
-
-        # 3. Load this agent's existing skill clusters (scoped to space).
+        # 2. Load existing clusters and short-circuit an at-least-once replay.
         existing = await cluster_repo.list_for_owner(
             event.agent_id,
             "agent_case",
             app_id=event.app_id,
             project_id=event.project_id,
         )
+        matches = [
+            cluster for cluster in existing if event.case_entry_id in cluster.members
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"case {event.case_entry_id!r} belongs to multiple skill clusters"
+            )
+        if matches:
+            cluster = matches[0]
+            assert cluster.id is not None
+            await ctx.emit(
+                SkillClusterUpdated(
+                    case_entry_id=event.case_entry_id,
+                    cluster_id=cluster.id,
+                    agent_id=event.agent_id,
+                    app_id=event.app_id,
+                    project_id=event.project_id,
+                )
+            )
+            logger.info(
+                "skill_cluster_replay_short_circuit",
+                case_entry_id=event.case_entry_id,
+                cluster_id=cluster.id,
+                agent_id=event.agent_id,
+            )
+            return
+
+        # 3. Embed the case's task_intent into a vector.
+        vector_list = await get_embedder().embed(event.task_intent)
+        vector = np.asarray(vector_list, dtype=np.float32)
 
         # 4. Build a size-1 cluster for the fresh case (id minted upfront).
         new_cluster = AlgoCluster(

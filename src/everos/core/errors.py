@@ -9,6 +9,14 @@ not import ``memory`` directly).
 from __future__ import annotations
 
 
+class PathTraversalError(Exception):
+    """A write target resolved outside the configured memory root.
+
+    This is a defense-in-depth backstop for path segments derived from
+    caller-supplied identifiers. DTO validation remains the first boundary.
+    """
+
+
 class MultimodalError(Exception):
     """Base for multimodal-parsing errors meant to reach the caller.
 

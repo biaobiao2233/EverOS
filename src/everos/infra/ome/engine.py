@@ -10,15 +10,18 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import os
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid5
 
 import portalocker
 from apscheduler.executors.asyncio import AsyncIOExecutor
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.schedulers.base import STATE_PAUSED
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -49,6 +52,23 @@ from everos.infra.ome.triggers import Cron, Idle
 logger = get_logger(__name__)
 
 _ENGINES: dict[str, OfflineEngine] = {}
+
+
+def _canonical_db_path(path: Path) -> Path:
+    """Return the canonical path used for engine identity and locking."""
+
+    return Path(os.path.normcase(str(path.resolve(strict=False))))
+
+
+def _stable_engine_id(config: OMEConfig) -> str:
+    """Identify one logical OME jobstore consistently across restarts."""
+
+    assert config.aps_jobstore_path is not None
+    canonical = "\0".join(
+        str(_canonical_db_path(path))
+        for path in (config.jobstore_path, config.aps_jobstore_path)
+    )
+    return uuid5(NAMESPACE_URL, f"everos:ome:{canonical}").hex
 
 
 def _refuse_inside_strategy(method: Any) -> Any:
@@ -162,9 +182,9 @@ class OfflineEngine:
         await engine.emit(SomeEvent(...))   # fan out through dispatcher
         await engine.stop()                 # graceful shutdown
 
-    Single-process invariant: a file lock on
-    ``<jobstore_path>.lock`` guarantees at most one engine per jobstore
-    at any time (cross-process safe via ``portalocker``).
+    Single-process invariant: canonical ``.lock`` files beside both the OME
+    and APS SQLite databases guarantee at most one engine owns either shared
+    resource at a time (cross-process safe via ``portalocker``).
     """
 
     def __init__(
@@ -175,6 +195,10 @@ class OfflineEngine:
         self._config = config
         self._registry = StrategyRegistry()
         self._storage = OMEStorage(db_path=config.jobstore_path)
+        self._lock_handles: list[tuple[Path, Any]] = []
+        # Compatibility alias for existing diagnostics/tests that inspected
+        # the former single OME-DB lock.  The real ownership set is now
+        # ``_lock_handles`` and contains both OME and APS lock files.
         self._lock_handle: Any = None
         self._started = False
         self._on_dead_letter: Callable[[RunRecord], None] | None = None
@@ -186,7 +210,7 @@ class OfflineEngine:
         self._runner: Runner | None = None
         self._engine_sem: asyncio.Semaphore | None = None
         self._idle_store: IdleStore | None = None
-        self._engine_id = uuid4().hex
+        self._engine_id = _stable_engine_id(config)
         self._scheduler: AsyncIOScheduler | None = None
         self._config_reloader: ConfigReloader | None = None
 
@@ -272,10 +296,14 @@ class OfflineEngine:
             self._idle_event.set()
             self._launch_scheduler()
             _ENGINES[self._engine_id] = self
+            self._rebind_persisted_runner_jobs()
             await self._run_crash_recovery()
             self._register_scheduled_jobs()
-            self._start_config_reloader()
+            await self._load_initial_config()
+            self._recompute_active_runs()
             self._started = True
+            self._scheduler.resume()
+            self._start_config_watcher()
         except Exception:
             await self._rollback_partial_start()
             raise
@@ -322,20 +350,39 @@ class OfflineEngine:
             },
             executors={"default": AsyncIOExecutor()},
         )
-        self._scheduler.start()
+        # Persistent jobs from the prior process must not execute until their
+        # legacy engine ids are rebound and orphaned RUNNING rows are repaired.
+        self._scheduler.start(paused=True)
+
+    def _rebind_persisted_runner_jobs(self) -> None:
+        """Migrate pre-upgrade runner jobs to the stable engine id."""
+
+        runner_ref = f"{_runner_entry.__module__}:{_runner_entry.__qualname__}"
+        for job in self._scheduler.get_jobs():
+            if job.func_ref != runner_ref:
+                continue
+            args = tuple(job.args or ())
+            if len(args) != 6:
+                raise OMEError(f"persisted runner job {job.id!r} has invalid args")
+            if args[0] != self._engine_id:
+                self._scheduler.modify_job(
+                    job.id,
+                    args=(self._engine_id, *args[1:]),
+                )
+                logger.info(
+                    "ome_runner_job_rebound",
+                    job_id=job.id,
+                    old_engine_id=args[0],
+                    engine_id=self._engine_id,
+                )
 
     async def _run_crash_recovery(self) -> None:
-        """Scan ``run_record`` for stale RUNNING rows and re-enqueue them.
-
-        Treats rows whose ``started_at`` is older than
-        ``crash_recovery_timeout_seconds`` as crashes from a previous
-        engine session: they are marked CRASHED and re-added to APS with
-        a fresh ``run_id`` reusing the original event payload.
-        """
+        """Recover every RUNNING row left by the previous lock owner."""
         await scan_and_resume(
             run_record_store=self._run_record_store,
             timeout_seconds=self._config.crash_recovery_timeout_seconds,
             add_job=self._enqueue_recovery_job,
+            recover_all=True,
         )
 
     async def _enqueue_recovery_job(
@@ -349,31 +396,39 @@ class OfflineEngine:
         """Add one APS job for a re-enqueued crashed run (callback for
         :func:`scan_and_resume`).
 
-        Same enqueue-time bookkeeping as :meth:`_enqueue_run`: the run
-        will reach :meth:`dispatch_run` like any other, so the +1/-1
-        pair must wrap the ``add_job`` call here too.
+        Startup runs while APS is paused.  Active-run accounting is rebuilt
+        once from the complete persisted job set immediately before resume.
         """
-        self._on_run_enqueued()
-        try:
-            self._scheduler.add_job(
-                _runner_entry,
-                trigger="date",
-                run_date=get_utc_now(),
-                args=[
-                    self._engine_id,
-                    name,
-                    run_id,
-                    event_topic,
-                    event_payload,
-                    max_retries,
-                ],
-                id=run_id,
-                replace_existing=False,
-                misfire_grace_time=None,  # type: ignore[arg-type]  # APS accepts None ("no expiry"); stub omits it (apscheduler/job.py:213)
-            )
-        except Exception:
-            self._on_run_completed()
-            raise
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int):
+            raise TypeError("recovery max_retries must be an integer")
+        if max_retries < 0:
+            raise ValueError("recovery max_retries must be >= 0")
+
+        # Validate every reference while the source RUNNING row is still the
+        # durable receipt. ``scan_and_resume`` marks that row CRASHED only
+        # after this callback returns, so any deployment incompatibility
+        # leaves it retryable/auditable instead of creating an APS one-shot
+        # that fails before Runner can write a replacement RunRecord.
+        self._registry.get(name)
+        event_cls = resolve_topic(event_topic)
+        event_cls.model_validate_json(event_payload)
+
+        self._scheduler.add_job(
+            _runner_entry,
+            trigger="date",
+            run_date=get_utc_now(),
+            args=[
+                self._engine_id,
+                name,
+                run_id,
+                event_topic,
+                event_payload,
+                max_retries,
+            ],
+            id=run_id,
+            replace_existing=True,
+            misfire_grace_time=None,  # type: ignore[arg-type]  # APS accepts None ("no expiry"); stub omits it (apscheduler/job.py:213)
+        )
 
     def _register_scheduled_jobs(self) -> None:
         """Add Cron / Idle APS jobs for every strategy with such a trigger.
@@ -399,17 +454,39 @@ class OfflineEngine:
                     replace_existing=True,
                 )
 
-    def _start_config_reloader(self) -> None:
-        """Start :class:`ConfigReloader` iff ``config_watch`` is on and a
-        ``config_path`` is provided.
+    def _recompute_active_runs(self) -> None:
+        """Rebuild enqueue bookkeeping for persisted one-shot jobs."""
+
+        runner_ref = f"{_runner_entry.__module__}:{_runner_entry.__qualname__}"
+        self._active_runs = sum(
+            1 for job in self._scheduler.get_jobs() if job.func_ref == runner_ref
+        )
+        if self._idle_event is not None:
+            if self._active_runs:
+                self._idle_event.clear()
+            else:
+                self._idle_event.set()
+
+    async def _load_initial_config(self) -> None:
+        """Apply the current TOML snapshot while APS is still paused.
+
+        Scheduled jobs are registered immediately before this call so cron /
+        idle overrides can atomically reschedule real APS jobs.  The watcher
+        starts only after ``resume()`` and does not repeat this initial load.
         """
-        if self._config.config_watch and self._config.config_path is not None:
-            self._config_reloader = ConfigReloader(
-                config_path=self._config.config_path,
-                registry=self._registry,
-                engine=self,
-                debounce_ms=self._config.config_watch_debounce_ms,
-            )
+        if self._config.config_path is None:
+            return
+        self._config_reloader = ConfigReloader(
+            config_path=self._config.config_path,
+            registry=self._registry,
+            engine=self,
+            debounce_ms=self._config.config_watch_debounce_ms,
+        )
+        await self._config_reloader.load_once()
+
+    def _start_config_watcher(self) -> None:
+        """Start watching after the initial TOML snapshot has been applied."""
+        if self._config.config_watch and self._config_reloader is not None:
             self._config_reloader.start()
 
     async def _rollback_partial_start(self) -> None:
@@ -430,12 +507,17 @@ class OfflineEngine:
                 self._config_reloader = None
         if self._scheduler is not None:
             try:
-                await self.wait_idle(timeout=5.0)
+                # A paused startup scheduler cannot drain; its jobs remain in
+                # SQLite for the next clean start.  A resumed scheduler gets
+                # a short best-effort drain.
+                if self._scheduler.state != STATE_PAUSED:
+                    await self.wait_idle(timeout=5.0)
                 self._scheduler.shutdown(wait=False)
             finally:
                 self._scheduler = None
         _ENGINES.pop(self._engine_id, None)
         self._release_lock()
+        self._started = False
         self._idle_event = None
         self._active_runs = 0
 
@@ -517,24 +599,76 @@ class OfflineEngine:
         self._active_runs = 0
 
     def _acquire_lock(self) -> None:
-        lock_path = Path(str(self._config.jobstore_path) + ".lock")
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        """Acquire the canonical OME + APS DB locks in deterministic order."""
+
+        if self._lock_handles:
+            raise OMEError("engine database locks are already held")
+
+        assert self._config.aps_jobstore_path is not None
+        lock_paths = sorted(
+            (
+                Path(str(_canonical_db_path(path)) + ".lock")
+                for path in (
+                    self._config.jobstore_path,
+                    self._config.aps_jobstore_path,
+                )
+            ),
+            key=lambda path: os.path.normcase(str(path)),
+        )
+        acquired: list[tuple[Path, Any]] = []
+        lock_path: Path | None = None
         try:
-            handle = open(lock_path, "a+")  # noqa: SIM115
-            portalocker.lock(handle, portalocker.LOCK_EX | portalocker.LOCK_NB)
-            self._lock_handle = handle
+            for lock_path in lock_paths:
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                handle = open(lock_path, "a+")  # noqa: SIM115
+                try:
+                    portalocker.lock(handle, portalocker.LOCK_EX | portalocker.LOCK_NB)
+                except Exception:
+                    # The current handle was never added to ``acquired``;
+                    # close it here before unwinding locks already obtained.
+                    with suppress(Exception):
+                        handle.close()
+                    raise
+                acquired.append((lock_path, handle))
         except portalocker.LockException as e:
+            self._release_lock_handles(acquired, raise_errors=False)
             raise EngineLockHeldError(
                 f"another OfflineEngine instance already holds {lock_path}"
             ) from e
+        except Exception:
+            self._release_lock_handles(acquired, raise_errors=False)
+            raise
+
+        self._lock_handles = acquired
+        self._lock_handle = acquired[0][1]
 
     def _release_lock(self) -> None:
-        if self._lock_handle is not None:
+        handles = self._lock_handles
+        # Clear ownership before syscalls so a cleanup exception cannot leave
+        # stale in-memory state that prevents a later start attempt.
+        self._lock_handles = []
+        self._lock_handle = None
+        self._release_lock_handles(handles, raise_errors=True)
+
+    @staticmethod
+    def _release_lock_handles(
+        handles: list[tuple[Path, Any]], *, raise_errors: bool
+    ) -> None:
+        """Unlock and close every handle, even when one cleanup syscall fails."""
+
+        errors: list[Exception] = []
+        for _path, handle in reversed(handles):
             try:
-                portalocker.unlock(self._lock_handle)
+                portalocker.unlock(handle)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
             finally:
-                self._lock_handle.close()
-                self._lock_handle = None
+                try:
+                    handle.close()
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+        if errors and raise_errors:
+            raise errors[0]
 
     @_refuse_inside_strategy
     async def emit(self, event: BaseEvent) -> None:

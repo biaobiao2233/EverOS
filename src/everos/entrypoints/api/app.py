@@ -6,11 +6,13 @@ lifespan, and registers the public routes (``/health``, ``/metrics``).
 
 from __future__ import annotations
 
+import hmac
 import os
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from everos.core.lifespan import (
     LifespanProvider,
@@ -49,6 +51,24 @@ logger = get_logger(__name__)
 def _docs_enabled() -> bool:
     """Enable docs endpoints (/docs, /redoc, /openapi.json) only in dev."""
     return os.environ.get("ENV", "prod").upper() == "DEV"
+
+
+def _load_api_token() -> str:
+    """Load optional bearer auth, failing closed for an explicit token file."""
+    token = os.environ.get("EVEROS_API_TOKEN", "").strip()
+    if token:
+        return token
+    token_file = os.environ.get("EVEROS_API_TOKEN_FILE", "").strip()
+    if not token_file:
+        return ""
+    try:
+        with open(token_file, encoding="utf-8") as handle:
+            token = handle.read().strip()
+    except OSError as exc:
+        raise RuntimeError(f"cannot read EVEROS_API_TOKEN_FILE: {exc}") from exc
+    if not token:
+        raise RuntimeError("EVEROS_API_TOKEN_FILE is empty")
+    return token
 
 
 def create_app(
@@ -112,6 +132,23 @@ def create_app(
     )
     app.add_middleware(PrometheusMiddleware)
     app.add_middleware(ProfileMiddleware)
+
+    api_token = _load_api_token()
+
+    @app.middleware("http")
+    async def require_api_token(request: Request, call_next):
+        """Require a configured bearer token on every non-health request."""
+        if (
+            not api_token
+            or request.url.path == "/health"
+            or request.method == "OPTIONS"
+        ):
+            return await call_next(request)
+        supplied = request.headers.get("Authorization", "")
+        expected = f"Bearer {api_token}"
+        if not hmac.compare_digest(supplied, expected):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+        return await call_next(request)
 
     # Routes.
     app.include_router(health.router)

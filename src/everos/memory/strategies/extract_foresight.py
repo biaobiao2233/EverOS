@@ -75,11 +75,17 @@ async def extract_foresight(event: UserPipelineStarted, ctx: StrategyContext) ->
     for fs in foresights:
         by_owner[fs.owner_id].append(_foresight_to_entry_body(fs))
 
-    # 4. Write each owner's full list with one batched append_entries.
+    # 4. Write each owner's full list once for this source memcell.
     writer = _get_writer()
+    source_date = from_timestamp(event.memcell.timestamp).date()
     for owner_id, items in by_owner.items():
-        await writer.append_entries(
-            owner_id, items, app_id=event.app_id, project_id=event.project_id
+        await writer.append_entries_once(
+            owner_id,
+            items,
+            parent_id=event.memcell_id,
+            date=source_date,
+            app_id=event.app_id,
+            project_id=event.project_id,
         )
 
     logger.info(

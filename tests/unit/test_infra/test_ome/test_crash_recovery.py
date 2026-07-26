@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 from pathlib import Path
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -84,6 +85,62 @@ async def test_recent_running_skipped(rec_store: RunRecordStore) -> None:
     assert resumed == []
 
 
+@pytest.mark.asyncio
+async def test_recover_all_resumes_fresh_running(rec_store: RunRecordStore) -> None:
+    await rec_store.mark_running(
+        run_id="r_fresh_all",
+        strategy_name="s",
+        attempt=0,
+        event_topic="x:E",
+        event_payload="{}",
+        max_retries_snapshot=1,
+    )
+    resumed: list[tuple] = []
+
+    async def add_job_hook(*args):
+        # Replacement must be durable before the source row is terminal.
+        source = await rec_store.get("r_fresh_all")
+        assert source.status == RunStatus.RUNNING
+        resumed.append(args)
+
+    await scan_and_resume(
+        run_record_store=rec_store,
+        timeout_seconds=1800,
+        add_job=add_job_hook,
+        recover_all=True,
+    )
+
+    rec = await rec_store.get("r_fresh_all")
+    assert rec.status == RunStatus.CRASHED
+    assert resumed[0][1] == uuid5(NAMESPACE_URL, "everos:ome:recovery:r_fresh_all").hex
+
+
+@pytest.mark.asyncio
+async def test_recovery_passes_only_remaining_retry_budget(
+    rec_store: RunRecordStore,
+) -> None:
+    await rec_store.mark_running(
+        run_id="r_attempt_2",
+        strategy_name="s",
+        attempt=2,
+        event_topic="x:E",
+        event_payload="{}",
+        max_retries_snapshot=3,
+    )
+    resumed: list[tuple] = []
+
+    async def add_job_hook(*args):
+        resumed.append(args)
+
+    await scan_and_resume(
+        run_record_store=rec_store,
+        timeout_seconds=1800,
+        add_job=add_job_hook,
+        recover_all=True,
+    )
+    assert resumed[0][-1] == 1
+
+
 @pytest.mark.parametrize("bad_timeout", [0, -1])
 @pytest.mark.asyncio
 async def test_scan_and_resume_non_positive_timeout_raises(
@@ -106,12 +163,7 @@ async def test_scan_and_resume_non_positive_timeout_raises(
 async def test_add_job_failure_does_not_abort_loop(
     rec_store: RunRecordStore,
 ) -> None:
-    """add_job raising on one row must not block sibling stale rows.
-
-    mark_crashed runs before add_job, so both rows end up CRASHED even
-    when add_job fails for one. This pins the at-most-once contract
-    documented in the module docstring.
-    """
+    """One enqueue failure preserves its row and reports startup failure."""
     for run_id in ("r_old_1", "r_old_2"):
         await rec_store.mark_running(
             run_id=run_id,
@@ -136,14 +188,15 @@ async def test_add_job_failure_does_not_abort_loop(
         if len(calls) == 1:
             raise RuntimeError("APS jobstore unavailable")
 
-    await scan_and_resume(
-        run_record_store=rec_store,
-        timeout_seconds=1800,
-        add_job=flaky_add_job,
-    )
+    with pytest.raises(RuntimeError, match="r_old_1"):
+        await scan_and_resume(
+            run_record_store=rec_store,
+            timeout_seconds=1800,
+            add_job=flaky_add_job,
+        )
 
     rec1 = await rec_store.get("r_old_1")
     rec2 = await rec_store.get("r_old_2")
-    assert rec1.status == RunStatus.CRASHED
+    assert rec1.status == RunStatus.RUNNING
     assert rec2.status == RunStatus.CRASHED
     assert len(calls) == 2

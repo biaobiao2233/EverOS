@@ -286,11 +286,21 @@ async def test_rename_out_of_kind_glob_degrades_to_delete(
         await anyio.to_thread.run_sync(
             shutil.move, str(src_absolute), str(dest_absolute)
         )
-        # Wait for the src deletion to settle. The dest path is outside
-        # the glob so it never enters md_change_state — can't wait on it.
-        # Re-poll src until row reflects the rename.
-        await asyncio.sleep(0.5)
-        await _wait_drain()
+        # A move between separately watched app roots is reported by Linux
+        # inotify as an unmatched MOVED_FROM event after its 0.5s pairing
+        # window. Poll for the new deletion generation rather than mistaking
+        # the already-done seed row for convergence.
+        async with asyncio.timeout(15.0):
+            while True:  # noqa: ASYNC110 - polling cascade state
+                src_row = await md_change_state_repo.get_by_id(src_md_path)
+                if (
+                    src_row is not None
+                    and src_row.change_type == "deleted"
+                    and src_row.status == "done"
+                    and await _count_lance_rows_md(src_md_path) == 0
+                ):
+                    break
+                await asyncio.sleep(0.05)
 
         assert await _count_lance_rows_md(src_md_path) == 0
         # No row should appear for the out-of-glob target.

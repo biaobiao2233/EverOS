@@ -3,6 +3,14 @@ Copyright 2025 EverMind AI
 
 This product includes software developed by EverMind AI.
 
+Production-optimized fork modifications
+Copyright 2026 biaobiao2233 and contributors
+
+This fork modifies EverOS with durable idempotent writes, recovery and
+concurrency hardening, extraction-quality controls, optional API
+authentication, and a local Antigravity CLI text provider. The complete
+modification summary is in PRODUCTION_OPTIMIZED.md.
+
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at

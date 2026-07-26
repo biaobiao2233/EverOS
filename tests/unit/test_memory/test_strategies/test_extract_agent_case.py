@@ -11,12 +11,35 @@ from everalgo.types import AgentCase, ChatMessage, MemCell
 
 from everos.core.persistence import EntryId
 from everos.infra.ome.testing import FakeStrategyContext
+from everos.infra.persistence.markdown.writers.base import (
+    AppendOnceEntry,
+    AppendOnceResult,
+)
 from everos.memory.events import AgentCaseExtracted, AgentPipelineStarted
 from everos.memory.strategies.extract_agent_case import extract_agent_case
 
 
 def _fake_eid() -> EntryId:
     return EntryId(prefix="ac", date=_dt.date(2026, 5, 17), seq=1)
+
+
+def _append_result(
+    eid: EntryId,
+    *,
+    inline: dict[str, object],
+    sections: dict[str, str],
+) -> AppendOnceResult:
+    return AppendOnceResult(
+        entries=(
+            AppendOnceEntry(
+                entry_id=eid,
+                marker_id=eid.format(),
+                inline={key: str(value) for key, value in inline.items()},
+                sections=dict(sections),
+            ),
+        ),
+        created=True,
+    )
 
 
 mod = importlib.import_module("everos.memory.strategies.extract_agent_case")
@@ -94,14 +117,20 @@ async def test_writes_md_when_algo_returns_a_case(
         structlog.testing.capture_logs() as captured,
     ):
         mock_cls.return_value.aextract = AsyncMock(return_value=[case])
-        mock_wcls.return_value.append_entry = AsyncMock(return_value=_fake_eid())
+        mock_wcls.return_value.append_entry_once = AsyncMock(
+            side_effect=lambda *_args, **kwargs: _append_result(
+                _fake_eid(),
+                inline=kwargs["inline"],
+                sections=kwargs["sections"],
+            )
+        )
         ctx = FakeStrategyContext()
 
         await extract_agent_case(_event(), ctx)
 
     assert mock_cls.return_value.aextract.await_count == 1
-    assert mock_wcls.return_value.append_entry.call_count == 1
-    _, kwargs = mock_wcls.return_value.append_entry.call_args
+    assert mock_wcls.return_value.append_entry_once.call_count == 1
+    _, kwargs = mock_wcls.return_value.append_entry_once.call_args
     assert kwargs["inline"]["owner_id"] == "agent_42"
     assert kwargs["inline"]["session_id"] == "s1"
     assert kwargs["inline"]["parent_type"] == "memcell"
@@ -173,7 +202,7 @@ async def test_fans_out_per_assistant_sender(
     )
     case = _algo_case(quality_score=0.85)
 
-    # writer.append_entry returns a different entry_id per call so the
+    # writer.append_entry_once returns a different entry_id per call so the
     # emitted events carry per-agent entry_ids (cascade keys off owner+entry).
     eids = [
         EntryId(prefix="ac", date=_dt.date(2026, 5, 17), seq=1),
@@ -194,7 +223,14 @@ async def test_fans_out_per_assistant_sender(
         structlog.testing.capture_logs() as captured,
     ):
         mock_cls.return_value.aextract = AsyncMock(return_value=[case])
-        mock_wcls.return_value.append_entry = AsyncMock(side_effect=eids)
+        eid_iter = iter(eids)
+        mock_wcls.return_value.append_entry_once = AsyncMock(
+            side_effect=lambda *_args, **kwargs: _append_result(
+                next(eid_iter),
+                inline=kwargs["inline"],
+                sections=kwargs["sections"],
+            )
+        )
         ctx = FakeStrategyContext()
 
         await extract_agent_case(event, ctx)
@@ -203,10 +239,10 @@ async def test_fans_out_per_assistant_sender(
     assert mock_cls.return_value.aextract.await_count == 1
 
     # Two md writes (one per distinct assistant sender), in first-seen order.
-    assert mock_wcls.return_value.append_entry.call_count == 2
+    assert mock_wcls.return_value.append_entry_once.call_count == 2
     owners_written = [
         call.kwargs["inline"]["owner_id"]
-        for call in mock_wcls.return_value.append_entry.call_args_list
+        for call in mock_wcls.return_value.append_entry_once.call_args_list
     ]
     assert owners_written == ["agent_lead", "agent_specialist"]
 
@@ -243,10 +279,16 @@ async def test_omits_key_insight_section_when_empty(
         ) as mock_wcls,
     ):
         mock_cls.return_value.aextract = AsyncMock(return_value=[case])
-        mock_wcls.return_value.append_entry = AsyncMock(return_value=_fake_eid())
+        mock_wcls.return_value.append_entry_once = AsyncMock(
+            side_effect=lambda *_args, **kwargs: _append_result(
+                _fake_eid(),
+                inline=kwargs["inline"],
+                sections=kwargs["sections"],
+            )
+        )
         await extract_agent_case(_event(), FakeStrategyContext())
 
-    _, kwargs = mock_wcls.return_value.append_entry.call_args
+    _, kwargs = mock_wcls.return_value.append_entry_once.call_args
     assert "KeyInsight" not in kwargs["sections"]
     assert kwargs["sections"]["TaskIntent"] == "summarise doc"
 
@@ -270,10 +312,10 @@ async def test_skips_when_algo_returns_empty(
         structlog.testing.capture_logs() as captured,
     ):
         mock_cls.return_value.aextract = AsyncMock(return_value=[])
-        mock_wcls.return_value.append_entry = AsyncMock(return_value=_fake_eid())
+        mock_wcls.return_value.append_entry_once = AsyncMock()
         await extract_agent_case(_event(), FakeStrategyContext())
 
-    mock_wcls.return_value.append_entry.assert_not_called()
+    mock_wcls.return_value.append_entry_once.assert_not_called()
     matching = [e for e in captured if e.get("event") == "agent_case_skipped_by_algo"]
     assert matching, "expected agent_case_skipped_by_algo log line"
 
@@ -311,12 +353,12 @@ async def test_skips_when_no_assistant_sender(
         structlog.testing.capture_logs() as captured,
     ):
         mock_cls.return_value.aextract = AsyncMock(return_value=[])
-        mock_wcls.return_value.append_entry = AsyncMock(return_value=_fake_eid())
+        mock_wcls.return_value.append_entry_once = AsyncMock()
         await extract_agent_case(event, FakeStrategyContext())
 
     # Algo extractor must not be invoked at all when there's no agent.
     mock_cls.return_value.aextract.assert_not_called()
-    mock_wcls.return_value.append_entry.assert_not_called()
+    mock_wcls.return_value.append_entry_once.assert_not_called()
     matching = [
         e for e in captured if e.get("event") == "agent_case_skipped_no_assistant"
     ]

@@ -54,13 +54,26 @@ def test_done_state_with_matching_mtime_is_skipped() -> None:
     assert decisions == []
 
 
-def test_pending_state_with_matching_mtime_still_emits_modified() -> None:
-    """Pending / failed states are NOT terminal — re-emit so worker re-runs."""
-    decisions = reconcile(
-        [_scan("a.md", mtime=1.0)],
-        state={"a.md": _state("a.md", mtime=1.0, status="pending")},
-    )
-    assert [(d.md_path, d.change_type) for d in decisions] == [("a.md", "modified")]
+def test_matching_mtime_is_skipped_in_every_queue_state() -> None:
+    """Scanner must not reset pending work, active claims, or diagnostics."""
+    for status in ("pending", "processing", "done", "failed"):
+        decisions = reconcile(
+            [_scan("a.md", mtime=1.0)],
+            state={"a.md": _state("a.md", mtime=1.0, status=status)},
+        )
+        assert decisions == [], status
+
+
+def test_changed_mtime_is_emitted_in_every_queue_state() -> None:
+    """A genuinely new file version re-enters from any prior state."""
+    for status in ("pending", "processing", "done", "failed"):
+        decisions = reconcile(
+            [_scan("a.md", mtime=2.0)],
+            state={"a.md": _state("a.md", mtime=1.0, status=status)},
+        )
+        assert [(d.md_path, d.change_type) for d in decisions] == [
+            ("a.md", "modified")
+        ], status
 
 
 def test_deleted_path_emits_deleted_decision() -> None:

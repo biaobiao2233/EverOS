@@ -20,12 +20,10 @@ ordering across rows is best-effort — the LSN gives a deterministic
 prefix but the handlers themselves are independent.
 
 After a batch completes, each kind that mutated its LanceDB table is
-passed to :meth:`_schedule_optimize` — a per-kind throttle + trailing
-edge scheduler that fires LanceDB ``optimize()`` as a separate task,
-so the drain loop is never blocked by index maintenance. A 60-second
-heartbeat sweeps every kind through the same gate so unindexed
-fragments don't linger after a worker restart even without new
-writes. See :meth:`_schedule_optimize` for the exact semantics.
+passed to the per-kind optimize scheduler. A 60-second heartbeat only
+restarts optimizer work that is already marked dirty but lost its task.
+It never manufactures idle optimize work; startup rebuild and write-driven
+scheduling cover normal recovery.
 
 A separate 12-hour loop (:meth:`_rebuild_loop`) does a full
 ``drop_index + create_index`` per kind to bound the **active** index
@@ -57,7 +55,7 @@ DEFAULT_BATCH_SIZE = 50
 DEFAULT_MAX_RETRY = 3
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_RETRY_BACKOFF_SECONDS = 2.0
-DEFAULT_OPTIMIZE_MIN_INTERVAL_SECONDS = 1.0
+DEFAULT_OPTIMIZE_MIN_INTERVAL_SECONDS = 10.0
 DEFAULT_OPTIMIZE_HEARTBEAT_SECONDS = 60.0
 DEFAULT_OPTIMIZE_REBUILD_INTERVAL_SECONDS = 12 * 60 * 60.0
 """How often (per kind) to do a full ``drop_index + create_index`` rebuild.
@@ -84,7 +82,7 @@ working merge implementation; ``optimize(num_indices_to_merge=1)``
 in the regular hot path will do the same job for ~free.
 """
 
-DEFAULT_OPTIMIZE_PRUNE_INTERVAL_SECONDS = 300.0
+DEFAULT_OPTIMIZE_PRUNE_INTERVAL_SECONDS = 60.0
 """How often (per kind) to add ``cleanup_older_than`` to ``optimize()``.
 
 ``optimize()`` without ``cleanup_older_than`` compacts fragments and
@@ -97,12 +95,14 @@ exhausts file descriptors at index-scan time (observed: macOS / Linux
 default ``ulimit -n`` of 1024 — the ``os error 24`` reported in CI).
 
 The prune itself is cheap when scoped to recent versions; we just don't
-want to pay it on every 1-second throttle tick. 5 minutes is the
-shortest interval that comfortably outlives any in-flight query / index
-build, while keeping the on-disk footprint bounded. It is also passed
-as ``cleanup_older_than`` itself (semantically: "the retention window
-equals the prune cadence") — every file replaced more than one cadence
-ago becomes eligible.
+want to pay it on every hot-path throttle tick. This deployment uses a
+60-second cadence because a 47k-row ``atomic_fact`` table rewrites about
+200 MiB per optimize pass: the previous 5-minute window consumed several
+GiB during a bulk import and could fill a small system disk. One minute
+still comfortably outlives normal search queries here while bounding the
+temporary footprint. It is also passed as ``cleanup_older_than`` itself
+(semantically: "the retention window equals the prune cadence") — every
+file replaced more than one cadence ago becomes eligible.
 
 Does **not** shrink active index internals (FTS ``part_N`` count or
 vector index UUID count): those only collapse via ``drop_index +
@@ -494,19 +494,17 @@ class CascadeWorker:
     async def _heartbeat_loop(self) -> None:
         """Periodic safety net for the optimizer.
 
-        Sweeps every kind through :meth:`_schedule_optimize` once per
-        ``optimize_heartbeat_seconds``. Without this, a worker that
-        restarts with stale unindexed fragments (e.g. after a crash
-        between write and optimize) would only catch up once new
-        writes arrive. The sweep goes through the same throttle gate
-        so it can never storm — kinds with an in-flight optimize or
-        a fresh ``last_run_at`` are coalesced.
+        Recover only a kind whose optimizer state is already dirty and whose
+        task is missing or done. Calling the scheduler for every idle handler
+        is unsafe because that method deliberately sets dirty=True; the old
+        heartbeat therefore created index UUID directories forever.
         """
         while not self._stop.is_set():
             if await self._wait_or_stop(self._optimize_heartbeat):
                 return
-            for kind in self._handlers:
-                self._schedule_optimize(kind)
+            for kind, state in tuple(self._optimizer_states.items()):
+                if state.dirty and (state.task is None or state.task.done()):
+                    self._schedule_optimize(kind)
 
     async def _rebuild_loop(self) -> None:
         """Slow per-kind ``drop_index + create_index`` loop.

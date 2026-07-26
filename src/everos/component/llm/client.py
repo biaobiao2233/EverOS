@@ -16,6 +16,8 @@ from everalgo.llm.protocols import LLMClient
 from everos.config import load_settings
 from everos.core.observability.logging import get_logger
 
+from .factory import build_llm_provider
+
 logger = get_logger(__name__)
 
 
@@ -39,21 +41,19 @@ def get_llm_client() -> LLMClient:
         return _llm_client
 
     llm_cfg = load_settings().llm
-    api_key = (
-        llm_cfg.api_key.get_secret_value() if llm_cfg.api_key is not None else None
+    try:
+        _llm_client = build_llm_provider(llm_cfg)
+    except ValueError as exc:
+        raise LLMNotConfiguredError(str(exc)) from exc
+    logger.info(
+        "llm_client_built",
+        provider=llm_cfg.provider,
+        model=(
+            llm_cfg.agy_model or "antigravity-default"
+            if llm_cfg.provider == "agy_cli"
+            else llm_cfg.model
+        ),
     )
-    if not api_key or not llm_cfg.base_url:
-        raise LLMNotConfiguredError(
-            "LLM is required; set EVEROS_LLM__API_KEY + EVEROS_LLM__BASE_URL"
-        )
-    _llm_client = build_client(
-        LLMConfig(
-            model=llm_cfg.model,
-            api_key=api_key,
-            base_url=llm_cfg.base_url,
-        )
-    )
-    logger.info("llm_client_built", model=llm_cfg.model)
     return _llm_client
 
 

@@ -25,7 +25,9 @@ Subclass usage::
 from __future__ import annotations
 
 import datetime as _dt
+import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -38,8 +40,36 @@ from everos.core.persistence import (
     MarkdownReader,
     MarkdownWriter,
     MemoryRoot,
+    parse_structured_entry,
     render_structured_entry,
 )
+from everos.core.persistence.locking import memory_root_lock
+
+
+@dataclass(frozen=True, slots=True)
+class AppendOnceEntry:
+    """Exact structured content selected by an append-once operation."""
+
+    entry_id: EntryId
+    marker_id: str
+    inline: dict[str, str]
+    sections: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class AppendOnceResult:
+    """Result of a natural-key append operation."""
+
+    entries: tuple[AppendOnceEntry, ...]
+    created: bool
+
+    @property
+    def entry_ids(self) -> tuple[EntryId, ...]:
+        return tuple(entry.entry_id for entry in self.entries)
+
+
+class DailyLogCorruptionError(RuntimeError):
+    """A daily log cannot be trusted for append-once decisions."""
 
 
 class BaseDailyWriter:
@@ -182,6 +212,162 @@ class BaseDailyWriter:
             )
             return eids
 
+    async def append_entry_once(
+        self,
+        scope_id: str,
+        *,
+        parent_id: str,
+        inline: Mapping[str, object],
+        sections: Mapping[str, str],
+        date: _dt.date,
+        app_id: str = "default",
+        project_id: str = "default",
+    ) -> AppendOnceResult:
+        """Append one entry once for ``(scope, kind, memcell parent)``.
+
+        Markdown is the receipt: a retry scans the stable source-date file
+        under a process-wide memory-root lock and returns the original entry
+        id instead of allocating another one.
+        """
+
+        result = await self.append_entries_once(
+            scope_id,
+            [(inline, sections)],
+            parent_id=parent_id,
+            date=date,
+            app_id=app_id,
+            project_id=project_id,
+        )
+        if len(result.entry_ids) != 1:
+            raise DailyLogCorruptionError(
+                "single-entry natural key resolves to multiple entries"
+            )
+        return result
+
+    async def append_entries_once(
+        self,
+        scope_id: str,
+        items: Sequence[tuple[Mapping[str, object], Mapping[str, str]]],
+        *,
+        parent_id: str,
+        date: _dt.date,
+        app_id: str = "default",
+        project_id: str = "default",
+    ) -> AppendOnceResult:
+        """Append one complete batch once for a source MemCell.
+
+        The first committed batch wins.  Later retries return its complete
+        entry-id tuple even if a non-deterministic extractor proposes a
+        different batch.  Empty batches need a separate SQLite no-output
+        receipt and are deliberately rejected here.
+        """
+
+        if not parent_id:
+            raise ValueError("parent_id is required for append-once")
+        if not items:
+            raise ValueError("append-once cannot prove an empty batch")
+        for inline, _sections in items:
+            if inline.get("parent_type") != "memcell":
+                raise ValueError("append-once requires parent_type='memcell'")
+            if inline.get("parent_id") != parent_id:
+                raise ValueError("append-once parent_id does not match entry body")
+            if inline.get("owner_id") != scope_id:
+                raise ValueError("append-once owner_id does not match scope")
+
+        path = self._resolve_path(scope_id, date, app_id, project_id)
+        async with memory_root_lock(self._root), self._writer.lock_for(path):
+            # Upgrade compatibility: historical writers bucketed by
+            # processing day.  Search sibling daily files for the same
+            # memcell before adopting the new stable source-date bucket.
+            siblings = await anyio.to_thread.run_sync(
+                lambda: sorted(path.parent.glob(f"{self.schema.FILE_PREFIX}-*.md"))
+            )
+            candidates = [path, *(item for item in siblings if item != path)]
+            parsed_target = None
+            existing_by_path: dict[Path, list[AppendOnceEntry]] = {}
+            parent_line = f"**parent_id**: {parent_id}"
+            for candidate in candidates:
+                if not await anyio.Path(candidate).is_file():
+                    continue
+                text = await anyio.Path(candidate).read_text(encoding="utf-8")
+                # Non-target legacy files are relevant only when the raw
+                # exact audit field is present.  This keeps the migration
+                # lookup cheap even for very large fact logs.
+                if candidate != path and parent_line not in text:
+                    continue
+                parsed = MarkdownReader.parse(text)
+                candidate_date = self._date_from_path(candidate)
+                self._validate_append_once_file(
+                    path=candidate,
+                    parsed=parsed,
+                    scope_id=scope_id,
+                    date=candidate_date,
+                )
+                if candidate == path:
+                    parsed_target = parsed
+                candidate_entries: list[AppendOnceEntry] = []
+                for entry in parsed.entries:
+                    structured = entry.as_structured()
+                    if (
+                        structured.inline.get("parent_type") == "memcell"
+                        and structured.inline.get("parent_id") == parent_id
+                    ):
+                        candidate_entries.append(
+                            AppendOnceEntry(
+                                entry_id=EntryId.parse(entry.id),
+                                marker_id=entry.id,
+                                inline=dict(structured.inline),
+                                sections=dict(structured.sections),
+                            )
+                        )
+                if candidate_entries:
+                    existing_by_path[candidate] = candidate_entries
+            if len(existing_by_path) > 1:
+                conflict_paths = ", ".join(
+                    str(item) for item in sorted(existing_by_path)
+                )
+                raise DailyLogCorruptionError(
+                    "append-once natural key exists in multiple daily files: "
+                    f"{conflict_paths}"
+                )
+            if existing_by_path:
+                existing = next(iter(existing_by_path.values()))
+                return AppendOnceResult(entries=tuple(existing), created=False)
+
+            base_count = len(parsed_target.entries) if parsed_target is not None else 0
+            eids = tuple(
+                EntryId.next_for(self.schema.ENTRY_ID_PREFIX, date, base_count + offset)
+                for offset in range(len(items))
+            )
+            rendered: list[tuple[str, EntryId]] = [
+                (
+                    render_structured_entry(
+                        header=eid.format(),
+                        inline=inline,
+                        sections=sections,
+                    ),
+                    eid,
+                )
+                for eid, (inline, sections) in zip(eids, items, strict=True)
+            ]
+            await self._writer._append_entries_unlocked(  # noqa: SLF001
+                path,
+                rendered,
+                frontmatter_updates=self._frontmatter_updates(
+                    scope_id, date, next_count=base_count + len(items)
+                ),
+            )
+            selected = tuple(
+                AppendOnceEntry(
+                    entry_id=eid,
+                    marker_id=eid.format(),
+                    inline=dict(parse_structured_entry(body).inline),
+                    sections=dict(parse_structured_entry(body).sections),
+                )
+                for body, eid in rendered
+            )
+            return AppendOnceResult(entries=selected, created=True)
+
     async def append(
         self,
         scope_id: str,
@@ -299,3 +485,68 @@ class BaseDailyWriter:
             / self.schema.DIR_NAME
             / f"{self.schema.FILE_PREFIX}-{date.isoformat()}.md"
         )
+
+    def _validate_append_once_file(
+        self,
+        *,
+        path: Path,
+        parsed: Any,
+        scope_id: str,
+        date: _dt.date,
+    ) -> None:
+        """Fail closed before deciding that a natural key is absent."""
+
+        open_ids = re.findall(r"<!-- entry:([A-Za-z0-9_-]+) -->", parsed.body)
+        close_ids = re.findall(r"<!-- /entry:([A-Za-z0-9_-]+) -->", parsed.body)
+        if open_ids != close_ids or len(parsed.entries) != len(open_ids):
+            raise DailyLogCorruptionError(f"malformed entry markers in {path}")
+        if len(set(open_ids)) != len(open_ids):
+            raise DailyLogCorruptionError(f"duplicate entry ids in {path}")
+
+        try:
+            frontmatter = self.schema.model_validate(parsed.frontmatter)
+        except ValueError as exc:
+            raise DailyLogCorruptionError(f"invalid frontmatter in {path}") from exc
+        scope_field = "user_id" if self.schema.SCOPE_DIR == "users" else "agent_id"
+        if getattr(frontmatter, scope_field, None) != scope_id:
+            raise DailyLogCorruptionError(f"frontmatter scope mismatch in {path}")
+        if getattr(frontmatter, "date", None) != date:
+            raise DailyLogCorruptionError(f"frontmatter date mismatch in {path}")
+        if getattr(frontmatter, "entry_count", None) != len(parsed.entries):
+            raise DailyLogCorruptionError(f"frontmatter entry_count mismatch in {path}")
+
+        expected_sequences = list(range(1, len(parsed.entries) + 1))
+        actual_sequences: list[int] = []
+        for entry in parsed.entries:
+            try:
+                entry_id = EntryId.parse(entry.id)
+            except ValueError as exc:
+                raise DailyLogCorruptionError(
+                    f"invalid entry id {entry.id!r} in {path}"
+                ) from exc
+            if entry_id.prefix != self.schema.ENTRY_ID_PREFIX or entry_id.date != date:
+                raise DailyLogCorruptionError(f"entry id bucket mismatch in {path}")
+            actual_sequences.append(entry_id.seq)
+            structured = entry.as_structured()
+            if structured.header != entry.id:
+                raise DailyLogCorruptionError(f"entry header mismatch in {path}")
+            if structured.inline.get("owner_id") != scope_id:
+                raise DailyLogCorruptionError(f"entry owner mismatch in {path}")
+            if structured.inline.get("parent_type") != "memcell":
+                raise DailyLogCorruptionError(f"entry parent_type mismatch in {path}")
+            if not structured.inline.get("parent_id"):
+                raise DailyLogCorruptionError(f"entry parent_id missing in {path}")
+        if actual_sequences != expected_sequences:
+            raise DailyLogCorruptionError(f"entry sequence mismatch in {path}")
+
+    def _date_from_path(self, path: Path) -> _dt.date:
+        prefix = f"{self.schema.FILE_PREFIX}-"
+        if not path.name.startswith(prefix) or path.suffix != ".md":
+            raise DailyLogCorruptionError(f"unexpected daily-log filename: {path}")
+        raw = path.name[len(prefix) : -len(path.suffix)]
+        try:
+            return _dt.date.fromisoformat(raw)
+        except ValueError as exc:
+            raise DailyLogCorruptionError(
+                f"invalid daily-log date in filename: {path}"
+            ) from exc

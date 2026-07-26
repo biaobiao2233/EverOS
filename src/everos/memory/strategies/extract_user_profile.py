@@ -57,6 +57,11 @@ PROFILE_MIN_MEMCELLS = 1
 """Opensource parity: skip when the candidate cluster set holds fewer
 than ``N`` memcells across all selected clusters."""
 
+# Custom: apps excluded from user_profile extraction
+# 2026-06-07: trae (early 2026 era) - user explicitly opted out
+# to prevent early-novice chat patterns from polluting current profile
+EXCLUDED_USER_PROFILE_APP_IDS = frozenset({"trae"})
+
 
 _writer: ProfileWriter | None = None
 _reader: ProfileReader | None = None
@@ -141,14 +146,40 @@ async def extract_user_profile(
         # 4. Pull memcell payloads from SQLite, rehydrate to algo types,
         #    time-sort.
         memcell_rows = await memcell_repo.find_by_ids(member_ids)
+        # Build app_id lookup from the SQL rows (algo_memcells has no app_id
+        # field; it only carries items + timestamp). Pair by memcell order so
+        # the lookup stays 1:1 with the sort result.
+        memcell_app_ids = [r.app_id for r in memcell_rows]
+        algo_memcells_raw = [
+            AlgoMemCell.model_validate_json(r.payload_json) for r in memcell_rows
+        ]
         algo_memcells = sorted(
-            (AlgoMemCell.model_validate_json(r.payload_json) for r in memcell_rows),
-            key=lambda mc: mc.timestamp,
+            zip(algo_memcells_raw, memcell_app_ids, strict=True),
+            key=lambda pair: pair[0].timestamp,
         )
+        # Filter out memcells from excluded apps (e.g. trae) so they do not
+        # pollute the user's current profile with early-novice patterns.
+        # They still live in atomic_fact/episode (per-source filter only here).
+        if EXCLUDED_USER_PROFILE_APP_IDS:
+            before_count = len(algo_memcells)
+            algo_memcells = [
+                (mc, app_id)
+                for mc, app_id in algo_memcells
+                if app_id not in EXCLUDED_USER_PROFILE_APP_IDS
+            ]
+            if before_count != len(algo_memcells):
+                logger.info(
+                    "user_profile_excluded_apps",
+                    excluded=sorted(EXCLUDED_USER_PROFILE_APP_IDS),
+                    dropped=before_count - len(algo_memcells),
+                    remaining=len(algo_memcells),
+                )
         if not algo_memcells:
             return
+        # Unpack back to algo_memcells (drop app_id for downstream code)
+        algo_memcells = [mc for mc, _app_id in algo_memcells]
 
-        # 5. Run the LLM extractor — INIT (no prior) or UPDATE (existing).
+        # 5. Run the LLM extractor - INIT (no prior) or UPDATE (existing).
         old_profile = _to_algo_profile(existing[0]) if existing else None
         extractor = ProfileExtractor(llm=get_llm_client())
         new_profile = await extractor.aextract(
