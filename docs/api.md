@@ -30,6 +30,7 @@ business semantics the raw spec does not carry.
   - [POST /api/v1/memory/flush](#post-apiv1memoryflush)
   - [POST /api/v1/memory/search](#post-apiv1memorysearch)
   - [POST /api/v1/memory/get](#post-apiv1memoryget)
+  - [Private local admin endpoints](#private-local-admin-endpoints)
 - [OpenAPI spec source](#openapi-spec-source)
 
 ## Overview
@@ -46,6 +47,23 @@ All business endpoints documented here live under `/api/v1/memory/`.
 The operational endpoints `GET /health` and `GET /metrics` exist but
 are intentionally outside this reference — they are runtime probes for
 deployment, not part of the application contract.
+
+### Private local admin endpoints
+
+The bearer-protected local control-plane endpoints live under `/api/v1/admin/`.
+They fail closed with `503` unless `EVEROS_API_TOKEN` or
+`EVEROS_API_TOKEN_FILE` is configured; they never start anonymously.
+They are intentionally read-only and are not a public file API:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/v1/admin/memory-files` | Stable paginated metadata for regular `.md` truth-source files below the configured memory root. Optional `kind`, `query`, `page` (default 1), and `page_size` (default 50; max 100). Returned `path` is the only value accepted by the content endpoint. |
+| `GET /api/v1/admin/memory-files/content?path=…` | Read one UTF-8 Markdown source with metadata; rejects absolute/traversal/symlink/non-Markdown paths and files larger than 1 MiB. |
+| `GET /api/v1/admin/pipeline/status` | Current observable memory-root, Cascade queue, and LanceDB lifecycle state. A component that this process cannot observe is explicitly `unavailable`; no progress percentage is estimated. |
+
+These endpoints use the existing application Bearer middleware and additionally
+require a configured token. They never expose tokens, environment variables,
+or SQLite/LanceDB files.
 
 ### Content type
 

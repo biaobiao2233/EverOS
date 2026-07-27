@@ -38,6 +38,7 @@ from .lifespans import (
     SqliteLifespanProvider,
 )
 from .routes import (
+    admin,
     get,
     health,
     memorize,
@@ -138,11 +139,15 @@ def create_app(
     @app.middleware("http")
     async def require_api_token(request: Request, call_next):
         """Require a configured bearer token on every non-health request."""
-        if (
-            not api_token
-            or request.url.path == "/health"
-            or request.method == "OPTIONS"
-        ):
+        if request.url.path == "/health" or request.method == "OPTIONS":
+            return await call_next(request)
+        is_admin_request = request.url.path.startswith("/api/v1/admin/")
+        if is_admin_request and not api_token:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Admin API requires EVEROS_API_TOKEN"},
+            )
+        if not api_token:
             return await call_next(request)
         supplied = request.headers.get("Authorization", "")
         expected = f"Bearer {api_token}"
@@ -156,6 +161,7 @@ def create_app(
     app.include_router(memorize.router)
     app.include_router(search.router)
     app.include_router(get.router)
+    app.include_router(admin.router)
 
     logger.info("app_created", docs_enabled=enable_docs)
     return app
