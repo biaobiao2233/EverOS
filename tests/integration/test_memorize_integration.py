@@ -35,10 +35,14 @@ from sqlmodel import SQLModel
 
 from everos.core.persistence import MarkdownReader, MemoryRoot
 from everos.service.memorize import (
+    BackgroundFlushResult,
     MemorizeResult,
     MemoryOperationConflictError,
+    StageResult,
     get_memory_operation_status,
     memorize,
+    queue_background_flush,
+    stage,
 )
 
 # ---------------------------------------------------------------------------
@@ -837,3 +841,258 @@ async def test_waiter_timeout_does_not_fail_the_active_operation_receipt(
     assert completed.operation_id == operation_id
     assert completed.status == "extracted"
     assert len(_memcell_rows(tmp_path)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Deferred stage + durable background flush
+# ---------------------------------------------------------------------------
+
+
+async def test_stage_is_llm_free_idempotent_and_content_free(
+    tmp_path: Path,
+    memorize_env: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await memorize_env(mode="chat", fake_llm=_make_fake_llm())
+    svc = importlib.import_module("everos.service.memorize")
+    monkeypatch.setattr(
+        svc,
+        "get_llm_client",
+        lambda: (_ for _ in ()).throw(AssertionError("stage called the LLM")),
+    )
+    operation_id = "evop1-stage-" + "1" * 64
+    payload = {
+        "operation_id": operation_id,
+        "session_id": "stage_no_llm",
+        "messages": [
+            _user("upload first", 1_700_000_000_000),
+            _assistant("stored", 1_700_000_001_000),
+        ],
+    }
+
+    first = await stage(payload)
+    replay = await stage(payload)
+
+    assert isinstance(first, StageResult)
+    assert first.status == "staged"
+    assert first.message_count == 2
+    assert first.replayed is False
+    assert replay.replayed is True
+    assert _buffer_count(tmp_path) == 2
+    receipt = await get_memory_operation_status(operation_id)
+    assert receipt is not None
+    assert receipt.kind == "stage"
+    assert receipt.state == "completed"
+    assert receipt.stage == "messages_staged"
+    assert receipt.message_count == 2
+    assert receipt.memcell_count == 0
+
+
+async def test_stage_conflict_and_overlap_rechunk_dedupe(
+    tmp_path: Path,
+    memorize_env: Callable[..., Any],
+) -> None:
+    await memorize_env(mode="chat", fake_llm=_make_fake_llm())
+    first_message = _user("one", 1_700_000_000_000)
+    overlap = _assistant("two", 1_700_000_001_000)
+    last_message = _user("three", 1_700_000_002_000)
+    first = {
+        "operation_id": "evop1-stage-" + "2" * 64,
+        "session_id": "stage_overlap",
+        "messages": [first_message, overlap],
+    }
+    second = {
+        "operation_id": "evop1-stage-" + "3" * 64,
+        "session_id": "stage_overlap",
+        # The overlapping message moved from batch index 1 to index 0.
+        "messages": [overlap, last_message],
+    }
+    await stage(first)
+    await stage(second)
+    assert _buffer_count(tmp_path) == 3
+
+    changed = {
+        **first,
+        "messages": [_user("changed", 1_700_000_000_000)],
+    }
+    with pytest.raises(MemoryOperationConflictError, match="different request"):
+        await stage(changed)
+
+
+async def test_stage_then_legacy_add_dedupes_transport_aliases(
+    tmp_path: Path,
+    memorize_env: Callable[..., Any],
+) -> None:
+    await memorize_env(
+        mode="chat",
+        fake_llm=_make_fake_llm(boundary_responses=[[]]),
+    )
+    messages = [
+        _user("same row through two routes", 1_700_000_000_000),
+        _assistant("must remain one copy", 1_700_000_001_000),
+    ]
+    await stage(
+        {
+            "operation_id": "evop1-stage-" + "6" * 64,
+            "session_id": "stage_add_alias",
+            "messages": messages,
+        }
+    )
+
+    result = await memorize(
+        {
+            "session_id": "stage_add_alias",
+            "messages": messages,
+        }
+    )
+
+    assert result.status == "accumulated"
+    assert _buffer_count(tmp_path) == 2
+
+
+async def test_background_flush_is_durable_and_recovered_on_scheduler_start(
+    tmp_path: Path,
+    memorize_env: Callable[..., Any],
+) -> None:
+    await memorize_env(
+        mode="chat",
+        fake_llm=_make_fake_llm(boundary_responses=[[]]),
+    )
+    await stage(
+        {
+            "operation_id": "evop1-stage-" + "4" * 64,
+            "session_id": "background_recovery",
+            "messages": [
+                _user("remember after restart", 1_700_000_000_000),
+                _assistant("ack", 1_700_000_001_000),
+            ],
+        }
+    )
+    flush_id = "evop1-flush-" + "4" * 64
+    queued = await queue_background_flush(
+        {
+            "operation_id": flush_id,
+            "session_id": "background_recovery",
+            "app_id": "default",
+            "project_id": "default",
+        }
+    )
+    assert isinstance(queued, BackgroundFlushResult)
+    assert queued.status == "processing"
+    assert queued.replayed is False
+    pending = await get_memory_operation_status(flush_id)
+    assert pending is not None
+    assert pending.state == "running"
+    assert pending.stage == "queued"
+
+    # Model a process that died after claiming work but before completion.
+    # A fresh scheduler must recover both queued and processing receipts.
+    from everos.infra.persistence.sqlite import memory_operation_repo
+
+    await memory_operation_repo.mark_processing(flush_id)
+    interrupted = await get_memory_operation_status(flush_id)
+    assert interrupted is not None
+    assert interrupted.stage == "processing"
+
+    # Constructing a scheduler here models a fresh service process. Repeated
+    # wake-ups still feed one bounded worker and one durable operation.
+    from everos.service.background_flush import BackgroundFlushScheduler
+
+    scheduler = BackgroundFlushScheduler()
+    await scheduler.start()
+    for _ in range(100):
+        scheduler.wake()
+        completed = await get_memory_operation_status(flush_id)
+        if completed is not None and completed.state == "completed":
+            break
+        await asyncio.sleep(0.01)
+    await scheduler.stop()
+
+    completed = await get_memory_operation_status(flush_id)
+    assert completed is not None
+    assert completed.state == "completed"
+    assert completed.stage == "sync_dispatch_completed"
+    assert len(_memcell_rows(tmp_path)) == 1
+    assert len(_episode_paths(tmp_path)) == 1
+    assert _buffer_count(tmp_path) == 0
+
+
+async def test_background_flush_duplicate_claim_replays_without_new_job(
+    memorize_env: Callable[..., Any],
+) -> None:
+    await memorize_env(mode="chat", fake_llm=_make_fake_llm())
+    payload = {
+        "operation_id": "evop1-flush-" + "5" * 64,
+        "session_id": "background_duplicate",
+        "app_id": "default",
+        "project_id": "default",
+    }
+    first = await queue_background_flush(payload)
+    replay = await queue_background_flush(payload)
+    assert first.replayed is False
+    assert replay.replayed is True
+    receipt = await get_memory_operation_status(payload["operation_id"])
+    assert receipt is not None
+    assert receipt.stage == "queued"
+
+
+async def test_failed_retryable_flush_does_not_starve_newer_work(
+    memorize_env: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await memorize_env(mode="chat", fake_llm=_make_fake_llm())
+    from everos.infra.persistence.sqlite import memory_operation_repo
+    from everos.service import background_flush as background_flush_module
+    from everos.service.background_flush import BackgroundFlushScheduler
+
+    old_id = "evop1-flush-" + "7" * 64
+    new_id = "evop1-flush-" + "8" * 64
+    for operation_id, session_id in (
+        (old_id, "old_retryable"),
+        (new_id, "new_queued"),
+    ):
+        await queue_background_flush(
+            {
+                "operation_id": operation_id,
+                "session_id": session_id,
+                "app_id": "default",
+                "project_id": "default",
+            }
+        )
+    await memory_operation_repo.mark_failed(
+        old_id,
+        error_code="TemporaryProviderError",
+        retryable=True,
+    )
+
+    calls: list[str] = []
+
+    async def fake_run(operation_id: str) -> MemorizeResult:
+        calls.append(operation_id)
+        if operation_id == old_id:
+            raise RuntimeError("still unavailable")
+        await memory_operation_repo.mark_completed(
+            operation_id,
+            {"message_count": 0, "status": "accumulated"},
+        )
+        return MemorizeResult(message_count=0, status="accumulated")
+
+    monkeypatch.setattr(
+        background_flush_module,
+        "run_background_flush_operation",
+        fake_run,
+    )
+    scheduler = BackgroundFlushScheduler()
+    await scheduler.start()
+    for _ in range(100):
+        current = await get_memory_operation_status(new_id)
+        if current is not None and current.state == "completed":
+            break
+        await asyncio.sleep(0.01)
+    await scheduler.stop()
+
+    old_receipt = await get_memory_operation_status(old_id)
+    new_receipt = await get_memory_operation_status(new_id)
+    assert calls == [old_id, new_id]
+    assert old_receipt is not None and old_receipt.state == "failed"
+    assert new_receipt is not None and new_receipt.state == "completed"

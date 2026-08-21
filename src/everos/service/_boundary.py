@@ -41,6 +41,7 @@ from everalgo.types import (
 )
 from everalgo.types import ToolCall as AlgoToolCall
 from sqlalchemy import delete, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from everos.component.utils.datetime import from_timestamp, to_timestamp_ms
 from everos.core.observability.logging import get_logger
@@ -198,6 +199,77 @@ async def prepare_cells(
         status="extracted",
         message_count=len(fresh),
     )
+
+
+async def stage_messages(
+    ingested: IngestResult,
+    *,
+    operation_id: str,
+) -> int:
+    """Reliably merge one deferred upload batch without running extraction.
+
+    The idempotent buffer insert and the operation's terminal receipt share one SQLite
+    transaction.  A caller therefore never observes ``staged`` unless every
+    canonical row is durable, and a crash cannot leave a committed buffer with
+    an ambiguous operation receipt.
+    """
+
+    app_id = ingested.app_id
+    project_id = ingested.project_id
+    fresh = list(ingested.messages)
+    async with session_scope(get_session_factory()) as session:
+        if fresh:
+            rows = [_canonical_to_row(message, app_id, project_id) for message in fresh]
+            await session.execute(
+                sqlite_insert(UnprocessedBuffer)
+                .values([row.model_dump() for row in rows])
+                .on_conflict_do_nothing(index_elements=["message_id"])
+            )
+
+            status_stmt = select(ConversationStatus).where(
+                ConversationStatus.app_id == app_id,
+                ConversationStatus.project_id == project_id,
+                ConversationStatus.session_id == ingested.session_id,
+                ConversationStatus.track == _TRACK,
+            )
+            status = (await session.execute(status_stmt)).scalars().first()
+            last_message_ts = max(message.timestamp for message in fresh)
+            if status is None:
+                status = ConversationStatus(
+                    app_id=app_id,
+                    project_id=project_id,
+                    session_id=ingested.session_id,
+                    track=_TRACK,
+                    last_message_ts=last_message_ts,
+                )
+                session.add(status)
+            elif (
+                status.last_message_ts is None
+                or last_message_ts > status.last_message_ts
+            ):
+                status.last_message_ts = last_message_ts
+
+        operation = await session.get(MemoryOperation, operation_id)
+        if operation is None:
+            raise KeyError(f"memory operation not found: {operation_id}")
+        if operation.state == "completed":
+            raise RuntimeError(
+                "stage operation unexpectedly completed while executing: "
+                f"{operation_id}"
+            )
+        operation.state = "completed"
+        operation.stage = "messages_staged"
+        operation.response_json = json.dumps(
+            {"message_count": len(fresh), "status": "staged"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        operation.error_code = None
+        operation.retryable = False
+        await session.commit()
+    return len(fresh)
 
 
 # ── Mode-specific filter ──────────────────────────────────────────────────
@@ -490,11 +562,48 @@ def _merge_dedupe_sort(
     buffered: list[CanonicalMessage],
     new: list[CanonicalMessage],
 ) -> list[CanonicalMessage]:
-    """Dedupe by message_id; sort by (timestamp, message_id) ascending."""
-    seen: dict[str, CanonicalMessage] = {m.message_id: m for m in buffered}
-    for m in new:
-        seen.setdefault(m.message_id, m)
-    return sorted(seen.values(), key=lambda m: (m.timestamp, m.message_id))
+    """Dedupe transport aliases; sort by ``(timestamp, message_id)``.
+
+    Deferred ``/stage`` uses a chunk-position-independent content hash while
+    the legacy ``/add`` route retains its historical index-based message id.
+    During a rolling client/server upgrade the same text row can therefore
+    arrive once through each route with different ids. Keep the first
+    persisted row, but also compare the canonical message body so that route
+    aliases cannot create duplicate MemCells.
+    """
+
+    seen_ids: set[str] = set()
+    seen_transports: dict[str, set[str]] = {}
+    merged: list[CanonicalMessage] = []
+    for message in (*buffered, *new):
+        if message.message_id in seen_ids:
+            continue
+        identity = json.dumps(
+            message.model_dump(mode="json", exclude={"message_id"}),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        transport = (
+            "stage"
+            if message.message_id.startswith("ms_")
+            else "legacy_add"
+            if message.message_id.startswith("m_")
+            else "other"
+        )
+        prior_transports = seen_transports.setdefault(identity, set())
+        if (
+            transport == "stage"
+            and "legacy_add" in prior_transports
+            or transport == "legacy_add"
+            and "stage" in prior_transports
+        ):
+            continue
+        seen_ids.add(message.message_id)
+        prior_transports.add(transport)
+        merged.append(message)
+    return sorted(merged, key=lambda m: (m.timestamp, m.message_id))
 
 
 def _slice_tail(

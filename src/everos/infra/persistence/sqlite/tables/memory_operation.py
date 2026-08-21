@@ -1,4 +1,4 @@
-"""Persistent idempotency ledger for ``/memory/add`` and ``/memory/flush``.
+"""Persistent idempotency ledger for memory write operations.
 
 The table stores request fingerprints and small progress receipts only.  Raw
 conversation payloads remain in the existing buffer / memcell stores and are
@@ -13,10 +13,13 @@ from sqlalchemy import Index
 
 from everos.core.persistence.sqlite import BaseTable, Field
 
-OperationKind = Literal["add", "flush"]
+OperationKind = Literal["add", "stage", "flush"]
 OperationState = Literal["running", "completed", "failed"]
 OperationStage = Literal[
     "claimed",
+    "messages_staged",
+    "queued",
+    "processing",
     "memcells_committed",
     "sync_dispatch_completed",
 ]

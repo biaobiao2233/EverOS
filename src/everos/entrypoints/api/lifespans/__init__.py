@@ -20,6 +20,9 @@ External usage::
     )
 """
 
+from .background_flush import (
+    BackgroundFlushLifespanProvider as BackgroundFlushLifespanProvider,
+)
 from .cascade import CascadeLifespanProvider as CascadeLifespanProvider
 from .lancedb import LanceDBLifespanProvider as LanceDBLifespanProvider
 from .llm import LLMLifespanProvider as LLMLifespanProvider
@@ -27,6 +30,7 @@ from .ome import OmeLifespanProvider as OmeLifespanProvider
 from .sqlite import SqliteLifespanProvider as SqliteLifespanProvider
 
 __all__ = [
+    "BackgroundFlushLifespanProvider",
     "CascadeLifespanProvider",
     "LLMLifespanProvider",
     "LanceDBLifespanProvider",

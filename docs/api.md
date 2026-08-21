@@ -27,7 +27,9 @@ business semantics the raw spec does not carry.
   - [GetMemoryType](#getmemorytype)
 - [Endpoints](#endpoints)
   - [POST /api/v1/memory/add](#post-apiv1memoryadd)
+  - [POST /api/v1/memory/stage](#post-apiv1memorystage)
   - [POST /api/v1/memory/flush](#post-apiv1memoryflush)
+  - [GET /api/v1/memory/operations/{operation_id}](#get-apiv1memoryoperationsoperation_id)
   - [POST /api/v1/memory/search](#post-apiv1memorysearch)
   - [POST /api/v1/memory/get](#post-apiv1memoryget)
   - [Private local admin endpoints](#private-local-admin-endpoints)
@@ -562,6 +564,31 @@ Response (real capture):
 }
 ```
 
+### POST /api/v1/memory/stage
+
+Durably append a deferred text batch without running boundary detection,
+memory extraction, OME, or Cascade. The request fields match `/add`, except
+that `operation_id` is required and must match
+`evop1-stage-<64 lowercase hex>`.
+
+The server normalizes the messages, merges them under the same cross-process
+session lock used by `/add` and `/flush`, deduplicates stable message
+fingerprints across overlapping or regrouped HTTP batches, and commits the
+buffer plus receipt in one SQLite transaction.
+
+`200 OK` returns:
+
+| Field | Type | Notes |
+|---|---|---|
+| `message_count` | `integer` | Number of messages in this stage request |
+| `status` | `"staged"` | The batch and receipt are durable |
+| `operation_id` | `string` | Caller-provided idempotency key |
+| `replayed` | `boolean` | `true` when returning an existing receipt |
+
+Reusing an operation id with changed scope, session, or content returns
+`409`. Unparsed multimodal content is rejected with `415`; use `/add` for
+that path.
+
 ### POST /api/v1/memory/flush
 
 Force the boundary detector to decide **now** for the given session
@@ -576,6 +603,8 @@ or agent run to make sure pending context becomes durable memory.
 | `session_id` | `string` | yes | — | length 1–128 |
 | `app_id` | `string` *(ScopeId)* | no | `"default"` | — |
 | `project_id` | `string` *(ScopeId)* | no | `"default"` | — |
+| `operation_id` | `string` | required when `background=true` | `null` | `evop1-flush-<64 lowercase hex>` |
+| `background` | `boolean` | no | `false` | — |
 
 **`session_id`** — Identifies which buffer to flush. Must match the
 `session_id` of prior `/add` calls in the same `(app_id, project_id)`
@@ -601,6 +630,13 @@ time the response returns, the new entry is on disk. LanceDB index
 sync is still asynchronous — see
 [Eventual consistency](#eventual-consistency).
 
+With `background=true`, the server first persists a `queued` operation and
+immediately returns `status="processing"`. A lifespan-managed, single-worker
+dispatcher processes durable jobs in stable FIFO order. Service restart
+recovers both `queued` and interrupted `processing` jobs. The worker uses the
+same boundary hard limits as synchronous flush, so a large staged session may
+produce multiple bounded model calls rather than one unbounded prompt.
+
 #### cURL example
 
 ```bash
@@ -620,6 +656,16 @@ extraction LLM call):
     }
 }
 ```
+
+### GET /api/v1/memory/operations/{operation_id}
+
+Return the content-free durable receipt for an `add`, `stage`, or `flush`
+operation. Relevant fields are `kind`, `state`, `stage`, `message_count`,
+`memcell_count`, `retryable`, `error_code`, and (only when completed)
+`response`.
+
+`stage` is one of `claimed`, `messages_staged`, `queued`, `processing`,
+`memcells_committed`, or `sync_dispatch_completed`.
 
 ### POST /api/v1/memory/search
 

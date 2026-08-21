@@ -31,6 +31,7 @@ from everos.core.middleware import (
 from everos.core.observability.logging import get_logger
 
 from .lifespans import (
+    BackgroundFlushLifespanProvider,
     CascadeLifespanProvider,
     LanceDBLifespanProvider,
     LLMLifespanProvider,
@@ -88,9 +89,8 @@ def create_app(
         cors_allow_methods: Allowed CORS methods (default: ``["*"]``).
         cors_allow_headers: Allowed CORS headers (default: ``["*"]``).
         lifespan_providers: Optional list of LifespanProvider; defaults to
-            ``[MetricsLifespanProvider(), SqliteLifespanProvider(),
-            LanceDBLifespanProvider(), CascadeLifespanProvider(),
-            OmeLifespanProvider()]``.
+            the production metrics, LLM, SQLite, LanceDB, Cascade, OME, and
+            background-flush providers.
 
     Returns:
         FastAPI: Configured application instance.
@@ -105,6 +105,7 @@ def create_app(
             LanceDBLifespanProvider(),
             CascadeLifespanProvider(),
             OmeLifespanProvider(),
+            BackgroundFlushLifespanProvider(),
         ]
 
     app = FastAPI(

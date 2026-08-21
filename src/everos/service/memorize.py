@@ -58,7 +58,7 @@ from everos.memory.strategies import (
     trigger_profile_clustering,
     trigger_skill_clustering,
 )
-from everos.service._boundary import BoundaryOutcome, prepare_cells
+from everos.service._boundary import BoundaryOutcome, prepare_cells, stage_messages
 from everos.service._session_lock import scoped_session_lock
 
 logger = get_logger(__name__)
@@ -73,16 +73,41 @@ class MemorizeResult(BaseModel):
     replayed: bool = False
 
 
+class StageResult(BaseModel):
+    """Content-free receipt for one durable deferred-ingest batch."""
+
+    message_count: int
+    status: Literal["staged"] = "staged"
+    operation_id: str
+    replayed: bool = False
+
+
+class BackgroundFlushResult(BaseModel):
+    """Immediate acknowledgement for a durable background flush."""
+
+    status: Literal["processing"] = "processing"
+    operation_id: str
+    replayed: bool = False
+
+
 class MemoryOperationStatus(BaseModel):
     """Safe, content-free view exposed by the operation query endpoint."""
 
     operation_id: str
-    kind: Literal["add", "flush"]
+    kind: Literal["add", "stage", "flush"]
     app_id: str
     project_id: str
     session_id: str
     state: Literal["running", "completed", "failed"]
-    stage: Literal["claimed", "memcells_committed", "sync_dispatch_completed"]
+    stage: Literal[
+        "claimed",
+        "messages_staged",
+        "queued",
+        "processing",
+        "memcells_committed",
+        "sync_dispatch_completed",
+    ]
+    message_count: int
     memcell_count: int
     retryable: bool
     error_code: str | None = None
@@ -176,10 +201,212 @@ def _get_engine() -> OfflineEngine:
 # Public entry ───────────────────────────────────────────────────────────────
 
 
+async def stage(payload: dict[str, Any]) -> StageResult:
+    """Normalize and durably merge messages without invoking extraction.
+
+    The operation id is mandatory because its completed receipt is committed
+    atomically with the buffer rewrite.  The same request can be replayed; a
+    changed request under the same id is rejected.
+    """
+
+    request_payload = dict(payload)
+    operation_id_raw = request_payload.pop("operation_id", None)
+    if operation_id_raw is None:
+        raise ValueError("stage requires operation_id")
+    operation_id = str(operation_id_raw)
+    kind = "stage"
+    session_id = str(request_payload["session_id"])
+    app_id = str(request_payload.get("app_id") or "default")
+    project_id = str(request_payload.get("project_id") or "default")
+    request_sha256 = _request_sha256(kind, request_payload)
+    settings = load_settings()
+    configured_boundary = settings.boundary_detection
+    message_count = len(request_payload.get("messages", []))
+
+    _validate_operation_id(operation_id, kind)
+    operation, _ = await memory_operation_repo.claim(
+        MemoryOperation(
+            operation_id=operation_id,
+            kind=kind,
+            app_id=app_id,
+            project_id=project_id,
+            session_id=session_id,
+            request_sha256=request_sha256,
+            mode=settings.memorize.mode,
+            plan_version=1,
+            hard_token_limit=configured_boundary.hard_token_limit,
+            hard_msg_limit=configured_boundary.hard_msg_limit,
+            message_count=message_count,
+        )
+    )
+    _validate_operation(
+        operation,
+        kind=kind,
+        app_id=app_id,
+        project_id=project_id,
+        session_id=session_id,
+        request_sha256=request_sha256,
+    )
+    if operation.state == "completed":
+        return _stage_result_from_completed_operation(operation, replayed=True)
+    if operation.state == "failed" and not operation.retryable:
+        raise MemoryOperationRecoveryError(
+            f"operation {operation_id!r} failed permanently "
+            f"({operation.error_code or 'unknown'})"
+        )
+
+    owns_execution = False
+    try:
+        async with asyncio.timeout(settings.memorize.session_lock_timeout_seconds):
+            async with scoped_session_lock(
+                MemoryRoot.default(),
+                session_id,
+                app_id=app_id,
+                project_id=project_id,
+            ):
+                current = await memory_operation_repo.get(operation_id)
+                if current is None:  # pragma: no cover - DB invariant
+                    raise MemoryOperationRecoveryError(
+                        f"operation disappeared after claim: {operation_id!r}"
+                    )
+                _validate_operation(
+                    current,
+                    kind=kind,
+                    app_id=app_id,
+                    project_id=project_id,
+                    session_id=session_id,
+                    request_sha256=request_sha256,
+                )
+                if current.state == "completed":
+                    return _stage_result_from_completed_operation(
+                        current, replayed=True
+                    )
+                if current.state == "failed":
+                    if not current.retryable:
+                        raise MemoryOperationRecoveryError(
+                            f"operation {operation_id!r} is not retryable"
+                        )
+                    await memory_operation_repo.mark_running(operation_id)
+                owns_execution = True
+                ingested = await ingest_process(request_payload, deferred=True)
+                staged_count = await stage_messages(
+                    ingested,
+                    operation_id=operation_id,
+                )
+                return StageResult(
+                    message_count=staged_count,
+                    operation_id=operation_id,
+                )
+    except Exception as exc:
+        if owns_execution and not isinstance(exc, MemoryOperationConflictError):
+            retryable = not isinstance(
+                exc, (MultimodalError, MemoryOperationRecoveryError)
+            )
+            try:
+                await memory_operation_repo.mark_failed(
+                    operation_id,
+                    error_code=type(exc).__name__,
+                    retryable=retryable,
+                )
+            except Exception:  # pragma: no cover - preserve original failure
+                logger.exception(
+                    "memory_stage_failure_receipt_failed",
+                    extra={"operation_id": operation_id},
+                )
+        raise
+
+
+async def queue_background_flush(
+    payload: dict[str, Any],
+) -> BackgroundFlushResult:
+    """Persist a background flush claim without starting unbounded work."""
+
+    request_payload = dict(payload)
+    operation_id_raw = request_payload.pop("operation_id", None)
+    if operation_id_raw is None:
+        raise ValueError("background flush requires operation_id")
+    operation_id = str(operation_id_raw)
+    kind = "flush"
+    session_id = str(request_payload["session_id"])
+    app_id = str(request_payload.get("app_id") or "default")
+    project_id = str(request_payload.get("project_id") or "default")
+    request_payload["messages"] = []
+    request_sha256 = _request_sha256(kind, request_payload)
+    settings = load_settings()
+    configured_boundary = settings.boundary_detection
+
+    _validate_operation_id(operation_id, kind)
+    operation, created = await memory_operation_repo.claim(
+        MemoryOperation(
+            operation_id=operation_id,
+            kind=kind,
+            app_id=app_id,
+            project_id=project_id,
+            session_id=session_id,
+            request_sha256=request_sha256,
+            mode=settings.memorize.mode,
+            plan_version=1,
+            hard_token_limit=configured_boundary.hard_token_limit,
+            hard_msg_limit=configured_boundary.hard_msg_limit,
+            message_count=0,
+            stage="queued",
+        )
+    )
+    _validate_operation(
+        operation,
+        kind=kind,
+        app_id=app_id,
+        project_id=project_id,
+        session_id=session_id,
+        request_sha256=request_sha256,
+    )
+    if operation.state == "failed":
+        if not operation.retryable:
+            raise MemoryOperationRecoveryError(
+                f"operation {operation_id!r} is not retryable"
+            )
+        if operation.stage == "memcells_committed":
+            await memory_operation_repo.mark_running(operation_id)
+        else:
+            await memory_operation_repo.mark_queued(operation_id)
+    elif operation.state == "running" and operation.stage == "claimed":
+        await memory_operation_repo.mark_queued(operation_id)
+    return BackgroundFlushResult(
+        operation_id=operation_id,
+        replayed=not created,
+    )
+
+
+async def run_background_flush_operation(operation_id: str) -> MemorizeResult:
+    """Resume one persisted background flush through the normal state machine."""
+
+    operation = await memory_operation_repo.get(operation_id)
+    if operation is None:
+        raise MemoryOperationRecoveryError(
+            f"background operation not found: {operation_id!r}"
+        )
+    if operation.kind != "flush":
+        raise MemoryOperationRecoveryError(
+            f"background operation is not a flush: {operation_id!r}"
+        )
+    return await memorize(
+        {
+            "session_id": operation.session_id,
+            "app_id": operation.app_id,
+            "project_id": operation.project_id,
+            "messages": [],
+            "operation_id": operation.operation_id,
+        },
+        is_final=True,
+        background_worker=True,
+    )
+
+
 async def memorize(
     payload: dict[str, Any],
     *,
     is_final: bool = False,
+    background_worker: bool = False,
 ) -> MemorizeResult:
     """Execute one add/flush cycle with optional durable idempotency.
 
@@ -280,6 +507,10 @@ async def memorize(
                                 f"operation {operation_id!r} is not retryable"
                             )
                         current = await memory_operation_repo.mark_running(operation_id)
+                    if background_worker and current.stage in ("queued", "processing"):
+                        current = await memory_operation_repo.mark_processing(
+                            operation_id
+                        )
                     operation = current
                     owns_execution = True
 
@@ -406,7 +637,7 @@ async def get_memory_operation_status(
     response: dict[str, Any] | None = None
     if operation.state == "completed":
         if (
-            operation.stage != "sync_dispatch_completed"
+            operation.stage not in ("messages_staged", "sync_dispatch_completed")
             or operation.response_json is None
         ):
             raise MemoryOperationRecoveryError(
@@ -428,6 +659,7 @@ async def get_memory_operation_status(
         session_id=operation.session_id,
         state=operation.state,
         stage=operation.stage,
+        message_count=operation.message_count,
         memcell_count=len(memcell_ids),
         retryable=operation.retryable,
         error_code=operation.error_code,
@@ -513,6 +745,29 @@ def _result_from_completed_operation(
         ) from exc
     result.operation_id = operation.operation_id
     result.replayed = replayed
+    return result
+
+
+def _stage_result_from_completed_operation(
+    operation: MemoryOperation, *, replayed: bool
+) -> StageResult:
+    if operation.stage != "messages_staged" or operation.response_json is None:
+        raise MemoryOperationRecoveryError(
+            "completed stage operation has an inconsistent receipt"
+        )
+    try:
+        response = json.loads(operation.response_json)
+        result = StageResult.model_validate(
+            {
+                **response,
+                "operation_id": operation.operation_id,
+                "replayed": replayed,
+            }
+        )
+    except (ValueError, TypeError) as exc:
+        raise MemoryOperationRecoveryError(
+            "completed stage operation has an invalid response receipt"
+        ) from exc
     return result
 
 

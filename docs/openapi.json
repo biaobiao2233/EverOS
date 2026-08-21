@@ -94,6 +94,48 @@
         }
       }
     },
+    "/api/v1/memory/stage": {
+      "post": {
+        "tags": [
+          "memory"
+        ],
+        "summary": "Stage Memory",
+        "description": "Durably stage messages without invoking boundary or extraction.",
+        "operationId": "stage_memory_api_v1_memory_stage_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemorizeStageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope_StageResponseData_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/memory/flush": {
       "post": {
         "tags": [
@@ -262,6 +304,164 @@
           }
         }
       }
+    },
+    "/api/v1/admin/memory-files": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Get Memory Files",
+        "description": "List safe Markdown-source metadata, using stable path ordering.",
+        "operationId": "get_memory_files_api_v1_admin_memory_files_get",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/AdminMemoryKind"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Kind"
+            }
+          },
+          {
+            "name": "query",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Query"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 50,
+              "title": "Page Size"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminMemoryFilesResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/memory-files/content": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Get Memory File Content",
+        "description": "Return one bounded UTF-8 Markdown source named by a listed path.",
+        "operationId": "get_memory_file_content_api_v1_admin_memory_files_content_get",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "title": "Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminMemoryFileContentResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/pipeline/status": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Get Pipeline Status",
+        "description": "Return observed memory-root, Cascade, and indexing state only.",
+        "operationId": "get_pipeline_status_api_v1_admin_pipeline_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PipelineStatusResponse"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -309,6 +509,189 @@
           "status"
         ],
         "title": "AddResponseData"
+      },
+      "AdminMemoryFile": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/AdminMemoryKind"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Size Bytes"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "path",
+          "kind",
+          "size_bytes",
+          "modified_at"
+        ],
+        "title": "AdminMemoryFile"
+      },
+      "AdminMemoryFileContentData": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/AdminMemoryKind"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Size Bytes"
+          },
+          "modified_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Modified At"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "path",
+          "kind",
+          "size_bytes",
+          "modified_at",
+          "content"
+        ],
+        "title": "AdminMemoryFileContentData"
+      },
+      "AdminMemoryFileContentResponse": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/AdminMemoryFileContentData"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "AdminMemoryFileContentResponse"
+      },
+      "AdminMemoryFilesData": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AdminMemoryFile"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "page": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Page"
+          },
+          "page_size": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Page Size"
+          },
+          "total_count": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Total Count"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "page",
+          "page_size",
+          "total_count"
+        ],
+        "title": "AdminMemoryFilesData"
+      },
+      "AdminMemoryFilesResponse": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/AdminMemoryFilesData"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "AdminMemoryFilesResponse"
+      },
+      "AdminMemoryKind": {
+        "type": "string",
+        "enum": [
+          "episode",
+          "profile",
+          "atomic_fact",
+          "foresight",
+          "agent_case",
+          "agent_skill",
+          "other"
+        ],
+        "title": "AdminMemoryKind",
+        "description": "Recognised Markdown truth-source kinds, inferred from their path."
+      },
+      "CascadeStatus": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "unavailable"
+            ],
+            "title": "Status"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "running": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Running"
+          },
+          "queue": {
+            "$ref": "#/components/schemas/QueueStatus"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "status",
+          "queue"
+        ],
+        "title": "CascadeStatus"
       },
       "ContentItemDTO": {
         "properties": {
@@ -443,7 +826,8 @@
             "type": "string",
             "enum": [
               "extracted",
-              "no_extraction"
+              "no_extraction",
+              "processing"
             ],
             "title": "Status"
           },
@@ -902,6 +1286,46 @@
         "type": "object",
         "title": "HTTPValidationError"
       },
+      "IndexingStatus": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "unavailable"
+            ],
+            "title": "Status"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "lancedb_directory_exists": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lancedb Directory Exists"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "IndexingStatus"
+      },
       "MemorizeAddRequest": {
         "properties": {
           "session_id": {
@@ -992,6 +1416,11 @@
             ],
             "title": "Operation Id",
             "description": "Optional caller-stable idempotency key."
+          },
+          "background": {
+            "type": "boolean",
+            "title": "Background",
+            "default": false
           }
         },
         "type": "object",
@@ -999,6 +1428,54 @@
           "session_id"
         ],
         "title": "MemorizeFlushRequest"
+      },
+      "MemorizeStageRequest": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Session Id"
+          },
+          "app_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_.@+-]+$",
+            "title": "App Id",
+            "default": "default"
+          },
+          "project_id": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_.@+-]+$",
+            "title": "Project Id",
+            "default": "default"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/MessageItemDTO"
+            },
+            "type": "array",
+            "maxItems": 500,
+            "minItems": 1,
+            "title": "Messages"
+          },
+          "operation_id": {
+            "type": "string",
+            "pattern": "^evop1-stage-[0-9a-f]{64}$",
+            "title": "Operation Id",
+            "description": "Caller-stable deferred-ingest idempotency key."
+          }
+        },
+        "type": "object",
+        "required": [
+          "session_id",
+          "messages",
+          "operation_id"
+        ],
+        "title": "MemorizeStageRequest"
       },
       "MemoryOperationStatus": {
         "properties": {
@@ -1010,6 +1487,7 @@
             "type": "string",
             "enum": [
               "add",
+              "stage",
               "flush"
             ],
             "title": "Kind"
@@ -1039,10 +1517,17 @@
             "type": "string",
             "enum": [
               "claimed",
+              "messages_staged",
+              "queued",
+              "processing",
               "memcells_committed",
               "sync_dispatch_completed"
             ],
             "title": "Stage"
+          },
+          "message_count": {
+            "type": "integer",
+            "title": "Message Count"
           },
           "memcell_count": {
             "type": "integer",
@@ -1085,11 +1570,63 @@
           "session_id",
           "state",
           "stage",
+          "message_count",
           "memcell_count",
           "retryable"
         ],
         "title": "MemoryOperationStatus",
         "description": "Safe, content-free view exposed by the operation query endpoint."
+      },
+      "MemoryRootStatus": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "unavailable"
+            ],
+            "title": "Status"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "exists": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exists"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "MemoryRootStatus"
       },
       "MessageItemDTO": {
         "properties": {
@@ -1174,6 +1711,141 @@
           "content"
         ],
         "title": "MessageItemDTO"
+      },
+      "PipelineStatusData": {
+        "properties": {
+          "memory_root": {
+            "$ref": "#/components/schemas/MemoryRootStatus"
+          },
+          "cascade": {
+            "$ref": "#/components/schemas/CascadeStatus"
+          },
+          "indexing": {
+            "$ref": "#/components/schemas/IndexingStatus"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "memory_root",
+          "cascade",
+          "indexing"
+        ],
+        "title": "PipelineStatusData"
+      },
+      "PipelineStatusResponse": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PipelineStatusData"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "PipelineStatusResponse"
+      },
+      "QueueStatus": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "unavailable"
+            ],
+            "title": "Status"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "pending": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pending"
+          },
+          "done": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Done"
+          },
+          "failed_retryable": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failed Retryable"
+          },
+          "failed_permanent": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failed Permanent"
+          },
+          "max_lsn": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Lsn"
+          },
+          "last_processed_lsn": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Processed Lsn"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "QueueStatus"
       },
       "SearchAgentCaseItem": {
         "properties": {
@@ -1647,6 +2319,35 @@
         "title": "SearchResponse",
         "description": "Top-level response envelope."
       },
+      "StageResponseData": {
+        "properties": {
+          "message_count": {
+            "type": "integer",
+            "title": "Message Count"
+          },
+          "status": {
+            "type": "string",
+            "const": "staged",
+            "title": "Status"
+          },
+          "operation_id": {
+            "type": "string",
+            "title": "Operation Id"
+          },
+          "replayed": {
+            "type": "boolean",
+            "title": "Replayed"
+          }
+        },
+        "type": "object",
+        "required": [
+          "message_count",
+          "status",
+          "operation_id",
+          "replayed"
+        ],
+        "title": "StageResponseData"
+      },
       "SuccessEnvelope_AddResponseData_": {
         "properties": {
           "request_id": {
@@ -1697,6 +2398,23 @@
           "data"
         ],
         "title": "SuccessEnvelope[MemoryOperationStatus]"
+      },
+      "SuccessEnvelope_StageResponseData_": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "title": "Request Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/StageResponseData"
+          }
+        },
+        "type": "object",
+        "required": [
+          "request_id",
+          "data"
+        ],
+        "title": "SuccessEnvelope[StageResponseData]"
       },
       "ToolCallDTO": {
         "properties": {

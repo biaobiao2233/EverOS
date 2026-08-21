@@ -29,6 +29,7 @@ from typing import Any
 from everos.component.llm import get_multimodal_llm_client
 from everos.component.utils.datetime import from_timestamp
 from everos.config import load_settings
+from everos.core.errors import MultimodalError
 from everos.memory import CanonicalMessage, IngestResult, ToolCall
 from everos.memory.extract.parser import (
     enrich_content_items,
@@ -36,11 +37,15 @@ from everos.memory.extract.parser import (
     require_multimodal,
 )
 
-from .id_gen import gen_message_id
+from .id_gen import gen_message_id, gen_staged_message_id
 from .multimodal import coerce_items, derive_text
 
 
-async def process(payload: dict[str, Any]) -> IngestResult:
+async def process(
+    payload: dict[str, Any],
+    *,
+    deferred: bool = False,
+) -> IngestResult:
     """Normalise the raw add payload into an :class:`IngestResult`.
 
     The function is ``async`` for symmetry with the rest of the pipeline,
@@ -56,6 +61,11 @@ async def process(payload: dict[str, Any]) -> IngestResult:
     for idx, m in enumerate(raw_messages):
         content_items = coerce_items(m["content"])
         if has_unparsed_multimodal(content_items):
+            if deferred:
+                raise MultimodalError(
+                    "Deferred staging currently accepts text or already-parsed "
+                    "content only; use /memory/add for unparsed multimodal input."
+                )
             require_multimodal()
             await enrich_content_items(
                 content_items,
@@ -66,7 +76,17 @@ async def process(payload: dict[str, Any]) -> IngestResult:
         non_text_total += non_text
 
         ts_ms: int = int(m["timestamp"])
-        message_id = gen_message_id(session_id, ts_ms, idx)
+        message_id = (
+            gen_staged_message_id(
+                session_id,
+                ts_ms,
+                m,
+                app_id=app_id,
+                project_id=project_id,
+            )
+            if deferred
+            else gen_message_id(session_id, ts_ms, idx)
+        )
         ts = from_timestamp(ts_ms)
 
         canonical.append(

@@ -6,7 +6,7 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -64,6 +64,28 @@ class _MemoryOperationRepo(RepoBase[MemoryOperation]):
             retryable=False,
         )
 
+    async def mark_queued(self, operation_id: str) -> MemoryOperation:
+        """Make a durable background flush available to the bounded worker."""
+
+        return await self._transition(
+            operation_id,
+            state="running",
+            stage="queued",
+            error_code=None,
+            retryable=False,
+        )
+
+    async def mark_processing(self, operation_id: str) -> MemoryOperation:
+        """Record that a background worker owns the next execution attempt."""
+
+        return await self._transition(
+            operation_id,
+            state="running",
+            stage="processing",
+            error_code=None,
+            retryable=False,
+        )
+
     async def mark_memcells_committed(
         self,
         operation_id: str,
@@ -105,6 +127,32 @@ class _MemoryOperationRepo(RepoBase[MemoryOperation]):
             error_code=error_code,
             retryable=retryable,
         )
+
+    async def list_background_flush_pending(self) -> list[MemoryOperation]:
+        """Return recoverable background flushes in stable FIFO order."""
+
+        async with session_scope(self._factory) as session:
+            stmt = (
+                select(MemoryOperation)
+                .where(
+                    MemoryOperation.kind == "flush",
+                    MemoryOperation.stage.in_(
+                        ("queued", "processing", "memcells_committed")
+                    ),
+                    (
+                        (MemoryOperation.state == "running")
+                        | (
+                            (MemoryOperation.state == "failed")
+                            & (MemoryOperation.retryable.is_(True))
+                        )
+                    ),
+                )
+                .order_by(
+                    MemoryOperation.created_at.asc(),
+                    MemoryOperation.operation_id.asc(),
+                )
+            )
+            return list((await session.execute(stmt)).scalars().all())
 
     async def _transition(
         self,
