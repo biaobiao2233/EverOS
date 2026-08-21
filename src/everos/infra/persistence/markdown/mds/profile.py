@@ -38,3 +38,8 @@ class UserProfileFrontmatter(ProfilePathMixin, UserScopedFrontmatter):
     the most recent MemCell that fed into the synthesis. Compared with
     :attr:`everos.infra.persistence.sqlite.Cluster.last_ts_ms` to decide
     whether a cluster is fresh enough to drive a profile re-extraction."""
+
+    profile_watermark_memcell_ids: list[str] = []
+    """Stable memcell IDs whose timestamp equals profile_timestamp_ms and have
+    been successfully processed into this profile. Serves as a durable composite
+    cursor for late-arriving same-timestamp MemCells."""

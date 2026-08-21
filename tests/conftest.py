@@ -27,18 +27,14 @@ _LONG_CONV_PATH = _FIXTURE_DIR / "long_conversation_locomo_caroline_melanie.json
 
 
 @pytest.fixture(autouse=True)
-def _reset_settings_cache() -> Iterator[None]:
+def _reset_settings_cache(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     import structlog
 
     from everos.component.utils import datetime as dt_module
     from everos.config import load_settings
 
-    # ``configure_logging`` (called by some e2e fixtures / the CLI entry)
-    # sets ``cache_logger_on_first_use=True``; once a logger is cached,
-    # ``structlog.testing.capture_logs`` can no longer intercept events,
-    # which silently breaks log-assertion tests that run *after* it in the
-    # same process. Reset structlog to defaults around every test so that
-    # global config never leaks across the suite.
+    monkeypatch.delenv("EVEROS_API", raising=False)
+    monkeypatch.delenv("EVEROS_V2_API", raising=False)
     structlog.reset_defaults()
     load_settings.cache_clear()
     dt_module._display_tz.cache_clear()

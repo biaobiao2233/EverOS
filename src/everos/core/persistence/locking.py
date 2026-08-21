@@ -10,7 +10,10 @@ no async equivalent so they run in a worker thread via
 
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -42,6 +45,10 @@ async def memory_root_lock(
     Raises:
         LockError: When ``blocking=False`` and the lock is already held.
     """
+    if fcntl is None:
+        yield
+        return
+
     await anyio.Path(memory_root.root).mkdir(parents=True, exist_ok=True)
     lock_path = memory_root.lock_file
 
