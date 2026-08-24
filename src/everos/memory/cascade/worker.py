@@ -268,6 +268,16 @@ class _KindOptimizerState:
     last_run_at: float = 0.0
     last_prune_attempt_at: float = 0.0
     last_prune_at: float = 0.0
+    first_scheduled_at: float = 0.0
+    """Monotonic time of the first maintenance *opportunity* for this kind —
+    the moment ``_schedule_optimize`` first targeted it (a write batch touched
+    it, or the heartbeat revived a dirty flag). ``0`` means "never scheduled".
+
+    The prune-staleness clock baselines here rather than at worker start: a
+    state registered by the startup rebuild sweep on an idle deployment (no
+    writes → no beats) is not a stalled cleanup — nothing ever had a chance to
+    prune. Only once an opportunity exists can staleness mean anything.
+    """
     dirty: bool = False
     optimize_failures: int = 0
     """Consecutive non-benign optimize/prune failures **since the last
@@ -646,17 +656,24 @@ class CascadeWorker:
     def _prune_staleness(self) -> tuple[float, str | None]:
         """Staleness of the **worst** kind: ``(seconds, kind)``.
 
-        Per kind, staleness is the time since its own last successful
-        prune — or since worker start if it has never pruned — and the
-        worst (largest) one is reported. Taking the worst rather than the
-        newest prune across kinds is what makes the signal work on a
-        multi-kind deployment: one kind whose cleanup dies grows that
-        table's index dir unbounded, and the healthy kinds pruning on
-        schedule must not hide it.
+        Per kind, staleness is measured from its **first maintenance
+        opportunity** (:attr:`_KindOptimizerState.first_scheduled_at`) or its
+        last successful prune — whichever is newer. The worst (largest) one is
+        reported. Taking the worst rather than the newest prune across kinds
+        is what makes the signal work on a multi-kind deployment: one kind
+        whose cleanup dies grows that table's index dir unbounded, and the
+        healthy kinds pruning on schedule must not hide it.
+
+        A kind that has **never been scheduled** (no write batch touched it,
+        heartbeat never revived it) is skipped entirely: its optimizer state
+        may exist purely because the startup rebuild sweep registered it, and
+        "idle since boot" is not a stalled cleanup. Without this gate an idle
+        single-user deployment would drift past the alert threshold every
+        silent night and flip ``/health`` red while nothing is stuck.
 
         Returns ``(0.0, None)`` before the worker has started
-        (``_started_at == 0``) or before any kind has registered an
-        optimizer state — no prune beat has run, so nothing is stale yet.
+        (``_started_at == 0``), before any kind has registered a state, or
+        when no state carries a maintenance opportunity yet.
         """
         states = list(self._optimizer_states.items())
         if not states or self._started_at == 0.0:
@@ -665,11 +682,15 @@ class CascadeWorker:
         worst_seconds = -1.0
         worst_kind: str | None = None
         for kind, state in states:
-            baseline = max(state.last_prune_at, self._started_at)
+            if state.first_scheduled_at == 0.0:
+                continue
+            baseline = max(state.last_prune_at, state.first_scheduled_at)
             stale = max(0.0, now - baseline)
             if stale > worst_seconds:
                 worst_seconds, worst_kind = stale, kind
-        return max(0.0, worst_seconds), worst_kind
+        if worst_kind is None:
+            return 0.0, None
+        return worst_seconds, worst_kind
 
     # ── internals ──────────────────────────────────────────────────────────
 
@@ -808,6 +829,11 @@ class CascadeWorker:
         if repo is None:
             return
         state = self._optimizer_states.setdefault(kind, _KindOptimizerState())
+        if state.first_scheduled_at == 0.0:
+            # First maintenance opportunity for this kind — the prune-staleness
+            # health clock starts here, not at worker start (see
+            # _prune_staleness: idle deployments are not stalled deployments).
+            state.first_scheduled_at = time.monotonic()
         state.dirty = True
         if state.task is not None and not state.task.done():
             return
