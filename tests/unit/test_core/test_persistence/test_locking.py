@@ -144,3 +144,82 @@ async def test_blocking_waits_for_release(tmp_path: Path) -> None:
             assert elapsed >= 0.1
     finally:
         _stop_lock_holder(proc, release_path)
+
+
+# ── Bounded observable wait (poll-based LOCK_NB acquisition) ───────────────
+#
+# Uses an in-process fake ``fcntl`` so the poll/timeout/log contract is
+# testable on every platform, including Windows where real flock does not
+# exist and ``memory_root_lock`` degrades to a no-op yield.
+
+
+class _FakeFcntl:
+    """flock stand-in: raises BlockingIOError for the first ``held_polls``
+    non-blocking attempts, then acquires."""
+
+    LOCK_EX = 2
+    LOCK_NB = 4
+    LOCK_UN = 8
+
+    def __init__(self, *, held_polls: int) -> None:
+        self.held_polls = held_polls
+        self.polls = 0
+        self.acquired = False
+        self.unlocked = False
+
+    def flock(self, fd: object, flags: int) -> None:
+        if flags & self.LOCK_UN:
+            self.unlocked = True
+            return
+        if self.polls < self.held_polls:
+            self.polls += 1
+            raise BlockingIOError
+        self.acquired = True
+
+
+async def test_lock_wait_is_bounded_and_raises_on_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A holder that never releases must produce a LockError after the
+    configured timeout — not an unbounded wait."""
+    import everos.core.persistence.locking as locking_mod
+
+    fake = _FakeFcntl(held_polls=10_000)
+    monkeypatch.setattr(locking_mod, "fcntl", fake)
+    mr = MemoryRoot(tmp_path)
+    started = time.monotonic()
+    with pytest.raises(LockError, match="timed out"):
+        async with locking_mod.memory_root_lock(mr, timeout_seconds=0.3):
+            pass  # pragma: no cover — never reached
+    assert time.monotonic() - started < 5.0
+    assert fake.acquired is False
+
+
+async def test_lock_wait_succeeds_after_holder_releases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Polling acquires once the holder lets go; release happens on exit."""
+    import everos.core.persistence.locking as locking_mod
+
+    fake = _FakeFcntl(held_polls=2)
+    monkeypatch.setattr(locking_mod, "fcntl", fake)
+    mr = MemoryRoot(tmp_path)
+    async with locking_mod.memory_root_lock(mr, timeout_seconds=5.0):
+        assert fake.acquired is True
+        assert fake.polls >= 2, "waited through the contention window"
+        assert fake.unlocked is False
+    assert fake.unlocked is True, "lock released on exit"
+
+
+async def test_nonblocking_still_fails_immediately_under_fake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import everos.core.persistence.locking as locking_mod
+
+    fake = _FakeFcntl(held_polls=100)
+    monkeypatch.setattr(locking_mod, "fcntl", fake)
+    mr = MemoryRoot(tmp_path)
+    with pytest.raises(LockError):
+        async with locking_mod.memory_root_lock(mr, blocking=False):
+            pass  # pragma: no cover — never reached
+    assert fake.polls == 1, "non-blocking must not poll"

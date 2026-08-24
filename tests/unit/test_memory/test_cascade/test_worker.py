@@ -1,19 +1,24 @@
-"""Tests for :class:`CascadeWorker` retry classification + optimize scheduler.
+"""Tests for :class:`CascadeWorker` retry classification + maintenance scheduler.
 
 The pure-function pieces (registry / reconciler) get coverage in
 their own files. Here we focus on the worker's branch behaviour
 without touching the real handler / lancedb stack:
 
 - ``RecoverableError`` retries up to ``max_retry`` and then marks
-  ``retryable=TRUE``.
+  ``retryable=TRUE``; store-busy deadline errors retry the same way.
 - Any other exception marks ``retryable=FALSE`` immediately.
 - Successful handler ⇒ ``mark_done``.
 - Unknown kind ⇒ ``mark_failed(retryable=False)``.
 
 A second group covers the per-kind throttle + trailing-edge
-optimize scheduler that fires LanceDB ``optimize()`` outside the
-drain loop — coalescing under burst writes, re-running when dirty
-is re-raised mid-optimize, and flushing on drain-until-empty / stop.
+maintenance scheduler that fires LanceDB beats outside the drain loop
+— coalescing under burst writes, re-running when dirty is re-raised
+mid-beat, heavy/light beat splitting, benign commit-conflict handling,
+and flushing on drain-until-empty / stop.
+
+A third group covers loop supervision (bounded restart with backoff,
+budget exhaustion → process-exit request, stable-run reset) and the
+in-memory health signals feeding ``/health``.
 
 The repo singleton is monkey-patched onto a recording fake so the
 test stays in-memory.
@@ -29,21 +34,27 @@ from dataclasses import dataclass
 
 import pytest
 
+from everos.core.errors import VectorStoreBusyError
+from everos.memory.cascade import worker as worker_mod
 from everos.memory.cascade.errors import RecoverableError, UnrecoverableError
 from everos.memory.cascade.handlers import Handler, HandlerDeps
 from everos.memory.cascade.types import HandlerOutcome
 from everos.memory.cascade.worker import (
     DEFAULT_OPTIMIZE_MIN_INTERVAL_SECONDS,
-    DEFAULT_OPTIMIZE_PRUNE_INTERVAL_SECONDS,
+    DEFAULT_OPTIMIZE_PRUNE_RETENTION_SECONDS,
     CascadeWorker,
     _KindOptimizerState,
 )
 
+# Retention window is the disk-growth bound now: it must stay short enough
+# that superseded full-table copies are reclaimed quickly on a small disk.
+# The prune *cadence* is frequency-only and configurable via settings.
 
-def test_default_prune_window_bounds_bulk_import_disk_growth() -> None:
+
+def test_default_retention_bounds_bulk_import_disk_growth() -> None:
     """Keep local retention below the measured small-disk safety limit."""
     assert DEFAULT_OPTIMIZE_MIN_INTERVAL_SECONDS >= 10.0
-    assert DEFAULT_OPTIMIZE_PRUNE_INTERVAL_SECONDS <= 60.0
+    assert DEFAULT_OPTIMIZE_PRUNE_RETENTION_SECONDS <= 60.0
 
 
 @dataclass
@@ -214,33 +225,50 @@ def test_worker_handler_deps_construct_with_real_classes() -> None:
 
 
 class _FakeLanceRepo:
-    """Records every optimize() / rebuild_indexes() call.
+    """Records every maintenance call the worker drives.
 
-    ``optimize_delay`` / ``rebuild_delay`` simulate slow operations.
-    ``rebuild_raises`` makes ``rebuild_indexes`` raise (for crash-safety tests).
-    Each ``optimize`` call's ``cleanup_older_than`` is preserved so
-    prune-cadence tests can assert which calls took the heavy path.
+    ``optimize_delay`` / ``prune_delay`` / ``rebuild_delay`` simulate slow
+    operations. ``optimize_raises`` / ``rebuild_raises`` make the
+    corresponding call raise (for failure-classification tests). Prune
+    calls record their ``cleanup_older_than`` argument so beat-splitting
+    tests can assert the heavy/light paths.
     """
 
     def __init__(
         self,
         *,
         optimize_delay: float = 0.0,
+        prune_delay: float = 0.0,
         rebuild_delay: float = 0.0,
+        optimize_raises: Exception | None = None,
         rebuild_raises: bool = False,
     ) -> None:
         self.optimize_calls: list[float] = []
-        self.optimize_cleanup_args: list[dt.timedelta | None] = []
+        self.prune_calls: list[dt.timedelta] = []
         self.rebuild_calls: list[float] = []
         self.optimize_delay = optimize_delay
+        self.prune_delay = prune_delay
         self.rebuild_delay = rebuild_delay
+        self.optimize_raises = optimize_raises
         self.rebuild_raises = rebuild_raises
 
-    async def optimize(self, *, cleanup_older_than: dt.timedelta | None = None) -> None:
+    async def optimize(self) -> None:
         if self.optimize_delay > 0:
             await asyncio.sleep(self.optimize_delay)
+        if self.optimize_raises is not None:
+            raise self.optimize_raises
         self.optimize_calls.append(time.monotonic())
-        self.optimize_cleanup_args.append(cleanup_older_than)
+
+    async def prune(self, older_than: dt.timedelta) -> None:
+        # Recorded before the failure channel so callers can observe that a
+        # heavy beat *ran* even when it then raised.
+        self.prune_calls.append(older_than)
+        if self.prune_delay > 0:
+            await asyncio.sleep(self.prune_delay)
+        # Heavy beats share the raise channel with light beats so a failing
+        # repo surfaces regardless of which cadence fired.
+        if self.optimize_raises is not None:
+            raise self.optimize_raises
 
     async def rebuild_indexes(self) -> None:
         if self.rebuild_delay > 0:
@@ -271,15 +299,20 @@ async def test_schedule_optimize_noop_when_handler_has_no_lance_repo(
     assert "episode" not in w._optimizer_states
 
 
+def _beat_count(fake: _FakeLanceRepo) -> int:
+    """Total maintenance beats recorded on a fake repo (heavy + light)."""
+    return len(fake.prune_calls) + len(fake.optimize_calls)
+
+
 async def test_schedule_optimize_collapses_burst_within_throttle_window(
     patched_repo: _FakeRepo,
 ) -> None:
     """A burst of synchronous schedules creates at most one in-flight task.
 
-    The first call starts the optimize; subsequent calls during the
+    The first call starts the beat; subsequent calls during the
     same window only flip ``dirty``. With no time advance between
     schedules, the runner sees ``dirty=False`` after the first run
-    and exits — total optimize() calls collapse to one.
+    and exits — total maintenance beats collapse to one.
     """
     fake = _FakeLanceRepo()
     w = CascadeWorker(
@@ -290,32 +323,32 @@ async def test_schedule_optimize_collapses_burst_within_throttle_window(
     for _ in range(10):
         w._schedule_optimize("episode")
     await w._flush_optimizers()
-    assert fake.optimize_calls, "expected at least one optimize"
-    assert len(fake.optimize_calls) == 1, (
-        f"burst should collapse, got {len(fake.optimize_calls)} calls"
+    assert _beat_count(fake) >= 1, "expected at least one maintenance beat"
+    assert _beat_count(fake) == 1, (
+        f"burst should collapse, got {_beat_count(fake)} beats"
     )
 
 
-async def test_schedule_optimize_reruns_when_dirty_set_during_optimize(
+async def test_schedule_optimize_reruns_when_dirty_set_during_beat(
     patched_repo: _FakeRepo,
 ) -> None:
-    """A write that lands mid-optimize re-raises ``dirty`` and triggers a re-run.
+    """A write that lands mid-beat re-raises ``dirty`` and triggers a re-run.
 
-    Uses an artificially slow optimize so the second schedule fires
+    Uses an artificially slow first beat so the second schedule fires
     while the first run is still in flight. Trailing-edge semantics
     guarantee the second run happens after the throttle interval.
     """
-    fake = _FakeLanceRepo(optimize_delay=0.05)
+    fake = _FakeLanceRepo(prune_delay=0.05)
     w = CascadeWorker(
         {"episode": _OkHandlerWithRepo(fake)},
         retry_backoff_seconds=0,
         optimize_min_interval_seconds=0.02,
     )
     w._schedule_optimize("episode")
-    await asyncio.sleep(0.01)  # ensure first task is mid-optimize
+    await asyncio.sleep(0.01)  # ensure first task is mid-beat
     w._schedule_optimize("episode")
     await w._flush_optimizers()
-    assert len(fake.optimize_calls) == 2
+    assert _beat_count(fake) == 2
 
 
 async def test_concurrent_schedules_keep_one_task_per_kind(
@@ -341,8 +374,8 @@ async def test_concurrent_schedules_keep_one_task_per_kind(
 async def test_flush_optimizers_awaits_pending_task(
     patched_repo: _FakeRepo,
 ) -> None:
-    """flush_optimizers blocks until in-flight optimize commits and clears slot."""
-    fake = _FakeLanceRepo(optimize_delay=0.05)
+    """flush_optimizers blocks until the in-flight beat commits and clears slot."""
+    fake = _FakeLanceRepo(prune_delay=0.05)
     w = CascadeWorker(
         {"episode": _OkHandlerWithRepo(fake)},
         retry_backoff_seconds=0,
@@ -351,7 +384,7 @@ async def test_flush_optimizers_awaits_pending_task(
     w._schedule_optimize("episode")
     assert w._optimizer_states["episode"].task is not None
     await w._flush_optimizers()
-    assert fake.optimize_calls, "flush should not return before optimize ran"
+    assert _beat_count(fake), "flush should not return before the beat ran"
     assert w._optimizer_states["episode"].task is None
 
 
@@ -359,7 +392,7 @@ async def test_drain_until_empty_flushes_optimizers_before_returning(
     patched_repo: _FakeRepo,
 ) -> None:
     """CLI ``cascade sync`` expects FTS to be current when the call returns."""
-    fake = _FakeLanceRepo(optimize_delay=0.03)
+    fake = _FakeLanceRepo(prune_delay=0.03)
     patched_repo.batch = [_Row(md_path="a.md")]
     w = CascadeWorker(
         {"episode": _OkHandlerWithRepo(fake)},
@@ -368,15 +401,15 @@ async def test_drain_until_empty_flushes_optimizers_before_returning(
     )
     await w.drain_until_empty()
     assert patched_repo.done == ["a.md"]
-    assert len(fake.optimize_calls) == 1
+    assert _beat_count(fake) == 1
     assert w._optimizer_states["episode"].task is None
 
 
-async def test_drain_once_does_not_block_on_optimize(
+async def test_drain_once_does_not_block_on_maintenance(
     patched_repo: _FakeRepo,
 ) -> None:
-    """drain_once is fire-and-forget — it must return before optimize commits."""
-    fake = _FakeLanceRepo(optimize_delay=0.2)
+    """drain_once is fire-and-forget — it must return before a beat commits."""
+    fake = _FakeLanceRepo(prune_delay=0.2)
     patched_repo.batch = [_Row(md_path="a.md")]
     w = CascadeWorker(
         {"episode": _OkHandlerWithRepo(fake)},
@@ -386,36 +419,36 @@ async def test_drain_once_does_not_block_on_optimize(
     started = time.monotonic()
     await w.drain_once()
     drain_elapsed = time.monotonic() - started
-    # drain returned long before the 0.2s optimize would finish
-    assert drain_elapsed < 0.1, f"drain blocked on optimize: {drain_elapsed:.3f}s"
-    assert not fake.optimize_calls, "optimize should still be in flight"
+    # drain returned long before the 0.2s prune would finish
+    assert drain_elapsed < 0.1, f"drain blocked on maintenance: {drain_elapsed:.3f}s"
+    assert not fake.prune_calls, "prune should still be in flight"
     await w._flush_optimizers()
-    assert len(fake.optimize_calls) == 1
+    assert len(fake.prune_calls) == 1
 
 
-async def test_stop_waits_for_in_flight_optimize(
+async def test_stop_waits_for_in_flight_maintenance(
     patched_repo: _FakeRepo,
 ) -> None:
-    """stop() must give an in-flight optimize a chance to commit cleanly."""
-    fake = _FakeLanceRepo(optimize_delay=0.05)
+    """stop() must give an in-flight maintenance beat a chance to commit."""
+    fake = _FakeLanceRepo(prune_delay=0.05)
     w = CascadeWorker(
         {"episode": _OkHandlerWithRepo(fake)},
         retry_backoff_seconds=0,
         optimize_min_interval_seconds=0.02,
         optimize_heartbeat_seconds=10.0,
         # Park rebuild interval — startup sweep still fires but we wait
-        # for it before testing optimize semantics.
+        # for it before testing beat semantics.
         optimize_rebuild_interval_seconds=10.0,
     )
     await w.start()
     # Let the startup rebuild sweep complete (instant for the fake repo)
-    # before scheduling optimize — otherwise optimize would queue behind it.
+    # before scheduling a beat — otherwise it would queue behind the rebuild.
     await asyncio.sleep(0.02)
     assert fake.rebuild_calls, "startup rebuild should have fired by now"
     w._schedule_optimize("episode")
-    await asyncio.sleep(0.01)  # let optimize start
+    await asyncio.sleep(0.01)  # let the beat start
     await w.stop()
-    assert len(fake.optimize_calls) == 1
+    assert len(fake.prune_calls) == 1
 
 
 async def test_optimize_failure_does_not_crash_drain_loop(
@@ -425,6 +458,9 @@ async def test_optimize_failure_does_not_crash_drain_loop(
 
     class _FailingRepo:
         async def optimize(self) -> None:
+            raise RuntimeError("simulated lancedb manifest conflict")
+
+        async def prune(self, older_than: object) -> None:
             raise RuntimeError("simulated lancedb manifest conflict")
 
     class _HandlerWithFailingRepo(_OkHandler):
@@ -483,45 +519,44 @@ async def test_heartbeat_recovers_dirty_state_with_lost_task(
     await w.start()
     await asyncio.sleep(0.12)
     await w.stop()
-    assert fake.optimize_calls, "dirty state should be recovered"
+    assert _beat_count(fake), "dirty state should be recovered"
 
 
-async def test_optimize_prunes_on_first_call_then_throttles(
+async def test_first_beat_prunes_then_throttles_to_light_compaction(
     patched_repo: _FakeRepo,
 ) -> None:
-    """First optimize() per kind passes ``cleanup_older_than``; subsequent
-    calls within ``optimize_prune_interval_seconds`` do not.
+    """First maintenance beat per kind takes the heavy prune path; subsequent
+    beats within ``optimize_prune_interval_seconds`` take the light
+    lock-free compaction path.
 
-    Rationale lives in ``DEFAULT_OPTIMIZE_PRUNE_INTERVAL_SECONDS``:
-    LanceDB ``optimize()`` without ``cleanup_older_than`` leaves stale
-    physical files on disk; passing it on every 1-second optimize tick
-    is wasteful, but never passing it leaks files until FDs exhaust.
-    A separate cadence — prune ≪ optimize — balances the two.
+    Rationale lives in ``LanceRepoBase.prune``: a lock-free bundled
+    ``cleanup_older_than`` loses the manifest commit race under churn and
+    never reclaims; the heavy beat therefore runs under the per-table
+    write lock on a slow cadence, while every other tick stays cheap and
+    lock-free.
     """
     fake = _FakeLanceRepo()
+    retention = 25.0
     w = CascadeWorker(
         {"episode": _OkHandlerWithRepo(fake)},
         retry_backoff_seconds=0,
         optimize_min_interval_seconds=0.01,
-        optimize_prune_interval_seconds=10.0,  # long — second call should NOT prune
+        optimize_prune_interval_seconds=10.0,  # long — second beat must be light
+        optimize_prune_retention_seconds=retention,
     )
-    # First call: state has never pruned, must include cleanup_older_than.
+    # First beat: state has never attempted a prune — must go heavy.
     w._schedule_optimize("episode")
     await w._flush_optimizers()
-    assert len(fake.optimize_calls) == 1
-    assert fake.optimize_cleanup_args[0] is not None, (
-        "first optimize must prune to catch up from prior session"
-    )
-    assert fake.optimize_cleanup_args[0] == dt.timedelta(seconds=10.0)
+    assert len(fake.prune_calls) == 1
+    assert fake.optimize_calls == []
+    assert fake.prune_calls[0] == dt.timedelta(seconds=retention)
 
-    # Second call within the prune window: light path (no cleanup).
+    # Second beat within the prune cadence: light path (compaction only).
     await asyncio.sleep(0.02)  # exceed optimize throttle (0.01), not prune (10)
     w._schedule_optimize("episode")
     await w._flush_optimizers()
-    assert len(fake.optimize_calls) == 2
-    assert fake.optimize_cleanup_args[1] is None, (
-        "second optimize within prune window should skip cleanup_older_than"
-    )
+    assert len(fake.prune_calls) == 1, "prune cadence must gate the heavy beat"
+    assert len(fake.optimize_calls) == 1
 
 
 # ── Rebuild scheduler tests ────────────────────────────────────────────────
@@ -597,3 +632,487 @@ async def test_rebuild_failure_does_not_crash_daemon(
     await w.stop()
     # Worker is still alive (stop() returned cleanly).
     assert w._task is None
+
+
+# ── Loop supervision (failure injection) ───────────────────────────────────
+
+
+class _CrashThenBlockBody:
+    """Callable loop body that raises ``crashes`` times, then parks on stop."""
+
+    def __init__(self, worker: CascadeWorker, crashes: int = 1) -> None:
+        self.worker = worker
+        self.crashes = crashes
+        self.runs = 0
+        self.restarted = asyncio.Event()
+
+    async def __call__(self) -> None:
+        self.runs += 1
+        if self.runs <= self.crashes:
+            raise RuntimeError("injected loop crash")
+        self.restarted.set()
+        await self.worker._stop.wait()
+
+
+async def test_supervise_restarts_crashed_loop_with_backoff(
+    patched_repo: _FakeRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A loop body that raises is restarted after the (shortened) backoff."""
+    monkeypatch.setattr(worker_mod, "_LOOP_RESTART_BACKOFF_SECONDS", (0.01,))
+    w = CascadeWorker({"episode": _OkHandler()}, retry_backoff_seconds=0)
+    body = _CrashThenBlockBody(w, crashes=1)
+    task = asyncio.create_task(w._supervise("drain", body))  # type: ignore[arg-type]
+    # Deterministic: wait for the *restart itself* instead of guessing when
+    # the backoff has elapsed.
+    await asyncio.wait_for(body.restarted.wait(), timeout=2.0)
+    w._stop.set()  # let the parked body observe stop; supervisor returns
+    await asyncio.wait_for(task, timeout=2.0)
+    assert body.runs == 2, "crashing body must be restarted exactly once"
+
+
+class _AlwaysCrashBody:
+    def __init__(self) -> None:
+        self.runs = 0
+
+    async def __call__(self) -> None:
+        self.runs += 1
+        raise RuntimeError("deterministic crash")
+
+
+async def test_supervise_exhausts_budget_and_requests_process_exit(
+    patched_repo: _FakeRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Consecutive quick crashes past the budget trigger process-exit escalation."""
+    monkeypatch.setattr(worker_mod, "_LOOP_RESTART_BACKOFF_SECONDS", (0.01, 0.01))
+    exits: list[str] = []
+    w = CascadeWorker({"episode": _OkHandler()}, retry_backoff_seconds=0)
+    monkeypatch.setattr(
+        w, "_request_process_exit", lambda loop_name: exits.append(loop_name)
+    )
+    body = _AlwaysCrashBody()
+    await asyncio.wait_for(w._supervise("drain", body), timeout=5.0)  # type: ignore[arg-type]
+    # budget=2 → the 3rd strike (strikes > budget) escalates.
+    assert body.runs == 3
+    assert exits == ["drain"], "budget exhaustion must request process exit"
+
+
+class _LongRunThenCrashBody:
+    """Runs >= stable threshold, then crashes; parks on stop afterwards."""
+
+    def __init__(self, worker: CascadeWorker, crashes: int = 4) -> None:
+        self.worker = worker
+        self.crashes = crashes
+        self.runs = 0
+        self.phase_done = asyncio.Event()
+
+    async def __call__(self) -> None:
+        self.runs += 1
+        if self.runs <= self.crashes:
+            await asyncio.sleep(0.06)  # >= stable threshold → strike reset
+            raise RuntimeError("transient after honest work")
+        self.phase_done.set()
+        await self.worker._stop.wait()
+
+
+async def test_stable_run_resets_quick_crash_budget(
+    patched_repo: _FakeRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A body that ran >= stable-run seconds before crashing starts a fresh
+    incident — independent transients never accumulate into an escalation."""
+    monkeypatch.setattr(worker_mod, "_LOOP_RESTART_BACKOFF_SECONDS", (0.005,))
+    monkeypatch.setattr(worker_mod, "_LOOP_STABLE_RUN_SECONDS", 0.05)
+
+    exits: list[str] = []
+    w = CascadeWorker({"episode": _OkHandler()}, retry_backoff_seconds=0)
+    monkeypatch.setattr(
+        w, "_request_process_exit", lambda loop_name: exits.append(loop_name)
+    )
+    body = _LongRunThenCrashBody(w, crashes=4)
+    task = asyncio.create_task(w._supervise("drain", body))  # type: ignore[arg-type]
+    # Deterministic: wait until several post-stable crashes have happened
+    # (with budget=1, two *consecutive* quick crashes would escalate).
+    await asyncio.wait_for(body.phase_done.wait(), timeout=10.0)
+    w._stop.set()
+    await asyncio.wait_for(task, timeout=2.0)
+    assert body.runs == 5, "every post-stable crash must get a fresh budget"
+    assert exits == [], "stable runs reset strikes; escalation must not fire"
+
+
+def test_done_callback_logs_unexpected_supervisor_death(
+    patched_repo: _FakeRepo,
+) -> None:
+    """A supervised task that ends from a BaseException (not cancellation,
+    not stop()) is observed by its done-callback and logged.
+
+    Simulated with a stand-in task object: raising a real ``BaseException``
+    inside a coroutine would tear down the event loop under the test runner
+    — the very behaviour the callback exists to *observe* in production."""
+    import structlog
+
+    class _FakeTask:
+        def __init__(self, *, cancelled: bool, exc: BaseException | None) -> None:
+            self._cancelled = cancelled
+            self._exc = exc
+
+        def cancelled(self) -> bool:
+            return self._cancelled
+
+        def exception(self) -> BaseException | None:
+            return self._exc
+
+    w = CascadeWorker({"episode": _OkHandler()}, retry_backoff_seconds=0)
+    with structlog.testing.capture_logs() as logs:
+        w._on_loop_task_done(
+            "drain",
+            _FakeTask(cancelled=False, exc=KeyboardInterrupt("escape")),  # type: ignore[arg-type]
+        )
+    death_events = [
+        e for e in logs if e.get("event") == "cascade_loop_task_ended_unexpectedly"
+    ]
+    assert len(death_events) == 1
+    assert "KeyboardInterrupt" in str(death_events[0].get("error"))
+
+    # Cancelled tasks (stop() path) must stay silent.
+    with structlog.testing.capture_logs() as logs2:
+        w._on_loop_task_done(
+            "drain",
+            _FakeTask(cancelled=True, exc=None),  # type: ignore[arg-type]
+        )
+    assert logs2 == []
+
+
+# ── Health signals ─────────────────────────────────────────────────────────
+
+
+async def test_health_defaults_are_clean_before_start(patched_repo: _FakeRepo) -> None:
+    w = CascadeWorker({"episode": _OkHandler()})
+    h = w.health()
+    assert h.drain_consecutive_failures == 0
+    assert h.unrecoverable_total == 0
+    assert h.optimize_failure_streak == 0
+    assert h.prune_stale_seconds == 0.0
+    assert h.prune_stale_kind is None
+    assert h.reasons() == []
+
+
+class _FlakyClaimRepo(_FakeRepo):
+    """claim_pending_batch raises for the first N calls, then drains clean."""
+
+    def __init__(self, fail_times: int) -> None:
+        super().__init__(batch=[])
+        self.fail_times = fail_times
+        self.calls = 0
+
+    async def claim_pending_batch(self, _limit: int) -> list[_Row]:
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise RuntimeError("sqlite busy")
+        return []
+
+
+async def test_drain_failure_counter_counts_then_resets(
+    patched_repo: _FakeRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Consecutive drain exceptions are counted; a clean drain resets them."""
+    flaky = _FlakyClaimRepo(fail_times=3)
+    monkeypatch.setattr(worker_mod, "md_change_state_repo", flaky)
+    w = CascadeWorker(
+        {"episode": _OkHandler()},
+        retry_backoff_seconds=0,
+        poll_interval_seconds=0.01,
+    )
+    await w.start()
+    deadline = time.monotonic() + 2.0
+    saw_degraded = False
+    while time.monotonic() < deadline:
+        if w.health().drain_consecutive_failures >= 1:
+            saw_degraded = True
+            break
+        await asyncio.sleep(0.005)
+    assert saw_degraded, "failing drains must surface in health"
+    # The flaky repo recovers after 3 failures; the counter must reset to 0.
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if w.health().drain_consecutive_failures == 0:
+            break
+        await asyncio.sleep(0.005)
+    await w.stop()
+    assert w.health().drain_consecutive_failures == 0, (
+        "a clean drain resets the consecutive-failure counter"
+    )
+
+
+async def test_unrecoverable_handler_increments_health_counter(
+    patched_repo: _FakeRepo,
+) -> None:
+    patched_repo.batch = [_Row(md_path="a.md")]
+    w = CascadeWorker({"episode": _BareExceptionHandler()}, retry_backoff_seconds=0)
+    await w.drain_once()
+    assert w.health().unrecoverable_total == 1
+
+
+async def test_prune_staleness_reports_worst_kind(patched_repo: _FakeRepo) -> None:
+    """One stalled kind must not be masked by siblings pruning on schedule."""
+    now = time.monotonic()
+    w = CascadeWorker({"a": _OkHandler(), "b": _OkHandler()})
+    w._started_at = now - 100.0
+    w._optimizer_states["a"] = _KindOptimizerState(last_prune_at=now - 50.0)
+    w._optimizer_states["b"] = _KindOptimizerState(last_prune_at=now - 90.0)
+    stale, kind = w._prune_staleness()
+    assert kind == "b"
+    assert 89.0 < stale <= 91.0
+
+    # Before start (no baseline clock) nothing is reported stale.
+    fresh = CascadeWorker({"a": _OkHandler()})
+    fresh._optimizer_states["a"] = _KindOptimizerState(last_prune_at=now)
+    assert fresh._prune_staleness() == (0.0, None)
+
+
+def test_worker_health_reasons_thresholds() -> None:
+    from everos.memory.cascade.worker import CascadeWorkerHealth as H
+
+    clean = H(0, 0, 0, 0.0)
+    assert clean.reasons() == []
+
+    degraded_drain = H(3, 0, 0, 0.0)
+    assert any("drain loop failing" in r for r in degraded_drain.reasons())
+
+    stuck_optimize = H(0, 0, 5, 0.0)
+    assert any("optimize stuck" in r for r in stuck_optimize.reasons())
+
+    stalled_prune = H(0, 0, 0, 901.0, prune_stale_kind="agent_skill")
+    reasons = stalled_prune.reasons()
+    assert any("version cleanup stalled" in r and "agent_skill" in r for r in reasons)
+
+
+def test_failed_permanent_is_informational_not_operational() -> None:
+    """The data-quality backlog must not appear in operational ``reasons``.
+
+    ``failed_permanent`` lives in the SQLite summary (orchestrator level),
+    never in :meth:`CascadeWorkerHealth.reasons` — otherwise /health sits
+    red forever on a normal backlog."""
+    from everos.memory.cascade.worker import CascadeWorkerHealth as H
+
+    backlog = H(
+        drain_consecutive_failures=0,
+        unrecoverable_total=7,
+        optimize_failure_streak=0,
+        prune_stale_seconds=0.0,
+    )
+    assert backlog.reasons() == []
+
+
+# ── Maintenance failure classification (failure injection) ────────────────
+
+
+async def test_benign_commit_conflict_not_counted_and_no_fallback_rebuild(
+    patched_repo: _FakeRepo,
+) -> None:
+    """A lost manifest race is benign: debug-logged, streak stays 0, no rebuild."""
+    fake = _FakeLanceRepo(
+        optimize_raises=RuntimeError(
+            "Retryable commit conflict: This Rewrite transaction was preempted"
+        )
+    )
+    w = CascadeWorker(
+        {"episode": _OkHandlerWithRepo(fake)},
+        retry_backoff_seconds=0,
+        optimize_min_interval_seconds=0.001,
+    )
+    for _ in range(6):  # far beyond the alert threshold (5)
+        w._schedule_optimize("episode")
+        await w._flush_optimizers()
+        await asyncio.sleep(0.002)
+    assert w.health().optimize_failure_streak == 0
+    assert fake.rebuild_calls == [], "benign conflicts must not trigger rebuilds"
+
+
+async def test_real_failures_trigger_one_fallback_per_threshold(
+    patched_repo: _FakeRepo,
+) -> None:
+    """Non-benign beats escalate: fallback rebuild at threshold, once per
+    threshold; the health streak survives the rebuild it triggered."""
+    fake = _FakeLanceRepo(optimize_raises=RuntimeError("disk exploded"))
+    w = CascadeWorker(
+        {"episode": _OkHandlerWithRepo(fake)},
+        retry_backoff_seconds=0,
+        optimize_min_interval_seconds=0.001,
+    )
+    for _ in range(5):  # reach the alert threshold
+        w._schedule_optimize("episode")
+        await w._flush_optimizers()
+        await asyncio.sleep(0.002)
+    assert len(fake.rebuild_calls) == 1, "threshold must fire one fallback rebuild"
+    h = w.health()
+    assert h.optimize_failure_streak == 5, (
+        "fallback rebuild must NOT reset the health signal"
+    )
+    state = w._optimizer_states["episode"]
+    assert state.failures_since_fallback == 0, "rate limiter resets after firing"
+
+    # Five more failures → exactly one more fallback (rate-limited).
+    for _ in range(5):
+        w._schedule_optimize("episode")
+        await w._flush_optimizers()
+        await asyncio.sleep(0.002)
+    assert len(fake.rebuild_calls) == 2
+
+
+async def test_failed_prune_advances_attempt_clock_next_beat_is_light(
+    patched_repo: _FakeRepo,
+) -> None:
+    """A hung/failed heavy beat still backs off a full cadence before the next
+    attempt (attempt clock advanced pre-call), instead of re-pinning the lock
+    every throttle tick."""
+
+    class _HungPruneRepo(_FakeLanceRepo):
+        async def prune(self, older_than: dt.timedelta) -> None:
+            self.prune_calls.append(older_than)
+            raise TimeoutError("hung cleanup")
+
+    fake = _HungPruneRepo()
+    w = CascadeWorker(
+        {"episode": _OkHandlerWithRepo(fake)},
+        retry_backoff_seconds=0,
+        optimize_min_interval_seconds=0.001,
+        optimize_prune_interval_seconds=10.0,  # long cadence
+    )
+    w._schedule_optimize("episode")
+    await w._flush_optimizers()  # beat 1: heavy prune → fails
+    assert len(fake.prune_calls) == 1
+    state = w._optimizer_states["episode"]
+    assert state.last_prune_attempt_at > 0.0, "attempt clock advances on failure"
+    assert state.last_prune_at == 0.0, "success clock only moves on success"
+
+    # Beat 2 within the cadence: light compaction (not another lock-holding
+    # prune attempt).
+    await asyncio.sleep(0.002)
+    w._schedule_optimize("episode")
+    await w._flush_optimizers()
+    assert len(fake.prune_calls) == 1, "failed prune backs off the full cadence"
+    assert len(fake.optimize_calls) == 1
+
+
+async def test_store_busy_deadline_error_marks_row_retryable(
+    patched_repo: _FakeRepo,
+) -> None:
+    """``VectorStoreBusyError`` is transient by contract: retried inline, then
+    marked ``retryable=True`` — never permanently failed."""
+    patched_repo.batch = [_Row(md_path="a.md")]
+
+    class _BusyHandler(_OkHandler):
+        async def handle_added_or_modified(self, md_path: str) -> HandlerOutcome:
+            raise VectorStoreBusyError("upsert on 'episode' exceeded its 15s deadline")
+
+    w = CascadeWorker({"episode": _BusyHandler()}, max_retry=1, retry_backoff_seconds=0)
+    await w.drain_once()
+    assert patched_repo.done == []
+    assert len(patched_repo.failed) == 1
+    _path, retryable, err, _count = patched_repo.failed[0]
+    assert retryable is True
+    assert "VectorStoreBusyError" in err
+
+
+# ── Manifest commit-race handling (deterministic, both orderings) ──────────
+
+
+async def test_rebuild_commit_conflict_schedules_bounded_retry(
+    patched_repo: _FakeRepo,
+) -> None:
+    """A rebuild that loses the manifest race records a backoff *deadline*
+    instead of failing the kind or sleeping the loop."""
+    monkeypatch_backoffs = (600.0, 1800.0)
+    original = worker_mod._REBUILD_CONFLICT_BACKOFFS_SECONDS
+    worker_mod._REBUILD_CONFLICT_BACKOFFS_SECONDS = monkeypatch_backoffs
+    try:
+        conflict = RuntimeError("Retryable commit conflict: preempted")
+
+        class _ConflictOnceRepo(_FakeLanceRepo):
+            def __init__(self) -> None:
+                super().__init__()
+                self.rebuild_attempts = 0
+
+            async def rebuild_indexes(self) -> None:
+                self.rebuild_attempts += 1
+                if self.rebuild_attempts == 1:
+                    raise conflict
+                self.rebuild_calls.append(time.monotonic())
+
+        fake = _ConflictOnceRepo()
+        w = CascadeWorker(
+            {"episode": _OkHandlerWithRepo(fake)},
+            retry_backoff_seconds=0,
+            optimize_min_interval_seconds=0.01,
+        )
+        await w._run_rebuild_once("episode")  # loses the race
+        state = w._optimizer_states["episode"]
+        assert state.rebuild_attempt == 1
+        assert state.rebuild_retry_at > time.monotonic(), (
+            "retry recorded as a future deadline"
+        )
+        assert len(fake.rebuild_calls) == 0
+
+        # Due deadline → next loop pass retries and success resets the ledger.
+        state.rebuild_retry_at = time.monotonic() - 0.001
+        await w._run_rebuild_once("episode")
+        assert len(fake.rebuild_calls) == 1
+        assert state.rebuild_attempt == 0
+        assert state.rebuild_retry_at == 0.0
+    finally:
+        worker_mod._REBUILD_CONFLICT_BACKOFFS_SECONDS = original
+
+
+async def test_rebuild_real_failure_defers_to_next_sweep(
+    patched_repo: _FakeRepo,
+) -> None:
+    """A non-conflict rebuild error must NOT be retried via backoff — retrying
+    a real error just burns the write lock."""
+    fake = _FakeLanceRepo(rebuild_raises=True)
+    w = CascadeWorker(
+        {"episode": _OkHandlerWithRepo(fake)},
+        retry_backoff_seconds=0,
+        optimize_min_interval_seconds=0.01,
+    )
+    await w._run_rebuild_once("episode")
+    state = w._optimizer_states["episode"]
+    assert state.rebuild_attempt == 0
+    assert state.rebuild_retry_at == 0.0, "no retry scheduled for real errors"
+
+
+async def test_light_beat_conflict_then_success_recovers_streak(
+    patched_repo: _FakeRepo,
+) -> None:
+    """Both race orderings are benign and self-heal: heavy-beat conflict then
+    light-beat conflict, then a clean beat resets every counter."""
+    calls = {"n": 0}
+    outcomes = ["conflict", "conflict", "ok"]
+
+    class _ScriptedRepo(_FakeLanceRepo):
+        async def prune(self, older_than: dt.timedelta) -> None:
+            calls["n"] += 1
+            if outcomes[min(calls["n"], 3) - 1] == "conflict":
+                raise RuntimeError(
+                    "This Rewrite transaction was preempted by concurrent "
+                    "transaction — Retryable commit conflict"
+                )
+            self.prune_calls.append(older_than)
+
+        async def optimize(self) -> None:
+            calls["n"] += 1
+            if outcomes[min(calls["n"], 3) - 1] == "conflict":
+                raise RuntimeError("Retryable commit conflict: preempted")
+            self.optimize_calls.append(time.monotonic())
+
+    fake = _ScriptedRepo()
+    w = CascadeWorker(
+        {"episode": _OkHandlerWithRepo(fake)},
+        retry_backoff_seconds=0,
+        optimize_min_interval_seconds=0.005,
+        optimize_prune_interval_seconds=10.0,  # force distinct beats
+    )
+    for _ in range(3):
+        w._schedule_optimize("episode")
+        await w._flush_optimizers()
+        await asyncio.sleep(0.006)
+    assert w.health().optimize_failure_streak == 0
+    assert fake.rebuild_calls == []

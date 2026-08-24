@@ -6,22 +6,115 @@ either pass an :class:`AsyncTable` explicitly (typical in tests) or
 override :meth:`_table_lookup` to pull the cached table from their
 storage manager (typical in
 :mod:`everos.infra.persistence.lancedb.repos`).
+
+Every operation is bounded by a **deadline** (:meth:`_locked` /
+:meth:`_deadline`): no read, write, or maintenance call can hang
+forever, and no writer can wait on — or hold — a table's write lock
+indefinitely. On expiry the caller gets a retryable
+:class:`~everos.core.errors.VectorStoreBusyError`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import datetime as dt
-from collections.abc import Sequence
+import time
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, ClassVar
 
 from lancedb import AsyncTable
 
+from everos.component.utils.datetime import get_utc_now
+from everos.core.errors import VectorStoreBusyError
 from everos.core.observability.logging import get_logger
 
 from .base import BaseLanceTable
 
 logger = get_logger(__name__)
+
+# Write-lock deadlines, per operation class. Every critical section on a
+# table's write lock runs under one of these (see ``LanceRepoBase._locked``):
+# acquisition included, so neither waiting for the lock nor holding it can be
+# unbounded. They are hang-catchers, not throughput limits — but they are sized
+# from measured durations, not guessed, because the budget is also how long a
+# wedged table stays invisible.
+_WRITE_TIMEOUT_SECONDS = 15.0
+"""Row writes: add / upsert / update / delete.
+
+Measured on a local SSD across table sizes and batch sizes (10k–100k rows,
+50–500 rows per call): median 2–25ms, worst observed 63ms — flat in both
+dimensions, because these are append-and-commit operations, not scans.
+
+15s is ~240x the worst observation, which covers a slow/contended disk and
+several operations queued ahead on the same lock (the deadline includes
+acquisition). Reaching it means the table is not merely busy — it is stuck,
+and failing fast into the worker's retry is better than blocking writers for
+minutes. Deliberately not sized in the hundreds of seconds: the budget doubles
+as the detection latency for a wedged table."""
+
+_REBUILD_TIMEOUT_SECONDS = 300.0
+"""Index rebuild (replace every index in place) — the one genuinely slow
+critical section, measured at ~0.3s per 50k rows per indexed column, so 5
+minutes covers a multi-million-row table with wide headroom."""
+
+# Safety cap on a single prune's ``optimize(cleanup_older_than=…)`` call — a
+# pure hang-catcher, not a bound on normal runtime. A real cleanup is
+# milliseconds even on a heavily churned table (measured ~40ms at 320k writes /
+# 100 versions), so 60s is ~1500× headroom and never fires in normal operation.
+# Cleanup only deletes files already unreferenced by the current manifest, so a
+# timeout that cancels it mid-scan just reclaims less this beat — it cannot
+# corrupt the table — but it releases the per-table write lock instead of
+# wedging every writer behind a hung lance cleanup. Kept well below the prune
+# cadence (worker ``DEFAULT_OPTIMIZE_PRUNE_INTERVAL_SECONDS``) so a hung beat
+# leaves a real write window before the next attempt.
+_PRUNE_TIMEOUT_SECONDS = 60.0
+
+_COMPACT_TIMEOUT_SECONDS = 60.0
+"""Deadline on the lock-free compaction beat. It takes no lock, so it cannot
+block writers — but it still must not hang: the maintenance scheduler runs one
+task per kind and skips a kind whose task is in flight, so a compaction that
+never returns parks that kind's maintenance permanently. Measured at ~460ms on
+a table with 77 retained versions."""
+
+_HUSK_MIN_AGE_SECONDS = 7 * 24 * 60 * 60.0
+"""Minimum age of an empty ``_indices/<uuid>/`` dir before it is removed.
+
+Deliberately **lance's own number**, not one of ours. lance's ``cleanup.rs``
+defines an unverified threshold of 7 days and uses it for exactly this
+judgement: an index UUID that no manifest references is only assumed dead once
+it is at least 7 days old, because before that it is indistinguishable from an
+index build still in progress. Matching the threshold means this sweep can
+never be more aggressive than lance itself."""
+
+_HUSK_SWEEP_TIMEOUT_SECONDS = 60.0
+"""Deadline on the (lock-free) husk sweep. Same last-resort role as
+:data:`_COMPACT_TIMEOUT_SECONDS`: the maintenance scheduler skips a kind whose
+task is in flight, so a sweep that never returns would park that kind's
+maintenance forever. A timeout here is swallowed inside :meth:`prune` (the
+cleanup commit already succeeded, and billing the sweep to the prune ledger
+would corrupt that signal), and the orphaned worker thread finishes the walk
+anyway, so the reclamation still happens."""
+
+_READ_TIMEOUT_SECONDS = 60.0
+"""Deadline on every read. Reads take no lock, so a hung read blocks no writer
+— but it does park the caller, and the cascade drain loop reads on every batch
+while advancing strictly one batch at a time. A read that never returns
+therefore stops the whole md -> LanceDB projection, leaving claimed rows in
+``processing`` forever with nothing logged (a hang raises nothing, so the
+drain-failure counter stays at zero and ``/health`` keeps reporting healthy).
+Generous by design: everos builds no vector ANN index, so reads are flat scans
+— measured ~62ms over 117k rows, i.e. 60s is ~1000x headroom and never fires
+normally. On expiry the caller gets a retryable
+:class:`~everos.core.errors.VectorStoreBusyError`, so a drain row is retried
+and a search request fails with a structured error rather than hanging."""
+
+_SLOW_HOLD_LOG_SECONDS = 1.0
+"""Log a completed critical section that held the write lock at least this
+long. Normal writes are 2-25ms and a normal prune ~40ms, so anything past a
+second means writers were queued behind it — without this, a section that is
+slow but under its deadline is invisible."""
 
 
 def _q(value: str) -> str:
@@ -34,6 +127,55 @@ def _q(value: str) -> str:
     is defensive.
     """
     return value.replace("'", "''")
+
+
+def _remove_empty_index_dirs(table_uri: str, *, min_age_seconds: float) -> int:
+    """Remove empty ``_indices/<uuid>/`` husks under a table dir; return count.
+
+    lance's cleanup unlinks the *files* of a superseded index but never the
+    directory — it is written against an object store where paths are flat
+    keys and an "empty directory" does not exist. Only a local filesystem
+    materialises them, where they accumulate as inodes and slow every
+    directory scan.
+
+    Two independent guarantees:
+
+    1. **``rmdir`` cannot delete data.** The kernel refuses it on a non-empty
+       directory (``ENOTEMPTY``). No file can be lost through this function
+       whatever the rest of the logic decides — and because the check *is* the
+       operation, there is no check-then-act window to race. A *live* index
+       always has files inside its dir, so it can never be removed.
+    2. **Anything else waits out lance's own conservatism bound**
+       (:data:`_HUSK_MIN_AGE_SECONDS`): a directory a concurrent
+       ``create_index`` just made is seconds old, so it can never qualify even
+       before its first file lands.
+
+    Upstream's variant additionally excluded live index dirs by UUID read off
+    ``list_indices()``; lancedb 0.30.2's Python ``IndexConfig`` carries only
+    ``name`` / ``index_type`` / ``columns`` (verified by inspecting the
+    installed package stubs), so that belt-and-braces filter cannot be
+    expressed here. The two guarantees above are what make the sweep safe;
+    the UUID check was redundant with them.
+
+    Best-effort throughout: a directory that becomes non-empty, vanishes, or is
+    unreadable between listing and ``rmdir`` is skipped, not an error.
+    """
+    indices = Path(table_uri) / "_indices"
+    if not indices.is_dir():
+        return 0
+    cutoff = get_utc_now().timestamp() - min_age_seconds
+    removed = 0
+    for child in indices.iterdir():
+        if not child.is_dir():
+            continue
+        try:
+            if child.stat().st_mtime > cutoff:
+                continue
+            child.rmdir()
+        except OSError:
+            continue
+        removed += 1
+    return removed
 
 
 class LanceRepoBase[T: BaseLanceTable]:
@@ -102,6 +244,89 @@ class LanceRepoBase[T: BaseLanceTable]:
         """
         return cls._table_locks.setdefault(table_name, asyncio.Lock())
 
+    @asynccontextmanager
+    async def _deadline(self, budget: float, op: str) -> AsyncIterator[None]:
+        """Bound an operation that does **not** take the write lock.
+
+        Same last-resort guarantee as :meth:`_locked` minus the lock: the
+        maintenance scheduler runs one task per kind and skips a kind whose
+        task has not finished, so any await in that path which can hang must
+        have a deadline or that kind stops being maintained for good.
+        """
+        try:
+            async with asyncio.timeout(budget):
+                yield
+        except TimeoutError as exc:
+            logger.warning(
+                "lancedb_operation_deadline_exceeded",
+                table=self.table_name,
+                op=op,
+                budget_seconds=budget,
+            )
+            raise VectorStoreBusyError(
+                f"{op} on table {self.table_name!r} exceeded its {budget:g}s deadline"
+            ) from exc
+
+    @asynccontextmanager
+    async def _locked(self, budget: float, op: str) -> AsyncIterator[None]:
+        """Hold the table write lock for at most ``budget`` seconds.
+
+        **The deadline covers acquisition *and* the body.** That is the whole
+        point: every critical section on this lock is bounded, so no code path
+        can wait for it — or hold it — indefinitely. A single stuck operation
+        would otherwise wedge the table forever, because a stuck holder blocks
+        every writer *and* the maintenance scheduler skips a kind whose task
+        never finishes (observed upstream: one table stopped reclaiming
+        versions permanently with no error logged anywhere because nothing
+        failed — it simply never returned).
+
+        On expiry the body is cancelled, the lock is released, and the timeout
+        is re-raised as :class:`~everos.core.errors.VectorStoreBusyError` so
+        the cascade worker treats it as transient and retries instead of
+        marking the row permanently failed.
+
+        Callers resolve the table handle **inside** this block, not before it.
+        Resolving it outside leaves an unbounded await ahead of the deadline,
+        and a maintenance task that hangs there never returns — which silently
+        parks that kind forever.
+        """
+        started = time.monotonic()
+        acquired_at: float | None = None
+        try:
+            async with asyncio.timeout(budget):
+                async with self._write_lock(self.table_name):
+                    acquired_at = time.monotonic()
+                    yield
+        except TimeoutError as exc:
+            # ``acquired`` is the load-bearing field: it separates "never got
+            # the lock" (a holder is slow or stuck) from "got it and overran"
+            # (this operation itself is slow), which is exactly what a soak
+            # investigation cannot otherwise tell apart.
+            now = time.monotonic()
+            logger.warning(
+                "lancedb_write_lock_deadline_exceeded",
+                table=self.table_name,
+                op=op,
+                budget_seconds=budget,
+                acquired=acquired_at is not None,
+                waited_seconds=round((acquired_at or now) - started, 3),
+                held_seconds=round(now - acquired_at, 3) if acquired_at else 0.0,
+            )
+            raise VectorStoreBusyError(
+                f"{op} on table {self.table_name!r} exceeded its "
+                f"{budget:g}s write-lock deadline"
+            ) from exc
+        else:
+            held = time.monotonic() - (acquired_at or started)
+            if held >= _SLOW_HOLD_LOG_SECONDS:
+                logger.info(
+                    "lancedb_write_lock_slow_hold",
+                    table=self.table_name,
+                    op=op,
+                    held_seconds=round(held, 3),
+                    waited_seconds=round((acquired_at or started) - started, 3),
+                )
+
     @classmethod
     def _reset_locks_for_tests(cls) -> None:
         """Test-only: drop the write-lock pool.
@@ -140,8 +365,8 @@ class LanceRepoBase[T: BaseLanceTable]:
 
     async def add(self, records: Sequence[T]) -> None:
         """Insert one or more records."""
-        table = await self._table()
-        async with self._write_lock(self.table_name):
+        async with self._locked(_WRITE_TIMEOUT_SECONDS, "add"):
+            table = await self._table()
             await table.add(list(records))
 
     # ── Upsert ─────────────────────────────────────────────────────────────
@@ -162,8 +387,8 @@ class LanceRepoBase[T: BaseLanceTable]:
         for the first time inserts; an entry that was edited in md
         updates its existing row.
         """
-        table = await self._table()
-        async with self._write_lock(self.table_name):
+        async with self._locked(_WRITE_TIMEOUT_SECONDS, "upsert"):
+            table = await self._table()
             await (
                 table.merge_insert(by)
                 .when_matched_update_all()
@@ -173,48 +398,113 @@ class LanceRepoBase[T: BaseLanceTable]:
 
     # ── Maintenance ────────────────────────────────────────────────────────
 
-    async def optimize(self, *, cleanup_older_than: dt.timedelta | None = None) -> None:
+    async def optimize(self) -> None:
         """Compact fragments + merge new data into the FTS / vector indexes.
 
-        LanceDB's ``merge_insert`` writes new data into a fresh fragment.
-        The FTS (BM25) index built by :meth:`ensure_fts_indexes` only
-        covers fragments visible at index-build time, so rows written
-        after the initial build can become **invisible to BM25 queries**
-        until ``optimize()`` runs and merges those fragments into the
-        index segment that the query engine reads.
+        ``optimize()`` is a **performance + storage-hygiene** operation,
+        **not** a correctness/visibility one. LanceDB's ``merge_insert``
+        writes new data into a fresh fragment that the FTS / vector
+        indexes don't cover yet; queries stay correct regardless because
+        LanceDB transparently brute-force flat-scans that unindexed tail
+        and unions it with the indexed hits (verified on lancedb 0.30.2).
 
-        Symptom this guards against (verified on LoCoMo conv0): after
-        steady-state cascade ingest, ``nearest_to_text("any_common_word")``
-        returns 0 hits even though the column literally contains the
-        token in 100% of rows — the new fragments simply hadn't been
-        indexed.
+        What ``optimize()`` actually buys on the current stack:
+
+        - **Query speed** — the unindexed tail is flat-scanned on every
+          query; merging it into the index keeps that scan bounded as
+          ingest accumulates.
+        - **Storage hygiene** is *not* done here — physical reclamation
+          of replaced fragments / stale manifests / dead index files is
+          :meth:`prune`, a separate write-locked call.
 
         Cascade triggers this through a per-kind throttle + trailing
         edge scheduler (``CascadeWorker._schedule_optimize``): at most
-        one run per ~1s window per kind, decoupled from the drain
-        loop, with a 60s heartbeat sweep as a safety net. Cost is
-        O(N) data-rewrite per optimized fragment; the throttle is how
-        we cap it under sustained write pressure.
+        one run per throttle window per kind, decoupled from the drain
+        loop, with a heartbeat sweep as a safety net. Cost is O(N)
+        data-rewrite per optimized fragment; the throttle is how we cap
+        it under sustained write pressure.
 
-        Args:
-            cleanup_older_than: When set, also prune (physically delete)
-                files belonging to dataset versions older than this
-                interval. ``None`` (default) compacts only — historical
-                manifests, replaced data fragments, and stale index
-                UUID files are kept on disk forever, which inflates the
-                file count (and FD usage at scan time) without bound.
-                Cascade passes a non-None value on a slower beat
-                (``CascadeWorker._optimize_prune_interval``) so the
-                hot drain path stays cheap. Note: this does *not*
-                shrink **active** index internals (FTS ``part_N`` count
-                or vector index UUID count) — those only collapse via
-                ``drop_index + create_index``, which is not done here.
+        This is **compaction only** and takes **no lock**: a
+        ``Retryable commit conflict`` against a concurrent writer is
+        benign here (compaction is not urgent — the next scheduled beat
+        retries), so it must never stall writers.
         """
-        table = await self._table()
-        await table.optimize(cleanup_older_than=cleanup_older_than)
+        async with self._deadline(_COMPACT_TIMEOUT_SECONDS, "optimize"):
+            table = await self._table()
+            await table.optimize()
+
+    async def prune(self, older_than: dt.timedelta) -> None:
+        """Physically reclaim files from versions older than ``older_than``.
+
+        LanceDB's ``AsyncTable`` cannot clean up independently of compaction —
+        the only handle is ``optimize(cleanup_older_than=..., delete_unverified=...)``,
+        which bundles compact + cleanup into one manifest commit. Under
+        sustained churn that commit is a Rewrite that concurrent Delete /
+        Update writes preempt, so the bundled cleanup loses the race and
+        never runs (observed upstream: 16 successes / 547 conflicts over 21h
+        → the index dir grew unbounded to the disk guardrail).
+
+        Fix: run it **under the per-table write lock** so no write is in
+        flight for its duration. That does two things at once:
+
+        1. **No commit conflict** — the Rewrite has the manifest to itself,
+           so cleanup actually completes every beat.
+        2. **Cross-process safe** — ``delete_unverified=False`` keeps lance
+           from deleting any file it cannot tie to a removed version, i.e. a
+           file a writer in *another process* (a CLI ``cascade sync`` /
+           ``backfill``) may be mid-commit on. The per-table write lock is
+           in-process only, so it cannot fence a second process; the flag is
+           what makes concurrent processes safe. Reclaiming *during* active
+           load comes from running under the write lock so the cleanup commit
+           never loses the manifest race, not from the flag.
+
+        ``cleanup_older_than`` deletes the *files* under a superseded
+        ``_indices/<uuid>/`` but never the directory (lance's cleanup is
+        written against an object store where an empty directory does not
+        exist), so those husks accumulate on a local filesystem. They are
+        swept here, outside the lock — see :func:`_remove_empty_index_dirs`
+        for why that is safe.
+
+        The trade-off is a brief write stall (~seconds on a churned table,
+        dominated by the cleanup's file scan/delete — flat, not proportional
+        to the backlog). Cascade runs it on a slow beat
+        (``CascadeWorker`` prune cadence), so the stall is rare. Does *not*
+        shrink **active** index internals (FTS ``part_N`` / index UUID count)
+        — that is ``rebuild_indexes``' job.
+        """
+        async with self._locked(_PRUNE_TIMEOUT_SECONDS, "prune"):
+            table = await self._table()
+            await table.optimize(cleanup_older_than=older_than, delete_unverified=False)
+            table_uri = await table.uri()
+        # Lock-free: the sweep can only ``rmdir``, which the kernel refuses on a
+        # non-empty directory, so it cannot lose data no matter who else is
+        # writing. Keeping it out of the critical section also means a slow
+        # filesystem walk cannot overrun the prune budget.
+        #
+        # Best-effort means best-effort: the cleanup commit above already
+        # succeeded, so a sweep timeout must not escape ``prune()``. Letting it
+        # escape bills the failure to the wrong account — the optimize
+        # scheduler counts a prune "failure" and the prune-staleness clock
+        # stops advancing, both reporting a cleanup stall that did not happen.
+        try:
+            async with self._deadline(_HUSK_SWEEP_TIMEOUT_SECONDS, "prune_husk_sweep"):
+                removed = await asyncio.to_thread(
+                    _remove_empty_index_dirs,
+                    table_uri,
+                    min_age_seconds=_HUSK_MIN_AGE_SECONDS,
+                )
+        except VectorStoreBusyError:
+            # _deadline already logged lancedb_operation_deadline_exceeded.
+            removed = 0
+        if removed:
+            logger.debug(
+                "lancedb_pruned_empty_index_dirs",
+                table=self.table_name,
+                removed=removed,
+            )
 
     async def rebuild_indexes(self) -> None:
-        """Drop and re-create every index on this table.
+        """Rebuild every index on this table **in place**.
 
         **Why this exists** — workaround for an upstream Python API gap:
 
@@ -226,26 +516,37 @@ class LanceRepoBase[T: BaseLanceTable]:
         Two problems block us from using it from the application layer:
 
         1. ``lancedb.AsyncTable.optimize()`` does **not expose** this
-           parameter (verified on lancedb main 2026-05-28). It forwards
-           only ``cleanup_since_ms`` and ``delete_unverified`` to Rust.
+           parameter. It forwards only ``cleanup_older_than`` and
+           ``delete_unverified`` to Rust.
         2. Even calling Lance directly via ``pylance``, the merge
            behaviour itself is buggy on ``lance crate 4.0`` (what
            lancedb 0.30.2 embeds) — ``num_indices_to_merge=1`` does
-           nothing. Fix landed in ``lance 7.x``, but ``pylance 7.x``
-           can not collapse indexes on a ``lance 4.0``-format dataset
-           (verified by experiment).
+           nothing.
 
-        So in our current stack there is **no application-level path**
+        So on the current stack there is **no application-level path**
         to bound active index UUID growth. ``optimize()`` keeps
         accumulating one new UUID (vector) / one new ``part_N`` (FTS)
         per call.
 
-        This method is the workaround: drop every existing index and
-        rebuild from the schema's ``ensure_fts_indexes`` contract. The
-        rebuild is **O(N) full retrain** but cheap in practice (~0.3s
-        for 50k rows × 2 FTS columns on local SSD), and during the
-        window LanceDB transparently falls back to brute-force scan so
-        queries and writes stay available.
+        This method is the workaround: rebuild every indexed column from
+        the schema's ``ensure_fts_indexes`` contract. Measured effect —
+        the live index file set collapses back to its steady state after
+        many ``optimize()`` beats. The rebuild is an **O(N) full
+        retrain** but cheap in practice (~0.3s for 50k rows × 2 FTS
+        columns on local SSD).
+
+        It rebuilds **in place** (``create_index(replace=True)`` — supported
+        on lancedb 0.30.2's Python async API, verified by inspection of the
+        installed package) rather than dropping first. An earlier version
+        dropped every index and recreated them, on the assumption that
+        LanceDB falls back to a brute-force scan meanwhile. That is true for
+        vector search and **false for FTS**: with no inverted index a BM25
+        query raises ``Cannot perform full text search unless an INVERTED
+        index has been created`` (measured). Because the recall legs are
+        gathered without ``return_exceptions``, one failing leg fails the
+        whole search request, so the drop-first window was a source of 500s.
+        Only indexes on columns that are no longer indexed at all get
+        dropped; nothing queries those, so their drop opens no window.
 
         **Cadence** — :class:`CascadeWorker` runs this on a slow loop
         (default 12h per kind). Frequency is bounded by the rebuild
@@ -265,18 +566,21 @@ class LanceRepoBase[T: BaseLanceTable]:
           in lance v7.0.0)
         - https://docs.rs/lancedb/latest/lancedb/table/struct.OptimizeOptions.html
         """
-        table = await self._table()
-        async with self._write_lock(self.table_name):
+        async with self._locked(_REBUILD_TIMEOUT_SECONDS, "rebuild_indexes"):
+            table = await self._table()
+            wanted = set(self.schema.BM25_FIELDS or ())
             for idx in await table.list_indices():
-                await table.drop_index(idx.name)
-            await self.schema.ensure_fts_indexes(table)
+                if not wanted.intersection(idx.columns or ()):
+                    await table.drop_index(idx.name)
+            await self.schema.ensure_fts_indexes(table, replace=True)
 
     # ── Read ───────────────────────────────────────────────────────────────
 
     async def count(self) -> int:
         """Total row count."""
-        table = await self._table()
-        return await table.count_rows()
+        async with self._deadline(_READ_TIMEOUT_SECONDS, "count"):
+            table = await self._table()
+            return await table.count_rows()
 
     async def get_by_id(
         self,
@@ -291,13 +595,14 @@ class LanceRepoBase[T: BaseLanceTable]:
         predicate; everos's PK convention is ``<owner_id>_<entry_id>``
         which never contains quotes, so the escape is defensive.
         """
-        table = await self._table()
-        rows = (
-            await table.query()
-            .where(f"{id_field} = '{_q(id_value)}'")
-            .limit(1)
-            .to_list()
-        )
+        async with self._deadline(_READ_TIMEOUT_SECONDS, "get_by_id"):
+            table = await self._table()
+            rows = (
+                await table.query()
+                .where(f"{id_field} = '{_q(id_value)}'")
+                .limit(1)
+                .to_list()
+            )
         if not rows:
             return None
         return self.schema.model_validate(rows[0])
@@ -315,8 +620,9 @@ class LanceRepoBase[T: BaseLanceTable]:
         Use :meth:`search` when you need ``_distance`` or want to mix
         ANN with filters.
         """
-        table = await self._table()
-        rows = await table.query().where(where).limit(limit).to_list()
+        async with self._deadline(_READ_TIMEOUT_SECONDS, "find_where"):
+            table = await self._table()
+            rows = await table.query().where(where).limit(limit).to_list()
         return [self.schema.model_validate(r) for r in rows]
 
     async def find_one_where(self, where: str) -> T | None:
@@ -363,19 +669,20 @@ class LanceRepoBase[T: BaseLanceTable]:
             ``total`` is ``count_rows(filter=where)`` (the predicate's
             true match count, regardless of ``max_fetch``).
         """
-        table = await self._table()
-        total = await table.count_rows(filter=where)
-        if total > max_fetch:
-            logger.warning(
-                "find_where_paginated truncated",
-                extra={
-                    "table": self.table_name,
-                    "where": where,
-                    "total": total,
-                    "max_fetch": max_fetch,
-                },
-            )
-        arrow_tbl = await table.query().where(where).limit(max_fetch).to_arrow()
+        async with self._deadline(_READ_TIMEOUT_SECONDS, "find_where_paginated"):
+            table = await self._table()
+            total = await table.count_rows(filter=where)
+            if total > max_fetch:
+                logger.warning(
+                    "find_where_paginated truncated",
+                    extra={
+                        "table": self.table_name,
+                        "where": where,
+                        "total": total,
+                        "max_fetch": max_fetch,
+                    },
+                )
+            arrow_tbl = await table.query().where(where).limit(max_fetch).to_arrow()
         order = "descending" if descending else "ascending"
         arrow_tbl = arrow_tbl.sort_by([(sort_by, order)])
         offset = (page - 1) * page_size
@@ -419,20 +726,44 @@ class LanceRepoBase[T: BaseLanceTable]:
             List of row dicts (LanceDB native shape — fields depend on
             ``schema``; ``_distance`` added when ``vector`` is given).
         """
-        table = await self._table()
-        q = table.query()
-        if vector is not None:
-            q = q.nearest_to(list(vector))
-        if where is not None:
-            q = q.where(where)
-        return await q.limit(limit).to_list()
+        async with self._deadline(_READ_TIMEOUT_SECONDS, "search"):
+            table = await self._table()
+            q = table.query()
+            if vector is not None:
+                q = q.nearest_to(list(vector))
+            if where is not None:
+                q = q.where(where)
+            return await q.limit(limit).to_list()
+
+    # ── Update ─────────────────────────────────────────────────────────────
+
+    async def update(
+        self,
+        updates: dict[str, Any],
+        *,
+        where: str,
+    ) -> None:
+        """Partial column update for rows matching ``where``.
+
+        Wraps ``AsyncTable.update`` — sets specific column values without
+        rewriting the full row. Useful for lightweight metadata patches
+        (e.g. setting ``deprecated_by``) where a full embed+upsert cycle
+        is unnecessary.
+
+        Args:
+            updates: Column-name to new-value mapping.
+            where: SQL-like predicate scoping the update.
+        """
+        async with self._locked(_WRITE_TIMEOUT_SECONDS, "update"):
+            table = await self._table()
+            await table.update(updates, where=where)
 
     # ── Delete ─────────────────────────────────────────────────────────────
 
     async def delete(self, predicate: str) -> None:
         """Delete rows matching a SQL-like predicate."""
-        table = await self._table()
-        async with self._write_lock(self.table_name):
+        async with self._locked(_WRITE_TIMEOUT_SECONDS, "delete"):
+            table = await self._table()
             await table.delete(predicate)
 
     async def delete_by_md_path(self, md_path: str) -> int:
@@ -442,8 +773,8 @@ class LanceRepoBase[T: BaseLanceTable]:
         (or when reverse-reconcile discovers an orphaned LanceDB row).
         Single quotes in ``md_path`` are doubled defensively.
         """
-        table = await self._table()
-        async with self._write_lock(self.table_name):
+        async with self._locked(_WRITE_TIMEOUT_SECONDS, "delete_by_md_path"):
+            table = await self._table()
             result = await table.delete(f"md_path = '{_q(md_path)}'")
         return int(result.num_deleted_rows)
 

@@ -17,6 +17,19 @@ class PathTraversalError(Exception):
     """
 
 
+class VectorStoreBusyError(Exception):
+    """A LanceDB operation overran its deadline and was cancelled.
+
+    Raised by :class:`everos.core.persistence.lancedb.LanceRepoBase`
+    when a read / write / maintenance critical section exceeds its
+    bounded budget (see ``_locked`` / ``_deadline`` there). It is a
+    **transient** signal — "the table did not answer in time", not
+    "the data is wrong" — so callers (the cascade worker, search
+    routes) should retry or surface a structured busy error instead of
+    treating it as a permanent failure.
+    """
+
+
 class MultimodalError(Exception):
     """Base for multimodal-parsing errors meant to reach the caller.
 
