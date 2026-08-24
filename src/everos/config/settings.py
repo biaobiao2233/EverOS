@@ -288,6 +288,27 @@ class SearchSettings(BaseModel):
     vector_strategy: Literal["episode", "maxsim_atomic"] = "maxsim_atomic"
 
 
+class CascadeSettings(BaseModel):
+    """Cascade maintenance cadences.
+
+    These are *how often* each background job runs, not how long it is allowed
+    to take — the deadlines that bound a hung call stay as constants next to
+    the code they guard, sized from measurement, because a wrong value there
+    either masks a hang or manufactures failures.
+
+    Env binding:
+        EVEROS_CASCADE__OPTIMIZE_HEARTBEAT_SECONDS
+        EVEROS_CASCADE__OPTIMIZE_PRUNE_INTERVAL_SECONDS
+        EVEROS_CASCADE__OPTIMIZE_PRUNE_RETENTION_SECONDS
+        EVEROS_CASCADE__OPTIMIZE_REBUILD_INTERVAL_SECONDS
+    """
+
+    optimize_heartbeat_seconds: float = 60.0
+    optimize_prune_interval_seconds: float = 300.0
+    optimize_prune_retention_seconds: float = 60.0
+    optimize_rebuild_interval_seconds: float = 12 * 60 * 60.0
+
+
 class LanceDBSettings(BaseModel):
     """LanceDB tunables.
 
@@ -358,6 +379,7 @@ class Settings(BaseSettings):
     api: ApiSettings = ApiSettings()
     sqlite: SqliteSettings = SqliteSettings()
     lancedb: LanceDBSettings = LanceDBSettings()
+    cascade: CascadeSettings = CascadeSettings()
     llm: LLMSettings = LLMSettings()
     embedding: EmbeddingSettings = EmbeddingSettings()
     rerank: RerankSettings = RerankSettings()

@@ -13,6 +13,7 @@ loader / merger / env reader).
 """
 
 from .settings import BoundaryDetectionSettings as BoundaryDetectionSettings
+from .settings import CascadeSettings as CascadeSettings
 from .settings import EmbeddingSettings as EmbeddingSettings
 from .settings import LanceDBSettings as LanceDBSettings
 from .settings import LLMSettings as LLMSettings
@@ -25,6 +26,7 @@ from .settings import load_settings as load_settings
 
 __all__ = [
     "BoundaryDetectionSettings",
+    "CascadeSettings",
     "EmbeddingSettings",
     "LLMSettings",
     "LanceDBSettings",

@@ -17,6 +17,7 @@ import dataclasses
 
 from everos.component.embedding import EmbeddingProvider
 from everos.component.tokenizer import Tokenizer
+from everos.config import load_settings
 from everos.core.observability.logging import get_logger
 from everos.core.persistence import MemoryRoot
 from everos.infra.persistence.sqlite import QueueSummary, md_change_state_repo
@@ -25,18 +26,63 @@ from .handlers import HandlerDeps
 from .registry import build_handlers
 from .scanner import CascadeScanner
 from .watcher import CascadeWatcher
-from .worker import CascadeWorker
+from .worker import (
+    DEFAULT_OPTIMIZE_HEARTBEAT_SECONDS,
+    DEFAULT_OPTIMIZE_PRUNE_INTERVAL_SECONDS,
+    DEFAULT_OPTIMIZE_PRUNE_RETENTION_SECONDS,
+    DEFAULT_OPTIMIZE_REBUILD_INTERVAL_SECONDS,
+    CascadeWorker,
+)
 
 logger = get_logger(__name__)
+
+
+@dataclasses.dataclass(frozen=True)
+class CascadeHealth:
+    """Cascade health verdict for ``/health``.
+
+    ``healthy`` reflects **operational** health only — is the md →
+    LanceDB projection pipeline itself working: drain loop alive,
+    optimize not stuck, version cleanup (prune) not stalled. It is the
+    boolean ops/alerting acts on.
+
+    ``failed_permanent`` is deliberately **not** part of that verdict:
+    a handful of md files failing to index is a normal data-quality
+    backlog (almost always non-zero in a real deployment), so folding
+    it into ``healthy`` would pin the signal red forever. It is reported
+    as an informational count; per-file triage lives in the
+    ``cascade status`` / ``cascade fix`` CLI. ``reasons`` is the
+    operational "why not" list (empty when healthy).
+    """
+
+    healthy: bool
+    reasons: list[str]
+    pending: int
+    failed_permanent: int
+    """Informational: md files awaiting ``cascade fix``. Does NOT affect
+    :attr:`healthy` (see class docstring)."""
+    failed_retryable: int
+    drain_consecutive_failures: int
+    unrecoverable_total: int
+    optimize_failure_streak: int
+    prune_stale_seconds: float
 
 
 @dataclasses.dataclass(frozen=True)
 class CascadeConfig:
     """Construction-time knobs for the orchestrator.
 
-    Defaults are sized for a lightweight (single-user / small-team) dev
-    box; production tuning can surface these into
-    :class:`everos.config.Settings` once the daemon has wall-clock data.
+    Defaults are sized for a lightweight (single-user / small-team) dev box.
+    The maintenance cadences come from :class:`everos.config.CascadeSettings`
+    via :meth:`from_settings`, which every production construction path uses —
+    they were constructor-only for long enough that the 12h rebuild sweep could
+    not be exercised by any soak run short of half a day.
+
+    Deliberately *not* configurable: the deadlines that bound a hung call
+    (read / write / prune / rebuild). Those are hang-catchers sized from
+    measured durations; too low manufactures failures, too high makes a wedged
+    table invisible for longer. They stay as constants beside the code they
+    guard, each with its measurement in the docstring.
     """
 
     scan_interval_seconds: float = 30.0
@@ -44,6 +90,23 @@ class CascadeConfig:
     worker_max_retry: int = 3
     worker_poll_interval_seconds: float = 1.0
     worker_retry_backoff_seconds: float = 2.0
+    optimize_heartbeat_seconds: float = DEFAULT_OPTIMIZE_HEARTBEAT_SECONDS
+    optimize_prune_interval_seconds: float = DEFAULT_OPTIMIZE_PRUNE_INTERVAL_SECONDS
+    optimize_prune_retention_seconds: float = DEFAULT_OPTIMIZE_PRUNE_RETENTION_SECONDS
+    optimize_rebuild_interval_seconds: float = DEFAULT_OPTIMIZE_REBUILD_INTERVAL_SECONDS
+
+    @classmethod
+    def from_settings(cls) -> CascadeConfig:
+        """Build with maintenance cadences taken from ``[cascade]`` settings."""
+        cascade = load_settings().cascade
+        return cls(
+            optimize_heartbeat_seconds=cascade.optimize_heartbeat_seconds,
+            optimize_prune_interval_seconds=cascade.optimize_prune_interval_seconds,
+            optimize_prune_retention_seconds=(cascade.optimize_prune_retention_seconds),
+            optimize_rebuild_interval_seconds=(
+                cascade.optimize_rebuild_interval_seconds
+            ),
+        )
 
 
 class CascadeOrchestrator:
@@ -58,7 +121,7 @@ class CascadeOrchestrator:
         config: CascadeConfig | None = None,
     ) -> None:
         self._memory_root = memory_root
-        self._config = config or CascadeConfig()
+        self._config = config or CascadeConfig.from_settings()
         deps = HandlerDeps(
             memory_root=memory_root,
             embedder=embedder,
@@ -75,6 +138,16 @@ class CascadeOrchestrator:
             max_retry=self._config.worker_max_retry,
             poll_interval_seconds=self._config.worker_poll_interval_seconds,
             retry_backoff_seconds=self._config.worker_retry_backoff_seconds,
+            optimize_heartbeat_seconds=self._config.optimize_heartbeat_seconds,
+            optimize_prune_interval_seconds=(
+                self._config.optimize_prune_interval_seconds
+            ),
+            optimize_prune_retention_seconds=(
+                self._config.optimize_prune_retention_seconds
+            ),
+            optimize_rebuild_interval_seconds=(
+                self._config.optimize_rebuild_interval_seconds
+            ),
         )
         self._watcher: CascadeWatcher | None = None
         self._started = False
@@ -129,3 +202,29 @@ class CascadeOrchestrator:
     async def queue_summary(self) -> QueueSummary:
         """Forward to the repo so callers don't reach past this class."""
         return await md_change_state_repo.queue_summary()
+
+    async def health(self) -> CascadeHealth:
+        """Verdict for ``/health``: operational health + informational counts.
+
+        One query (:meth:`queue_summary`) plus the worker's in-memory
+        counters. ``healthy`` is driven **only** by operational signals
+        (:meth:`CascadeWorkerHealth.reasons` — drain / optimize / prune),
+        never by ``failed_permanent``: a per-file triage backlog is normal
+        steady state and must not pin the health signal red (see
+        :class:`CascadeHealth`). ``failed_permanent`` is still reported as
+        an informational count.
+        """
+        wh = self._worker.health()
+        summary = await self.queue_summary()
+        reasons = wh.reasons()  # operational only
+        return CascadeHealth(
+            healthy=not reasons,
+            reasons=reasons,
+            pending=summary.pending,
+            failed_permanent=summary.failed_permanent,
+            failed_retryable=summary.failed_retryable,
+            drain_consecutive_failures=wh.drain_consecutive_failures,
+            unrecoverable_total=wh.unrecoverable_total,
+            optimize_failure_streak=wh.optimize_failure_streak,
+            prune_stale_seconds=wh.prune_stale_seconds,
+        )

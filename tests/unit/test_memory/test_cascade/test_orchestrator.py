@@ -104,3 +104,46 @@ async def test_drain_once_returns_zero_on_empty_queue(
 ) -> None:
     orch = _make_orchestrator(runtime)
     assert await orch.drain_once() == 0
+
+
+# ── Health verdict + settings plumbing ─────────────────────────────────────
+
+
+async def test_health_reports_healthy_on_fresh_runtime(
+    runtime: MemoryRoot,
+) -> None:
+    """Fresh queue + no in-memory failures → healthy, empty reasons, and the
+    informational counts come from the SQLite summary."""
+    orch = _make_orchestrator(runtime)
+    verdict = await orch.health()
+    assert verdict.healthy is True
+    assert verdict.reasons == []
+    assert verdict.pending == 0
+    assert verdict.failed_permanent == 0
+
+
+async def test_from_settings_reads_cascade_cadences(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``[cascade]`` settings feed the maintenance cadence knobs."""
+    from everos.config import load_settings
+    from everos.memory.cascade import CascadeConfig as Config
+
+    monkeypatch.setenv("EVEROS_CASCADE__OPTIMIZE_PRUNE_INTERVAL_SECONDS", "123.0")
+    monkeypatch.setenv("EVEROS_CASCADE__OPTIMIZE_REBUILD_INTERVAL_SECONDS", "456.0")
+    load_settings.cache_clear()
+    try:
+        cfg = Config.from_settings()
+        assert cfg.optimize_prune_interval_seconds == 123.0
+        assert cfg.optimize_rebuild_interval_seconds == 456.0
+    finally:
+        load_settings.cache_clear()
+
+
+async def test_worker_receives_maintenance_knobs(runtime: MemoryRoot) -> None:
+    orch = _make_orchestrator(runtime)
+    w = orch._worker
+    assert w._optimize_heartbeat == 60.0
+    assert w._optimize_prune_interval == 300.0
+    assert w._optimize_prune_retention == 60.0
+    assert w._optimize_rebuild_interval == 12 * 60 * 60.0

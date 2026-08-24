@@ -105,11 +105,27 @@ class BaseLanceTable(LanceModel):
         )
 
     @classmethod
-    async def ensure_fts_indexes(cls, table: AsyncTable) -> None:
+    async def ensure_fts_indexes(
+        cls, table: AsyncTable, *, replace: bool = False
+    ) -> None:
         """Create FTS indexes on every column in :attr:`BM25_FIELDS`.
 
         Idempotent: columns that already have an index are skipped, so
-        this is safe to call on every startup. The FTS config is fixed
+        this is safe to call on every startup.
+
+        ``replace=True`` rebuilds each column's index in place instead of
+        skipping it — used by :meth:`LanceRepoBase.rebuild_indexes`, which
+        needs a fresh index but must never leave the column *without* one.
+        Dropping first would do exactly that, and a BM25 query issued in
+        that window does not degrade — it raises ``Cannot perform full
+        text search unless an INVERTED index has been created`` (measured;
+        vector search falls back to a flat scan, FTS does not). Since the
+        recall legs are gathered without ``return_exceptions``, that
+        window turns into a 500 on the whole search request.
+        ``create_index(replace=True)`` is atomic: concurrent queries keep
+        hitting the old index until the new one commits.
+
+        The FTS config is fixed
         to the app-layer pre-tokenisation + LanceDB normalisation
         convention (designed for **multilingual mixed content**):
 
@@ -127,7 +143,15 @@ class BaseLanceTable(LanceModel):
           filtering and a divided source of truth.
         - ``ascii_folding=True`` — strips diacritics (é→e) on Latin
           characters; no-op on CJK.
-        - ``with_position=True`` — enables phrase queries.
+        - ``with_position=False`` — everos does OR-mode BM25 recall
+          (``MatchQuery`` clauses), never phrase queries, so token
+          positions are never read. Building the position posting list is
+          therefore pure overhead **and** triggers a ``Max offset exceeds
+          length of values`` offset-overflow crash inside lance's
+          compaction once position lists grow large (lance-format/lance#7653).
+          That crash blocks ``optimize()`` — including version cleanup —
+          so the index dir grows unbounded until the disk fills. Keeping
+          positions off avoids both the overhead and the crash.
 
         Subclasses normally do not need to override this — declaring
         :attr:`BM25_FIELDS` is enough.
@@ -137,12 +161,13 @@ class BaseLanceTable(LanceModel):
         indices = await table.list_indices()
         indexed_cols = {col for idx in indices for col in (idx.columns or [])}
         for field in cls.BM25_FIELDS:
-            if field in indexed_cols:
+            if field in indexed_cols and not replace:
                 continue
             await table.create_index(
                 column=field,
+                replace=replace,
                 config=FTS(
-                    with_position=True,
+                    with_position=False,
                     base_tokenizer="whitespace",
                     lower_case=True,
                     stem=True,
