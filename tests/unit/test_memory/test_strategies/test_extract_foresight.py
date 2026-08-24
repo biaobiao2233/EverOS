@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import importlib
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import structlog.testing
-from everalgo.types import ChatMessage, Foresight, MemCell
+from everalgo.types import (
+    ChatMessage,
+    Foresight,
+    MemCell,
+    ToolCall,
+    ToolCallFunction,
+    ToolCallRequest,
+    ToolCallResult,
+)
 
 from everos.infra.ome.testing import FakeStrategyContext
 from everos.memory.events import UserPipelineStarted
@@ -64,6 +72,42 @@ async def test_strategy_meta_is_attached() -> None:
     assert UserPipelineStarted in meta.trigger.on
     assert meta.emits == frozenset()
     assert meta.max_retries == 2
+
+
+async def test_disabled_by_default() -> None:
+    """Foresight ships disabled: nothing in EverOS reads its output yet, so
+    running it by default spends one LLM call per sender per memcell on
+    write-only data. The decorator flag is the switch (not ome.toml — an
+    existing ``~/.everos/ome.toml`` is never rewritten by ``everos init``),
+    and the dispatcher's enabled gate honours it."""
+    meta = extract_foresight._ome_strategy_meta  # type: ignore[attr-defined]
+    assert meta.enabled is False
+
+
+async def test_toml_opt_in_re_enables_strategy() -> None:
+    """The documented ome.toml opt-in must actually flip the coded default.
+
+    ``apply_overrides`` is the same path ConfigReloader drives on load /
+    hot-reload; exercising it against a registry holding the default-off
+    strategy pins that ``[strategies.extract_foresight] enabled = true``
+    reaches the strategy rather than being silently ignored.
+    """
+    from everos.infra.ome._background.config_reloader import apply_overrides
+    from everos.infra.ome._dispatch.registry import StrategyRegistry
+    from everos.infra.ome.config import TomlRoot
+
+    registry = StrategyRegistry()
+    registry.register(extract_foresight)
+    assert registry.get("extract_foresight").enabled is False
+
+    root = TomlRoot.model_validate(
+        {"strategies": {"extract_foresight": {"enabled": True}}}
+    )
+    # The engine argument only feeds APS rescheduling for Cron/Idle
+    # triggers; extract_foresight is Immediate, so a stub suffices.
+    apply_overrides(registry, root, MagicMock())
+
+    assert registry.get("extract_foresight").enabled is True
 
 
 async def test_extracts_per_sender(
@@ -229,3 +273,104 @@ async def test_skips_when_memcell_has_no_messages(
     assert matching, "log line should still fire (count=0)"
     assert matching[0]["count"] == 0
     mock_wcls.return_value.append_entries_once.assert_not_called()
+
+
+# ── mixed agent/user memcells (tool calls) ──────────────────────────────
+
+
+def _tool_call_memcell(*, with_user_message: bool) -> MemCell:
+    """A memcell shaped the way an agent trajectory arrives.
+
+    ``ToolCallRequest`` carries ``sender_id`` but no ``role``;
+    ``ToolCallResult`` carries neither. Only ``ChatMessage`` has ``role``,
+    which is why a bare ``m.role`` test raised on the first tool call.
+    """
+    items: list[object] = [
+        ToolCallRequest(
+            id="t1",
+            sender_id="agent",
+            timestamp=1_700_000_000_000,
+            tool_calls=[
+                ToolCall(
+                    id="c1",
+                    function=ToolCallFunction(name="read_file", arguments="{}"),
+                )
+            ],
+        ),
+        ToolCallResult(
+            id="t2",
+            timestamp=1_700_000_001_000,
+            tool_call_id="c1",
+            content="file contents",
+        ),
+    ]
+    if with_user_message:
+        items.insert(
+            0,
+            ChatMessage(
+                id="m1",
+                role="user",
+                content="please fix the autoreloader",
+                timestamp=1_699_999_999_000,
+                sender_id="u_alice",
+            ),
+        )
+    return MemCell(items=items, timestamp=1_700_000_000_000)
+
+
+@pytest.mark.parametrize(
+    ("with_user_message", "expected_senders"),
+    [
+        pytest.param(False, [], id="pure_agent_trajectory"),
+        pytest.param(True, ["u_alice"], id="mixed_user_and_tool_calls"),
+    ],
+)
+async def test_tool_calls_do_not_crash_the_sender_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    with_user_message: bool,
+    expected_senders: list[str],
+) -> None:
+    """A memcell holding tool calls must not raise, and must not over-extract.
+
+    Regression guard: the scan used to read ``m.role`` off every item, so
+    the first ``ToolCallRequest`` raised ``AttributeError`` — before any
+    sender was resolved, before any LLM call. That made the strategy sound
+    on plain user chat and guaranteed to dead-letter on agent trajectories.
+    everalgo contracts for the mixed case
+    (``user_memory/_render.chat_messages``), so the fix is to honour that
+    contract rather than pre-filter by hand.
+
+    Both directions are pinned: a pure agent trajectory extracts nothing
+    and never reaches the LLM, and a mixed memcell extracts for the human
+    senders only — an implementation that merely stopped raising but
+    scanned tool-call ``sender_id`` values would invent ``"agent"`` as a
+    user.
+    """
+    event = UserPipelineStarted(
+        memcell_id="mc_tool",
+        session_id="s1",
+        memcell=_tool_call_memcell(with_user_message=with_user_message),
+    )
+    monkeypatch.setattr(mod, "_writer", None, raising=False)
+
+    with (
+        patch(
+            "everos.memory.strategies.extract_foresight.get_llm_client",
+            return_value=object(),
+        ),
+        patch(
+            "everos.memory.strategies.extract_foresight.ForesightExtractor"
+        ) as mock_cls,
+        patch(
+            "everos.memory.strategies.extract_foresight.ForesightWriter"
+        ) as mock_wcls,
+    ):
+        mock_cls.return_value.aextract = AsyncMock(return_value=[])
+        mock_wcls.return_value.append_entries_once = AsyncMock()
+        await extract_foresight(event, FakeStrategyContext())
+
+    called_senders = [
+        call.kwargs["sender_id"]
+        for call in mock_cls.return_value.aextract.await_args_list
+    ]
+    assert called_senders == expected_senders

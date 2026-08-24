@@ -2,10 +2,12 @@
 
 Mocked seams: ``cluster_repo`` (sqlite), ``agent_case_repo`` /
 ``agent_skill_repo`` (LanceDB), ``get_embedder`` (component),
-``AgentSkillExtractor`` (algo), ``AgentSkillWriter`` (md). Each
-retry-class exception (cluster missing / case-not-indexed) bubbles up so
-OME's ``max_retries`` machinery catches the race instead of the strategy
-implementing its own backoff loop.
+``AgentSkillExtractor`` (algo), ``AgentSkillWriter`` / ``AgentSkillReader``
+(md). Each retry-class exception (cluster missing / case exists nowhere)
+bubbles up so OME's ``max_retries`` machinery catches the race instead of
+the strategy implementing its own backoff loop. The cascade-lag scenario
+itself must NOT retry: a case durably present in markdown is rescued from
+md and the run proceeds (regression tests below).
 
 LanceDB repo behaviour itself (predicate isolation, cosine ranking,
 ``_distance`` stripping) lives under
@@ -18,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import importlib
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -29,7 +32,15 @@ from everos.component.embedding import (
     EmbeddingError,
     EmbeddingNotConfiguredError,
 )
+from everos.core.persistence import MemoryRoot
 from everos.infra.ome.testing import FakeStrategyContext
+from everos.infra.persistence.markdown import (
+    AgentCaseReader,
+    AgentCaseWriter,
+    AgentSkillFrontmatter,
+    AgentSkillReader,
+    AgentSkillWriter,
+)
 from everos.memory.events import SkillClusterUpdated
 from everos.memory.strategies._partition_locks import _reset_for_tests
 from everos.memory.strategies.extract_agent_skill import (
@@ -38,6 +49,7 @@ from everos.memory.strategies.extract_agent_skill import (
     _CaseNotYetIndexedError,
     _ClusterMissingError,
     _collect_supporting_entry_ids,
+    _reap_renamed_skills,
     _resolve_query_vector,
     _select_existing_skills,
     _select_supporting_cases,
@@ -45,10 +57,24 @@ from everos.memory.strategies.extract_agent_skill import (
     extract_agent_skill,
 )
 
+mod = importlib.import_module("everos.memory.strategies.extract_agent_skill")
+
 
 @pytest.fixture(autouse=True)
 def _isolate_partition_locks() -> None:
     _reset_for_tests()
+
+
+@pytest.fixture
+def md_root(tmp_path: Path) -> MemoryRoot:
+    return MemoryRoot(tmp_path)
+
+
+def _install_md_stores(monkeypatch: pytest.MonkeyPatch, root: MemoryRoot) -> None:
+    """Bind every md singleton the strategy lazily builds to ``root``."""
+    monkeypatch.setattr(mod, "_writer", AgentSkillWriter(root=root), raising=False)
+    monkeypatch.setattr(mod, "_reader", AgentSkillReader(root), raising=False)
+    monkeypatch.setattr(mod, "_case_reader", AgentCaseReader(root), raising=False)
 
 
 def _event(
@@ -101,22 +127,44 @@ def _lance_case(
     return case
 
 
-def _lance_skill(
+def _frontmatter(
+    name: str,
     *,
-    name: str = "old_skill",
-    cluster_id: str = "cl_xxxxxxxxxxx1",
+    agent_id: str = "a",
+    cluster_id: str | None = "cl_x",
     source_case_ids: list[str] | None = None,
-) -> MagicMock:
-    skill = MagicMock()
-    skill.id = f"agent_42_{name}"
-    skill.cluster_id = cluster_id
-    skill.name = name
-    skill.description = f"desc {name}"
-    skill.content = f"content {name}"
-    skill.confidence = 0.5
-    skill.maturity_score = 0.5
-    skill.source_case_ids = source_case_ids or []
-    return skill
+    confidence: float = 0.5,
+    maturity_score: float = 0.5,
+) -> AgentSkillFrontmatter:
+    return AgentSkillFrontmatter(
+        id=f"{agent_id}_{name}",
+        agent_id=agent_id,
+        name=name,
+        description=f"desc {name}",
+        confidence=confidence,
+        maturity_score=maturity_score,
+        source_case_ids=source_case_ids or [],
+        cluster_id=cluster_id,
+    )
+
+
+def _reader_stub(fms: list[AgentSkillFrontmatter]) -> MagicMock:
+    """Reader double: ``list_by_cluster`` returns each frontmatter paired
+    with a synthetic body — mirroring the real ``AgentSkillReader``, which
+    returns ``(frontmatter, body)`` pairs directly rather than requiring a
+    second, name-based read to hydrate ``content``."""
+    reader = MagicMock()
+    reader.list_by_cluster = AsyncMock(
+        return_value=[(fm, f"body of {fm.name}") for fm in fms]
+    )
+    return reader
+
+
+def _lance_skill_row(name: str) -> MagicMock:
+    """Stand-in for a LanceDB AgentSkill ranking row (only ``.name`` is read)."""
+    row = MagicMock()
+    row.name = name
+    return row
 
 
 def _algo_skill(
@@ -158,8 +206,15 @@ async def test_raises_when_cluster_missing_for_retry() -> None:
             await extract_agent_skill(_event(), FakeStrategyContext())
 
 
-async def test_raises_when_target_case_not_yet_in_lancedb() -> None:
-    """LanceDB has not yet indexed the freshly-written case — let OME retry."""
+async def test_raises_when_target_case_exists_nowhere(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The case is neither in LanceDB nor in markdown — a genuine same-tick
+    race between the md append landing and this run. Retry-class error so
+    OME catches up."""
+    monkeypatch.setattr(
+        mod, "_case_reader", MagicMock(find_structured=AsyncMock(return_value=None))
+    )
     with (
         patch(
             "everos.memory.strategies.extract_agent_skill.cluster_repo"
@@ -174,22 +229,208 @@ async def test_raises_when_target_case_not_yet_in_lancedb() -> None:
             await extract_agent_skill(_event(), FakeStrategyContext())
 
 
+# ── cascade-lag rescue (markdown durable source > LanceDB projection) ────
+
+
+async def _seed_case_md(writer: AgentCaseWriter, *, intent: str, approach: str) -> str:
+    """Append one AgentCase entry through the production write path.
+
+    Mirrors ``extract_agent_case._agent_case_to_entry_body``'s field layout.
+    Returns the stored marker id (``ac_<date>_<seq>``).
+    """
+    inline: dict[str, object] = {
+        "owner_id": "agent_42",
+        "session_id": "s1",
+        "timestamp": "2026-05-17T00:00:00+00:00",
+        "parent_type": "memcell",
+        "parent_id": "mc_a",
+        "quality_score": 0.82,
+    }
+    sections = {"TaskIntent": intent, "Approach": approach}
+    append = await writer.append_entry_once(
+        "agent_42",
+        parent_id="mc_a",
+        inline=inline,
+        sections=sections,
+        date=_dt.date(2026, 5, 17),
+    )
+    return append.entries[0].marker_id
+
+
+async def test_cascade_lag_rescues_case_from_markdown(
+    monkeypatch: pytest.MonkeyPatch, md_root: MemoryRoot
+) -> None:
+    """Regression for the production dead-letter: the AgentCase exists
+    durably in markdown but its LanceDB projection lags behind (cascade
+    backlog). The run must proceed off the md body instead of raising
+    ``_CaseNotYetIndexedError`` into the DLQ after exhausting retries.
+
+    Seeds the daily-log entry through the real ``AgentCaseWriter``, points
+    the LanceDB repo at ``None`` (the lagging projection), and drives the
+    whole strategy: the algo receives the md-derived target, and the skill
+    lands on disk.
+    """
+    _install_md_stores(monkeypatch, md_root)
+    marker_id = await _seed_case_md(
+        AgentCaseWriter(root=md_root),
+        intent="fix the autoreloader",
+        approach="restart the watcher process",
+    )
+    # First entry of the 2026-05-17 bucket: seq 1, zero-padded to 8 digits.
+    assert marker_id == "ac_20260517_00000001"
+
+    emitted = [_algo_skill(name="fix_autoreloader")]
+    prompt_loader = MagicMock()
+    prompt_loader.load.side_effect = lambda name: f"prompt:{name}"
+    monkeypatch.setattr(mod, "_prompt_loader", prompt_loader, raising=False)
+
+    with (
+        patch(
+            "everos.memory.strategies.extract_agent_skill.cluster_repo"
+        ) as mock_cluster_repo,
+        patch(
+            "everos.memory.strategies.extract_agent_skill.agent_case_repo"
+        ) as mock_case_repo,
+        patch(
+            "everos.memory.strategies.extract_agent_skill.agent_skill_repo"
+        ) as mock_skill_repo,
+        patch(
+            "everos.memory.strategies.extract_agent_skill.get_llm_client",
+            return_value=object(),
+        ),
+        patch(
+            "everos.memory.strategies.extract_agent_skill.AgentSkillExtractor"
+        ) as mock_extractor_cls,
+    ):
+        mock_cluster_repo.get_with_members = AsyncMock(
+            return_value=_algo_cluster(members=[marker_id])
+        )
+        # The lagging projection: nothing indexed yet.
+        mock_case_repo.find_by_owner_entry = AsyncMock(return_value=None)
+        mock_case_repo.find_by_owner_entries = AsyncMock(return_value=[])
+
+        async def _fail_topk(*_a: object, **_kw: object) -> list[object]:
+            raise AssertionError(
+                "no ranking expected: md enumeration found no existing skills"
+            )
+
+        mock_skill_repo.find_topk_relevant_in_cluster = AsyncMock(
+            side_effect=_fail_topk
+        )
+        mock_extractor_cls.return_value.aextract = AsyncMock(return_value=emitted)
+
+        await extract_agent_skill(
+            _event(case_entry_id=marker_id), FakeStrategyContext()
+        )
+
+    # The algo got the md-rescued case body, not a crash.
+    target_arg = mock_extractor_cls.return_value.aextract.call_args.args[0]
+    assert target_arg.id == marker_id
+    assert target_arg.task_intent == "fix the autoreloader"
+    assert target_arg.approach == "restart the watcher process"
+    assert target_arg.quality_score == 0.82
+    assert target_arg.timestamp == int(
+        _dt.datetime(2026, 5, 17, tzinfo=_dt.UTC).timestamp() * 1000
+    )
+
+    # And the skill was durably written.
+    assert (
+        md_root.agents_dir()
+        / "agent_42"
+        / "skills"
+        / "skill_fix_autoreloader"
+        / "SKILL.md"
+    ).is_file()
+
+
+async def test_rescue_degrades_on_partial_md_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    md_root: MemoryRoot,
+) -> None:
+    """A hand-edited / partially-written md entry degrades to safe empties
+    (with a warning) rather than reintroducing the dead-letter the rescue
+    exists to prevent."""
+    _install_md_stores(monkeypatch, md_root)
+    marker_id = (
+        (
+            await AgentCaseWriter(root=md_root).append_entry_once(
+                "agent_42",
+                parent_id="mc_b",
+                inline={
+                    "owner_id": "agent_42",
+                    "session_id": "s1",
+                    "parent_type": "memcell",
+                    "parent_id": "mc_b",
+                },
+                sections={},  # no TaskIntent / Approach / quality / timestamp
+                date=_dt.date(2026, 5, 17),
+            )
+        )
+        .entries[0]
+        .marker_id
+    )
+
+    with (
+        patch(
+            "everos.memory.strategies.extract_agent_skill.cluster_repo"
+        ) as mock_cluster_repo,
+        patch(
+            "everos.memory.strategies.extract_agent_skill.agent_case_repo"
+        ) as mock_case_repo,
+        patch(
+            "everos.memory.strategies.extract_agent_skill.agent_skill_repo"
+        ) as mock_skill_repo,
+        patch(
+            "everos.memory.strategies.extract_agent_skill.get_llm_client",
+            return_value=object(),
+        ),
+        patch(
+            "everos.memory.strategies.extract_agent_skill.AgentSkillExtractor"
+        ) as mock_extractor_cls,
+    ):
+        mock_cluster_repo.get_with_members = AsyncMock(
+            return_value=_algo_cluster(members=[marker_id])
+        )
+        mock_case_repo.find_by_owner_entry = AsyncMock(return_value=None)
+        mock_case_repo.find_by_owner_entries = AsyncMock(return_value=[])
+
+        async def _fail_topk(*_a: object, **_kw: object) -> list[object]:
+            raise AssertionError("no ranking expected")
+
+        mock_skill_repo.find_topk_relevant_in_cluster = AsyncMock(
+            side_effect=_fail_topk
+        )
+        mock_extractor_cls.return_value.aextract = AsyncMock(return_value=[])
+
+        await extract_agent_skill(
+            _event(case_entry_id=marker_id), FakeStrategyContext()
+        )
+
+    target_arg = mock_extractor_cls.return_value.aextract.call_args.args[0]
+    assert target_arg.id == marker_id
+    assert target_arg.task_intent == ""
+    assert target_arg.quality_score == 0.0
+
+
 # ── end-to-end orchestration (mocked) ────────────────────────────────────
 
 
-@pytest.mark.asyncio
 async def test_extracts_and_persists_with_cluster_id_stamped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """End-to-end (mocked): extractor emits skills → writer stamps cluster_id."""
     target = _lance_case("ac_20260517_0001", vector=[0.1] * 1024)
     supporting = [_lance_case("ac_20260517_0000")]
-    existing = [_lance_skill(name="old_skill", source_case_ids=["ac_20260517_0000"])]
+    existing_fm = _frontmatter(
+        "old_skill",
+        agent_id="agent_42",
+        cluster_id="cl_xxxxxxxxxxx1",
+        source_case_ids=["ac_20260517_0000"],
+    )
     emitted = [_algo_skill(name="summarise_doc"), _algo_skill(name="batch_then_synth")]
-    module = importlib.import_module("everos.memory.strategies.extract_agent_skill")
     prompt_loader = MagicMock()
     prompt_loader.load.side_effect = lambda name: f"prompt:{name}"
-    monkeypatch.setattr(module, "_prompt_loader", prompt_loader, raising=False)
+    monkeypatch.setattr(mod, "_prompt_loader", prompt_loader, raising=False)
 
     with (
         patch(
@@ -217,12 +458,20 @@ async def test_extracts_and_persists_with_cluster_id_stamped(
         )
         mock_case_repo.find_by_owner_entry = AsyncMock(return_value=target)
         mock_case_repo.find_by_owner_entries = AsyncMock(return_value=supporting)
-        # Small cluster path: count ≤ K → scalar fetch returns existing.
-        mock_skill_repo.count_in_cluster = AsyncMock(return_value=len(existing))
-        mock_skill_repo.find_in_cluster = AsyncMock(return_value=existing)
+
+        # Small cluster path: md enumeration ≤ K → everything used as-is;
+        # no ranking round trip.
+        async def _fail_topk(*_a: object, **_kw: object) -> list[object]:
+            raise AssertionError("ranking pointless on a fully-inclusive set")
+
+        mock_skill_repo.find_topk_relevant_in_cluster = AsyncMock(
+            side_effect=_fail_topk
+        )
+        monkeypatch.setattr(mod, "_reader", _reader_stub([existing_fm]), raising=False)
         mock_extractor_cls.return_value.aextract = AsyncMock(return_value=emitted)
         mock_writer_cls.return_value.write_main = AsyncMock(return_value=None)
-        monkeypatch.setattr(module, "_writer", None, raising=False)
+        mock_writer_cls.return_value.delete_skill = AsyncMock(return_value=False)
+        monkeypatch.setattr(mod, "_writer", None, raising=False)
 
         await extract_agent_skill(_event(), FakeStrategyContext())
 
@@ -230,9 +479,10 @@ async def test_extracts_and_persists_with_cluster_id_stamped(
     target_arg = extractor_call.args[0]
     assert target_arg.id == "ac_20260517_0001"
     assert target_arg.task_intent == "intent of ac_20260517_0001"
-    assert [s.name for s in extractor_call.kwargs["existing_relevant_skills"]] == [
-        "old_skill"
-    ]
+    existing_arg = extractor_call.kwargs["existing_relevant_skills"]
+    assert [s.name for s in existing_arg] == ["old_skill"]
+    assert existing_arg[0].id == "agent_42_old_skill"
+    assert existing_arg[0].content == "body of old_skill"
     assert [c.id for c in extractor_call.kwargs["supporting_cases"]] == [
         "ac_20260517_0000"
     ]
@@ -278,60 +528,108 @@ def test_skill_safety_gate_allows_safe_placeholder_and_verification() -> None:
     assert _skill_rejection_reason(skill) is None
 
 
+def test_persisted_skill_survives_traversal_shaped_llm_name() -> None:
+    """A traversal-shaped LLM name is sanitized *before* frontmatter
+    construction — the read-side validator must never turn the security
+    fix into a dead-letter DoS."""
+    raw = "../" * 8 + "tmp/pwned"
+    skill = _algo_skill(name=raw)
+    sanitized = AgentSkillFrontmatter.sanitize_skill_name(skill.name)
+
+    fm = AgentSkillFrontmatter(
+        id=f"agent_42_{sanitized}",
+        agent_id="agent_42",
+        name=sanitized,
+        description=skill.description,
+        confidence=skill.confidence,
+        maturity_score=skill.maturity_score,
+        source_case_ids=list(skill.source_case_ids),
+        cluster_id="cl1",
+    )
+    assert "/" not in fm.name
+    assert fm.name == sanitized
+
+
 # ── _select_existing_skills routing (cluster size × vector availability) ─
 
 
-async def test_select_existing_skills_small_cluster_uses_scalar_fetch() -> None:
-    """``total ≤ K`` short-circuits — no ranking needed for fully-inclusive set."""
+async def test_select_existing_skills_small_cluster_returns_all_md_skills(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``len(md) ≤ K`` short-circuits — no ranking needed, no LanceDB call."""
     target = _lance_case("ac_001", vector=[0.5] * 1024)
-    skills = [_lance_skill(name=f"s{i}") for i in range(3)]
+    fms = [_frontmatter(f"s{i}") for i in range(3)]
+    monkeypatch.setattr(mod, "_reader", _reader_stub(fms), raising=False)
 
     with patch(
         "everos.memory.strategies.extract_agent_skill.agent_skill_repo"
     ) as mock_repo:
-        mock_repo.count_in_cluster = AsyncMock(return_value=3)
-        mock_repo.find_in_cluster = AsyncMock(return_value=skills)
-        mock_repo.find_topk_relevant_in_cluster = AsyncMock()
+
+        async def _fail_topk(*_a: object, **_kw: object) -> list[object]:
+            raise AssertionError("ranking pointless on a fully-inclusive set")
+
+        mock_repo.find_topk_relevant_in_cluster = AsyncMock(side_effect=_fail_topk)
 
         got = await _select_existing_skills(
-            agent_id="a", cluster_id="cl_x", target=target
+            agent_id="a",
+            cluster_id="cl_x",
+            target=target,
+            app_id="default",
+            project_id="default",
         )
 
-    assert got == skills
-    mock_repo.find_topk_relevant_in_cluster.assert_not_awaited()
-    mock_repo.find_in_cluster.assert_awaited_once_with(
-        owner_id="a", cluster_id="cl_x", limit=MAX_SKILLS_IN_PROMPT
-    )
+    assert [s.name for s in got] == [f"s{i}" for i in range(3)]
+    assert [s.content for s in got] == [f"body of s{i}" for i in range(3)]
 
 
-async def test_select_existing_skills_large_cluster_with_vector_uses_topk() -> None:
-    """``total > K`` and target carries vector → cosine top-K path."""
+async def test_select_existing_skills_large_cluster_with_vector_ranks_via_lancedb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``len(md) > K`` and the target carries a vector → cosine top-K over
+    LanceDB, hydrated from md; stale LanceDB rows are skipped and md
+    backfills the remainder."""
     target = _lance_case("ac_001", vector=[0.5] * 1024)
-    topk_skills = [_lance_skill(name=f"s{i}") for i in range(MAX_SKILLS_IN_PROMPT)]
+    fms = [_frontmatter(f"s{i}") for i in range(MAX_SKILLS_IN_PROMPT + 5)]
+    monkeypatch.setattr(mod, "_reader", _reader_stub(fms), raising=False)
 
     with patch(
         "everos.memory.strategies.extract_agent_skill.agent_skill_repo"
     ) as mock_repo:
-        mock_repo.count_in_cluster = AsyncMock(return_value=MAX_SKILLS_IN_PROMPT + 5)
-        mock_repo.find_topk_relevant_in_cluster = AsyncMock(return_value=topk_skills)
-        mock_repo.find_in_cluster = AsyncMock()
-
-        got = await _select_existing_skills(
-            agent_id="a", cluster_id="cl_x", target=target
+        # Ranking proposes two live skills plus one stale row (indexed once,
+        # deleted from md since).
+        mock_repo.find_topk_relevant_in_cluster = AsyncMock(
+            return_value=[
+                _lance_skill_row("s9"),
+                _lance_skill_row("ghost"),
+                _lance_skill_row("s0"),
+            ]
         )
 
-    assert got == topk_skills
-    mock_repo.find_in_cluster.assert_not_awaited()
+        got = await _select_existing_skills(
+            agent_id="a",
+            cluster_id="cl_x",
+            target=target,
+            app_id="default",
+            project_id="default",
+        )
+
+    # Ranked winners first (stale row dropped), then md-order backfill to K.
+    expected = ["s9", "s0"] + [f"s{i}" for i in range(1, 9)]
+    assert [s.name for s in got] == expected
     call_kwargs = mock_repo.find_topk_relevant_in_cluster.await_args.kwargs
     assert call_kwargs["query_vector"] == [0.5] * 1024
     assert call_kwargs["top_k"] == MAX_SKILLS_IN_PROMPT
 
 
-async def test_select_existing_skills_large_cluster_recomputes_embedding() -> None:
-    """``total > K`` but case has no vector → re-embed ``task_intent`` on the fly."""
+async def test_select_existing_skills_large_cluster_recomputes_embedding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``len(md) > K`` but case has no vector → re-embed ``task_intent`` on the fly."""
     target = _lance_case("ac_001", vector=[], task_intent="how to summarise docs")
-    topk_skills = [_lance_skill(name=f"s{i}") for i in range(MAX_SKILLS_IN_PROMPT)]
+    fms = [_frontmatter(f"s{i}") for i in range(MAX_SKILLS_IN_PROMPT + 2)]
+    ranked = [_lance_skill_row(f"s{i}") for i in range(MAX_SKILLS_IN_PROMPT)]
     fresh_vec = [0.42] * 1024
+    monkeypatch.setattr(mod, "_reader", _reader_stub(fms), raising=False)
 
     mock_embedder = MagicMock()
     mock_embedder.embed = AsyncMock(return_value=fresh_vec)
@@ -345,24 +643,29 @@ async def test_select_existing_skills_large_cluster_recomputes_embedding() -> No
             return_value=mock_embedder,
         ),
     ):
-        mock_repo.count_in_cluster = AsyncMock(return_value=MAX_SKILLS_IN_PROMPT + 5)
-        mock_repo.find_topk_relevant_in_cluster = AsyncMock(return_value=topk_skills)
-        mock_repo.find_in_cluster = AsyncMock()
+        mock_repo.find_topk_relevant_in_cluster = AsyncMock(return_value=ranked)
 
         got = await _select_existing_skills(
-            agent_id="a", cluster_id="cl_x", target=target
+            agent_id="a",
+            cluster_id="cl_x",
+            target=target,
+            app_id="default",
+            project_id="default",
         )
 
-    assert got == topk_skills
     mock_embedder.embed.assert_awaited_once_with("how to summarise docs")
+    assert len(got) == MAX_SKILLS_IN_PROMPT
     call_kwargs = mock_repo.find_topk_relevant_in_cluster.await_args.kwargs
     assert call_kwargs["query_vector"] == fresh_vec
 
 
-async def test_select_existing_skills_falls_back_to_scalar_when_embed_fails() -> None:
-    """``total > K`` + no vector + embedder fails → scalar fetch capped at K."""
+async def test_select_existing_skills_falls_back_to_md_order_when_embed_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``len(md) > K`` + no vector + embedder fails → md ordering capped at K."""
+    fms = [_frontmatter(f"s{i}") for i in range(MAX_SKILLS_IN_PROMPT + 3)]
     target = _lance_case("ac_001", vector=[], task_intent="how to summarise docs")
-    scalar_skills = [_lance_skill(name=f"s{i}") for i in range(MAX_SKILLS_IN_PROMPT)]
+    monkeypatch.setattr(mod, "_reader", _reader_stub(fms), raising=False)
 
     mock_embedder = MagicMock()
     mock_embedder.embed = AsyncMock(side_effect=EmbeddingError("provider down"))
@@ -376,19 +679,138 @@ async def test_select_existing_skills_falls_back_to_scalar_when_embed_fails() ->
             return_value=mock_embedder,
         ),
     ):
-        mock_repo.count_in_cluster = AsyncMock(return_value=MAX_SKILLS_IN_PROMPT + 5)
-        mock_repo.find_in_cluster = AsyncMock(return_value=scalar_skills)
-        mock_repo.find_topk_relevant_in_cluster = AsyncMock()
+
+        async def _fail_topk(*_a: object, **_kw: object) -> list[object]:
+            raise AssertionError("no query vector → no ranking call")
+
+        mock_repo.find_topk_relevant_in_cluster = AsyncMock(side_effect=_fail_topk)
 
         got = await _select_existing_skills(
-            agent_id="a", cluster_id="cl_x", target=target
+            agent_id="a",
+            cluster_id="cl_x",
+            target=target,
+            app_id="default",
+            project_id="default",
         )
 
-    assert got == scalar_skills
-    mock_repo.find_topk_relevant_in_cluster.assert_not_awaited()
-    mock_repo.find_in_cluster.assert_awaited_once_with(
-        owner_id="a", cluster_id="cl_x", limit=MAX_SKILLS_IN_PROMPT
+    assert [s.name for s in got] == [f"s{i}" for i in range(MAX_SKILLS_IN_PROMPT)]
+
+
+async def test_select_existing_skills_no_vector_no_intent_falls_back_to_md_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The md-rescue path carries no vector; an empty intent leaves nothing
+    to embed either — degrade to md order, never raise."""
+    fms = [_frontmatter(f"s{i}") for i in range(MAX_SKILLS_IN_PROMPT + 1)]
+    target = _lance_case("ac_001", vector=[], task_intent="")
+    monkeypatch.setattr(mod, "_reader", _reader_stub(fms), raising=False)
+
+    with (
+        patch(
+            "everos.memory.strategies.extract_agent_skill.agent_skill_repo"
+        ) as mock_repo,
+        patch(
+            "everos.memory.strategies.extract_agent_skill.get_embedder"
+        ) as mock_get_embedder,
+    ):
+
+        async def _fail_topk(*_a: object, **_kw: object) -> list[object]:
+            raise AssertionError("no query vector → no ranking call")
+
+        mock_repo.find_topk_relevant_in_cluster = AsyncMock(side_effect=_fail_topk)
+
+        got = await _select_existing_skills(
+            agent_id="a",
+            cluster_id="cl_x",
+            target=target,
+            app_id="default",
+            project_id="default",
+        )
+
+    assert [s.name for s in got] == [f"s{i}" for i in range(MAX_SKILLS_IN_PROMPT)]
+    mock_get_embedder.assert_not_called()
+
+
+async def test_existing_skills_reaches_llm_for_skill_whose_directory_has_a_space(
+    monkeypatch: pytest.MonkeyPatch, md_root: MemoryRoot
+) -> None:
+    """End-to-end regression for the ``list_by_cluster`` drop bug: a
+    ``skill_My Skill/`` directory written outside the writer (raw space,
+    never sanitized) must reach ``existing_relevant_skills`` with non-empty
+    ``content`` — enumeration and hydration happen in one path-based pass,
+    with no second, name-based read to drop it one layer downstream.
+    """
+    _install_md_stores(monkeypatch, md_root)
+
+    skill_dir = md_root.agents_dir() / "a1" / "skills" / "skill_My Skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "id: a1_My Skill\n"
+        "type: agent_skill\n"
+        "agent_id: a1\n"
+        "track: agent\n"
+        "name: My Skill\n"
+        "description: d\n"
+        "confidence: 0.5\n"
+        "maturity_score: 0.5\n"
+        "cluster_id: cl1\n"
+        "---\n"
+        "The real skill body.\n",
+        encoding="utf-8",
     )
+
+    captured: dict[str, list] = {}
+
+    async def spy_aextract(
+        target, *, existing_relevant_skills, supporting_cases, **_kw
+    ):
+        captured["existing"] = list(existing_relevant_skills)
+        return []
+
+    with (
+        patch(
+            "everos.memory.strategies.extract_agent_skill.cluster_repo"
+        ) as mock_cluster_repo,
+        patch(
+            "everos.memory.strategies.extract_agent_skill.agent_skill_repo"
+        ) as mock_skill_repo,
+        patch(
+            "everos.memory.strategies.extract_agent_skill.agent_case_repo"
+        ) as mock_case_repo,
+        patch(
+            "everos.memory.strategies.extract_agent_skill.get_llm_client",
+            return_value=object(),
+        ),
+        patch(
+            "everos.memory.strategies.extract_agent_skill.AgentSkillExtractor"
+        ) as mock_extractor_cls,
+    ):
+        mock_cluster_repo.get_with_members = AsyncMock(
+            return_value=_algo_cluster(cluster_id="cl1", members=["c0", "c1"])
+        )
+
+        async def _fail_topk(*_a: object, **_kw: object) -> list[object]:
+            raise AssertionError(
+                "must not be reached: cluster is within MAX_SKILLS_IN_PROMPT"
+            )
+
+        mock_skill_repo.find_topk_relevant_in_cluster = AsyncMock(
+            side_effect=_fail_topk
+        )
+        mock_case_repo.find_by_owner_entry = AsyncMock(return_value=_lance_case("c1"))
+        mock_case_repo.find_by_owner_entries = AsyncMock(return_value=[])
+        mock_extractor_cls.return_value.aextract = spy_aextract
+
+        await extract_agent_skill(
+            _event(cluster_id="cl1", agent_id="a1", case_entry_id="c1"),
+            FakeStrategyContext(),
+        )
+
+    assert len(captured["existing"]) == 1
+    hydrated = captured["existing"][0]
+    assert hydrated.name == "My Skill"
+    assert hydrated.content == "The real skill body."
 
 
 # ── _resolve_query_vector layered fallback ───────────────────────────────
@@ -396,7 +818,7 @@ async def test_select_existing_skills_falls_back_to_scalar_when_embed_fails() ->
 
 async def test_resolve_query_vector_prefers_persisted_vector() -> None:
     """When ``target.vector`` is set, reuse it; never call the embedder."""
-    target = _lance_case("ac_001", vector=[0.3] * 1024)
+    target = mod._lance_to_target(_lance_case("ac_001", vector=[0.3] * 1024))
     with patch(
         "everos.memory.strategies.extract_agent_skill.get_embedder"
     ) as mock_get_embedder:
@@ -407,7 +829,7 @@ async def test_resolve_query_vector_prefers_persisted_vector() -> None:
 
 async def test_resolve_query_vector_returns_empty_when_no_text_either() -> None:
     """No persisted vector + no task_intent → ``[]`` (no policy here)."""
-    target = _lance_case("ac_001", vector=[], task_intent="")
+    target = mod._lance_to_target(_lance_case("ac_001", vector=[], task_intent=""))
     with patch(
         "everos.memory.strategies.extract_agent_skill.get_embedder"
     ) as mock_get_embedder:
@@ -418,7 +840,7 @@ async def test_resolve_query_vector_returns_empty_when_no_text_either() -> None:
 
 async def test_resolve_query_vector_swallows_embedder_not_configured() -> None:
     """Missing embedder config is a deployment issue, not a strategy fault."""
-    target = _lance_case("ac_001", vector=[], task_intent="hello")
+    target = mod._lance_to_target(_lance_case("ac_001", vector=[], task_intent="hello"))
     mock_embedder = MagicMock()
     mock_embedder.embed = AsyncMock(
         side_effect=EmbeddingNotConfiguredError("no api key")
@@ -437,8 +859,9 @@ async def test_resolve_query_vector_swallows_embedder_not_configured() -> None:
 async def test_select_supporting_cases_ranks_by_quality_then_timestamp() -> None:
     """Hydrated cases sort ``(quality_score desc, timestamp desc)``."""
     skills = [
-        _lance_skill(name="s1", source_case_ids=["ac_a", "ac_b", "ac_c"]),
+        _algo_skill(name="s1", content="c"),
     ]
+    skills[0].source_case_ids = ["ac_a", "ac_b", "ac_c"]
     case_a = _lance_case(
         "ac_a",
         quality_score=0.4,
@@ -477,7 +900,8 @@ async def test_select_supporting_cases_ranks_by_quality_then_timestamp() -> None
 async def test_select_supporting_cases_caps_at_max_supporting() -> None:
     """Hydrated set is truncated to ``MAX_SUPPORTING_CASES``."""
     ids = [f"ac_{i:03d}" for i in range(MAX_SUPPORTING_CASES + 3)]
-    skills = [_lance_skill(name="s1", source_case_ids=ids)]
+    skills = [_algo_skill(name="s1", content="c")]
+    skills[0].source_case_ids = ids
     hydrated = [
         _lance_case(eid, quality_score=0.5 + 0.01 * i) for i, eid in enumerate(ids)
     ]
@@ -499,7 +923,8 @@ async def test_select_supporting_cases_caps_at_max_supporting() -> None:
 
 async def test_select_supporting_cases_skips_repo_when_no_lineage_ids() -> None:
     """No usable source ids → ``[]`` without a repo round trip."""
-    skills = [_lance_skill(name="s1", source_case_ids=[])]
+    skills = [_algo_skill(name="s1", content="c")]
+    skills[0].source_case_ids = []
     with patch(
         "everos.memory.strategies.extract_agent_skill.agent_case_repo"
     ) as mock_case_repo:
@@ -579,6 +1004,11 @@ async def _run_serialisation_probe(
             "everos.memory.strategies.extract_agent_skill.AgentSkillExtractor"
         ) as mock_extractor_cls,
         patch("everos.memory.strategies.extract_agent_skill.AgentSkillWriter"),
+        patch.object(
+            mod,
+            "_reader",
+            _reader_stub([]),
+        ),
     ):
         mock_cluster_repo.get_with_members = AsyncMock(
             return_value=_algo_cluster(members=["ac_run_a", "ac_run_b"])
@@ -589,8 +1019,13 @@ async def _run_serialisation_probe(
             )
         )
         mock_case_repo.find_by_owner_entries = AsyncMock(return_value=[])
-        mock_skill_repo.count_in_cluster = AsyncMock(return_value=0)
-        mock_skill_repo.find_in_cluster = AsyncMock(return_value=[])
+
+        async def _fail_topk(*_a: object, **_kw: object) -> list[object]:
+            raise AssertionError("no existing skills → no ranking call")
+
+        mock_skill_repo.find_topk_relevant_in_cluster = AsyncMock(
+            side_effect=_fail_topk
+        )
         mock_extractor_cls.return_value.aextract = mock_aextract
         await asyncio.gather(
             extract_agent_skill(
@@ -619,3 +1054,119 @@ async def test_partition_lock_lets_different_agents_run_in_parallel() -> None:
     log = await _run_serialisation_probe("agent_42", "agent_43")
     assert log.index("enter:ac_run_a") < log.index("leave:ac_run_b")
     assert log.index("enter:ac_run_b") < log.index("leave:ac_run_a")
+
+
+# ── rename reconciliation (orphan directories) ──────────────────────────
+
+
+def _identified_algo_skill(skill_id: str, name: str) -> AlgoAgentSkill:
+    """Like :func:`_algo_skill` but with an explicit id — rename
+    reconciliation keys off identity, so these tests must control it."""
+    return AlgoAgentSkill(
+        id=skill_id,
+        cluster_id="cl1",
+        name=name,
+        description="d",
+        content="body",
+        confidence=0.8,
+        maturity_score=0.5,
+        source_case_ids=["case_a"],
+    )
+
+
+async def _write_skill(writer: AgentSkillWriter, name: str) -> Path:
+    fm = AgentSkillFrontmatter(
+        id=f"agent_42_{name}",
+        agent_id="agent_42",
+        name=name,
+        description="d",
+        confidence=0.8,
+        maturity_score=0.5,
+        cluster_id="cl1",
+    )
+    path = await writer.write_main("agent_42", name, frontmatter=fm, body="body")
+    return path.parent
+
+
+async def test_reap_removes_the_directory_a_rename_left_behind(
+    tmp_path: Path,
+) -> None:
+    """An update that renames a skill must not leave its old directory.
+
+    everalgo's ``_apply_update`` keeps ``prior.id`` while changing the
+    name, so the emitted skill is written under a new directory and the
+    old one would survive carrying the same ``cluster_id``. That is not a
+    cosmetic leak: the next extraction's ``existing_relevant_skills`` come
+    from the markdown enumeration, so the orphan returns as a duplicate of
+    a skill the LLM already renamed, which is how ``add``-instead-of-
+    ``update`` full-replace clobbering gets back in. Uses a real writer on
+    a real tmp_path — the property under test is that the directory is
+    gone from the filesystem.
+    """
+    writer = AgentSkillWriter(MemoryRoot(tmp_path))
+    old_dir = await _write_skill(writer, "fix_django")
+    new_dir = await _write_skill(writer, "fix_django_autoreload")
+    assert old_dir.is_dir() and new_dir.is_dir()
+
+    await _reap_renamed_skills(
+        writer,
+        {"agent_42_fix_django": "fix_django_autoreload"},
+        existing_skills=[_identified_algo_skill("agent_42_fix_django", "fix_django")],
+        agent_id="agent_42",
+        app_id="default",
+        project_id="default",
+    )
+
+    assert not old_dir.exists()
+    assert (new_dir / "SKILL.md").is_file()
+
+
+async def test_reap_keeps_a_prior_name_another_emitted_skill_claimed(
+    tmp_path: Path,
+) -> None:
+    """Never delete a directory this same batch just wrote.
+
+    With two ops in one extraction — rename ``a`` → ``b`` while a second
+    op writes ``a`` — reaping ``a`` by prior name would remove a file
+    written moments earlier in the same loop. The claimed-name guard is
+    what prevents the reap from undoing its own caller.
+    """
+    writer = AgentSkillWriter(MemoryRoot(tmp_path))
+    dir_a = await _write_skill(writer, "alpha")
+    await _write_skill(writer, "beta")
+
+    await _reap_renamed_skills(
+        writer,
+        {"agent_42_alpha": "beta", "other_id": "alpha"},
+        existing_skills=[_identified_algo_skill("agent_42_alpha", "alpha")],
+        agent_id="agent_42",
+        app_id="default",
+        project_id="default",
+    )
+
+    assert dir_a.is_dir()
+
+
+async def test_reap_ignores_newly_added_skills(tmp_path: Path) -> None:
+    """A fresh ``add`` carries a uuid4 id absent from the enumerated set.
+
+    Identity is the only thing that survives a rename — ``_apply_update``
+    preserves ``prior.id`` while ``_apply_add`` mints a new one — so an
+    id that never appeared in ``existing_skills`` cannot be a rename, and
+    nothing may be deleted on its account.
+    """
+    writer = AgentSkillWriter(MemoryRoot(tmp_path))
+    kept = await _write_skill(writer, "existing_skill")
+
+    await _reap_renamed_skills(
+        writer,
+        {"3f2a9c1e4b6d47f8a0c5e9b2d7143a6f": "brand_new_skill"},
+        existing_skills=[
+            _identified_algo_skill("agent_42_existing_skill", "existing_skill")
+        ],
+        agent_id="agent_42",
+        app_id="default",
+        project_id="default",
+    )
+
+    assert kept.is_dir()
