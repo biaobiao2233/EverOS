@@ -19,6 +19,9 @@ def test_ome_config_defaults() -> None:
     assert c.aps_jobstore_path == MemoryRoot.default().ome_aps_db
     assert c.max_concurrent_runs == 20
     assert c.max_retries == 1
+    assert c.retry_backoff_base_seconds == 1.0
+    assert c.retry_backoff_cap_seconds == 10.0
+    assert c.retry_jitter_seconds == 0.5
     assert c.max_records_per_strategy == 1000
     assert c.crash_recovery_timeout_seconds == 1800
     assert c.config_path is None
@@ -74,6 +77,21 @@ def test_ome_config_rejects_unknown_field() -> None:
 def test_ome_config_rejects_zero_concurrency() -> None:
     with pytest.raises(ValidationError):
         OMEConfig(max_concurrent_runs=0)
+
+
+def test_ome_config_rejects_negative_backoff_base() -> None:
+    with pytest.raises(ValidationError):
+        OMEConfig(retry_backoff_base_seconds=-0.1)
+
+
+def test_ome_config_rejects_negative_backoff_cap() -> None:
+    with pytest.raises(ValidationError):
+        OMEConfig(retry_backoff_cap_seconds=-1.0)
+
+
+def test_ome_config_rejects_negative_jitter() -> None:
+    with pytest.raises(ValidationError):
+        OMEConfig(retry_jitter_seconds=-0.5)
 
 
 def test_toml_root_parses_strategy_override() -> None:

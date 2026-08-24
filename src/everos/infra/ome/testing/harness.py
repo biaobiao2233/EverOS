@@ -41,6 +41,9 @@ class StrategyTestHarness:
             config_watch=False,
             max_concurrent_runs=20,
             max_retries=1,
+            # Retry-chain sleeps are production tuning, not a property any
+            # harness test pins — keep failing strategies instant here.
+            retry_backoff_base_seconds=0.0,
         )
         self._engine = OfflineEngine(config=cfg)
 

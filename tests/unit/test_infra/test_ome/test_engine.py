@@ -98,6 +98,25 @@ async def test_engine_register_and_start(cfg: OMEConfig) -> None:
 
 
 @pytest.mark.asyncio
+async def test_engine_wires_config_into_runner(cfg: OMEConfig) -> None:
+    """The Runner must see the engine's OMEConfig — its per-attempt
+    backoff timing (retry_backoff_* / retry_jitter_seconds) is read from
+    there at retry time."""
+
+    @offline_strategy(name="s", trigger=Immediate(on=[_E]), emits=[])
+    async def s(event: _E, ctx: StrategyContext) -> None:
+        return None
+
+    engine = OfflineEngine(config=cfg)
+    engine.register(s)
+    await engine.start()
+    try:
+        assert engine._runner._config is cfg
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
 async def test_engine_register_after_start_raises(cfg: OMEConfig) -> None:
     engine = OfflineEngine(config=cfg)
     await engine.start()
