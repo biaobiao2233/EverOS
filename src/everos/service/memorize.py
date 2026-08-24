@@ -38,10 +38,10 @@ from everos.infra.ome.engine import OfflineEngine
 from everos.infra.persistence.markdown import EpisodeWriter
 from everos.infra.persistence.sqlite import (
     MemoryOperation,
-    canonical_json,
     memcell_repo,
     memory_operation_repo,
 )
+from everos.infra.persistence.sqlite.repos.memory_operation import canonical_json
 from everos.memory import IngestResult, MemCell
 from everos.memory.extract.ingest import process as ingest_process
 from everos.memory.extract.pipeline import (

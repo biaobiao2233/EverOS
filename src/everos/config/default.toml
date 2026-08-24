@@ -71,6 +71,7 @@ model = "gpt-4o-mini"
 # provider = "agy_cli"
 # agy_executable = "agy"
 # agy_workdir = "~/.local/share/everos/agy-worker"
+# agy_homes = ["/root", "/var/lib/agy-accounts/profile-3"]
 # agy_agent = "everos-text"
 # agy_model = "gemini-3.5-flash-medium"
 # agy_timeout_seconds = 300.0

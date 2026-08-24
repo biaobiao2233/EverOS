@@ -42,7 +42,7 @@ def _sample_memcell(memcell_id: str, ts: int, sender_id: str = "user") -> MemCel
 
 def test_app_registers_status_and_recover() -> None:
     names = {cmd.name for cmd in profile_mod.app.registered_commands}
-    assert names == {"status", "recover"}
+    assert names == {"status", "recover", "clean"}
 
 
 def test_help_exits_zero() -> None:
@@ -389,6 +389,122 @@ def test_recover_execution_commits_watermark_when_lock_acquired() -> None:
         assert "Starting Profile Recovery for 'user'" in result.stdout
         assert "Recovery Complete" in result.stdout
         assert mock_persist.call_count >= 1
+
+
+def test_recover_rejects_negative_max_checkpoints() -> None:
+    result = CliRunner().invoke(
+        profile_mod.app,
+        [
+            "recover",
+            "--owner-id",
+            "user",
+            "--app-id",
+            "codex",
+            "--project-id",
+            "solo",
+            "--max-checkpoints",
+            "-1",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "--max-checkpoints must be 0" in result.output
+
+
+def test_recover_max_checkpoints_stops_after_first_persisted_checkpoint() -> None:
+    """A smoke limit counts durable writes, not raw dynamic sub-batches."""
+    from everos.memory.strategies.extract_user_profile import NextBatch
+
+    existing_fm = UserProfileFrontmatter(
+        id="profile_user",
+        user_id="user",
+        summary="User profile summary",
+        profile_timestamp_ms=1000,
+    )
+    first_cell = _sample_memcell("mc_1", 1500)
+    second_cell = _sample_memcell("mc_2", 1500)
+    third_cell = _sample_memcell("mc_3", 2000)
+    new_profile = AlgoProfile(
+        owner_id="user",
+        summary="Updated profile",
+        timestamp=1500,
+    )
+
+    first_batch = NextBatch(
+        memcells=[first_cell],
+        completed_watermark=None,
+        completed_memcell_ids=[],
+    )
+    second_batch = NextBatch(
+        memcells=[second_cell],
+        completed_watermark=1500,
+        completed_memcell_ids=["mc_1", "mc_2"],
+    )
+
+    with (
+        patch(
+            "everos.entrypoints.cli.commands.profile.is_everos_service_active",
+            return_value=False,
+        ),
+        patch(
+            "everos.entrypoints.cli.commands.profile.ProfileReader"
+        ) as mock_reader_cls,
+        patch(
+            "everos.entrypoints.cli.commands.profile.get_unprocessed_memcells_for_owner",
+            return_value=(
+                [
+                    ("mc_1", first_cell),
+                    ("mc_2", second_cell),
+                    ("mc_3", third_cell),
+                ],
+                0,
+                0,
+            ),
+        ),
+        patch(
+            "everos.entrypoints.cli.commands.profile.plan_next_step",
+            side_effect=[
+                (first_batch, ["after-first"]),
+                (second_batch, ["must-not-run"]),
+            ],
+        ) as mock_plan,
+        patch(
+            "everos.entrypoints.cli.commands.profile.get_llm_client",
+            return_value=object(),
+        ),
+        patch(
+            "everos.entrypoints.cli.commands.profile.ProfileExtractor"
+        ) as mock_extractor_cls,
+        patch(
+            "everos.entrypoints.cli.commands.profile._persist_profile",
+            new=AsyncMock(),
+        ) as mock_persist,
+    ):
+        mock_reader_cls.return_value.read = AsyncMock(return_value=[existing_fm])
+        mock_extractor_cls.return_value.aextract = AsyncMock(return_value=new_profile)
+
+        result = CliRunner().invoke(
+            profile_mod.app,
+            [
+                "recover",
+                "--owner-id",
+                "user",
+                "--app-id",
+                "codex",
+                "--project-id",
+                "solo",
+                "--max-checkpoints",
+                "1",
+            ],
+        )
+
+        assert result.exit_code == 0
+        assert "Done sub-chunk. Watermark held at 1000." in result.stdout
+        assert "Watermark advanced to 1500" in result.stdout
+        assert "stopped after 1 checkpoint(s)" in result.stdout
+        assert "Recovery Complete" not in result.stdout
+        assert mock_plan.call_count == 2
+        assert mock_extractor_cls.return_value.aextract.call_count == 2
+        assert mock_persist.call_count == 1
 
 
 def test_recover_rejects_prompt_budget_above_hard_limit() -> None:

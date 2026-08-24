@@ -107,3 +107,38 @@ async def test_chat_fails_closed_on_cli_error(tmp_path) -> None:
     message = str(exc_info.value)
     assert "private prompt" not in message
     assert "secret stderr" not in message
+
+
+async def test_chat_round_robins_configured_account_homes(tmp_path) -> None:
+    home_a = tmp_path / "account-a"
+    home_b = tmp_path / "account-b"
+    provider = AgyCLIProvider(
+        workdir=tmp_path / "work",
+        homes=[home_a, home_b],
+    )
+    provider._run = AsyncMock(return_value=(0, b"ok"))  # type: ignore[method-assign]
+
+    await provider.chat([ChatMessage(role="user", content="first")])
+    await provider.chat([ChatMessage(role="user", content="second")])
+
+    assert provider._run.await_args_list[0].kwargs["home"] == home_a
+    assert provider._run.await_args_list[1].kwargs["home"] == home_b
+
+
+async def test_chat_fails_over_to_next_home_on_cli_nonzero(tmp_path) -> None:
+    home_a = tmp_path / "account-a"
+    home_b = tmp_path / "account-b"
+    provider = AgyCLIProvider(
+        workdir=tmp_path / "work",
+        homes=[home_a, home_b],
+    )
+    provider._run = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[(1, b""), (0, b"ok")]
+    )
+
+    response = await provider.chat([ChatMessage(role="user", content="retry")])
+
+    assert response.content == "ok"
+    assert provider._run.await_count == 2
+    assert provider._run.await_args_list[0].kwargs["home"] == home_a
+    assert provider._run.await_args_list[1].kwargs["home"] == home_b

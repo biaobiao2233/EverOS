@@ -139,7 +139,7 @@ def create_app(
 
     @app.middleware("http")
     async def require_api_token(request: Request, call_next):
-        """Require a configured bearer token on every non-health request."""
+        """Protect remote memory APIs while keeping loopback jobs compatible."""
         if request.url.path == "/health" or request.method == "OPTIONS":
             return await call_next(request)
         is_admin_request = request.url.path.startswith("/api/v1/admin/")
@@ -148,6 +148,11 @@ def create_app(
                 status_code=503,
                 content={"detail": "Admin API requires EVEROS_API_TOKEN"},
             )
+        client_host = request.client.host if request.client else ""
+        if not is_admin_request and (
+            not api_token or client_host in {"127.0.0.1", "::1"}
+        ):
+            return await call_next(request)
         if not api_token:
             return await call_next(request)
         supplied = request.headers.get("Authorization", "")

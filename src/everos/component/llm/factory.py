@@ -33,6 +33,7 @@ def build_llm_provider(settings: LLMSettings) -> LLMClient:
         return AgyCLIProvider(
             executable=settings.agy_executable,
             workdir=settings.agy_workdir,
+            homes=settings.agy_homes,
             agent=settings.agy_agent,
             model=settings.agy_model,
             timeout_seconds=settings.agy_timeout_seconds,

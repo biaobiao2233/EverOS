@@ -124,6 +124,7 @@ class LLMSettings(BaseModel):
         EVEROS_LLM__BASE_URL
         EVEROS_LLM__AGY_EXECUTABLE
         EVEROS_LLM__AGY_WORKDIR
+        EVEROS_LLM__AGY_HOMES
         EVEROS_LLM__AGY_AGENT
         EVEROS_LLM__AGY_MODEL
         EVEROS_LLM__AGY_TIMEOUT_SECONDS
@@ -136,6 +137,7 @@ class LLMSettings(BaseModel):
     base_url: str | None = None
     agy_executable: str = "agy"
     agy_workdir: Path = Path("~/.local/share/everos/agy-worker")
+    agy_homes: list[Path] = Field(default_factory=list)
     agy_agent: str = "everos-text"
     agy_model: str | None = None
     agy_timeout_seconds: float = Field(default=300.0, gt=0)

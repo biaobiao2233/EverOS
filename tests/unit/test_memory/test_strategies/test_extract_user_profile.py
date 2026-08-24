@@ -30,8 +30,12 @@ from everos.memory.events import ProfileClusterUpdated
 from everos.memory.strategies._partition_locks import _reset_for_tests
 from everos.memory.strategies.extract_user_profile import (
     DEFAULT_MAX_PROMPT_CHARS,
+    PROFILE_QUALITY_POLICY_MARKER,
+    BoundedProfileLLMClient,
     _persist_profile,
     extract_user_profile,
+    profile_quality_violations,
+    rewrite_profile_for_quality,
     split_memcell_losslessly,
 )
 
@@ -103,6 +107,211 @@ class FakeLLM:
                 "implicit_traits": [{"trait": "analytical"}],
             }
         return FakeLLMResponse(json.dumps(resp))
+
+
+@pytest.mark.asyncio
+async def test_r7_quality_policy_injected_and_secret_response_fails_closed() -> None:
+    class SecretDelegate:
+        def __init__(self) -> None:
+            self.prompt = ""
+
+        async def chat(self, messages: list[Any], **kwargs: Any) -> FakeLLMResponse:
+            del kwargs
+            first = messages[0]
+            self.prompt = (
+                first["content"] if isinstance(first, dict) else str(first.content)
+            )
+            return FakeLLMResponse(
+                json.dumps(
+                    {
+                        "operations": [
+                            {
+                                "action": "add",
+                                "type": "explicit_info",
+                                "data": {
+                                    "category": "credential",
+                                    "description": "password: ExampleSecret123",
+                                },
+                            }
+                        ]
+                    }
+                )
+            )
+
+    delegate = SecretDelegate()
+    guarded = BoundedProfileLLMClient(delegate)
+
+    with pytest.raises(ValueError, match="credential-like content"):
+        await guarded.chat([{"role": "user", "content": "profile update"}])
+
+    assert PROFILE_QUALITY_POLICY_MARKER in delegate.prompt
+
+
+def test_r7_profile_quality_violations_detect_bloat_and_language_artifacts() -> None:
+    profile = AlgoProfile(
+        owner_id="user",
+        summary="summary",
+        timestamp=1234,
+        explicit_info=[
+            {
+                "category": "workflow",
+                "description": "用户经常 and 使用自动化工具" + ("长" * 700),
+                "evidence": "e" * 360,
+            }
+        ],
+        implicit_traits=[],
+    )
+
+    violations = profile_quality_violations(profile)
+
+    assert "mixed_language_connector_artifact" in violations
+    assert any("oversized description" in item for item in violations)
+
+
+def test_r7_profile_quality_rejects_transient_task_ledger_category() -> None:
+    profile = AlgoProfile(
+        owner_id="user",
+        summary="summary",
+        timestamp=1234,
+        explicit_info=[
+            {
+                "category": "当前任务与目标",
+                "description": "当前核心技术任务包括修博客、调代理和处理飞控。",
+                "evidence": "近期对话中的项目清单。",
+            }
+        ],
+        implicit_traits=[],
+    )
+
+    assert "transient_task_ledger" in profile_quality_violations(profile)
+
+
+def test_r7_profile_quality_allows_english_technical_conjunctions() -> None:
+    profile = AlgoProfile(
+        owner_id="user",
+        summary="summary",
+        timestamp=1234,
+        explicit_info=[
+            {
+                "category": "技术栈",
+                "description": "用户使用 Node.js and Python 进行开发。",
+                "evidence": "长期技术栈中包含这两类开发环境。",
+            }
+        ],
+        implicit_traits=[],
+    )
+
+    assert "mixed_language_connector_artifact" not in profile_quality_violations(
+        profile
+    )
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "用户关注 AI and 自动化工具的协作方式。",
+        "用户会把知识图谱 and RAG 结合使用。",
+        "用户熟悉 Node.js and Python 进行开发。",
+        "用户阅读 University of Oxford 的公开资料。",
+    ],
+)
+def test_r7_profile_quality_allows_one_sided_cjk_technical_connectors(
+    description: str,
+) -> None:
+    profile = AlgoProfile(
+        owner_id="user",
+        summary="summary",
+        timestamp=1234,
+        explicit_info=[
+            {
+                "category": "技术偏好",
+                "description": description,
+                "evidence": "长期技术讨论中的稳定偏好。",
+            }
+        ],
+        implicit_traits=[],
+    )
+
+    assert "mixed_language_connector_artifact" not in profile_quality_violations(
+        profile
+    )
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "用户经常 and 使用自动化工具。",
+        "用户偏好 of 技术方案。",
+    ],
+)
+def test_r7_profile_quality_rejects_cjk_connector_cjk_artifacts(
+    description: str,
+) -> None:
+    profile = AlgoProfile(
+        owner_id="user",
+        summary="summary",
+        timestamp=1234,
+        explicit_info=[
+            {
+                "category": "工作流",
+                "description": description,
+                "evidence": "用于质量门回归。",
+            }
+        ],
+        implicit_traits=[],
+    )
+
+    assert "mixed_language_connector_artifact" in profile_quality_violations(profile)
+
+
+@pytest.mark.asyncio
+async def test_r7_quality_rewrite_preserves_watermark_and_cursor() -> None:
+    profile = AlgoProfile(
+        owner_id="user",
+        summary="old",
+        timestamp=4321,
+        explicit_info=[
+            {
+                "category": "workflow",
+                "description": "用户在多个工具之间 and 切换，并保留很多临时日志细节。",
+                "evidence": "历史对话包含大量一次性排障记录。",
+            }
+        ],
+        implicit_traits=[],
+    )
+    profile.profile_watermark_memcell_ids = ["mc_a", "mc_b"]
+
+    def response_factory(_prompt: str, _call_num: int) -> str:
+        return json.dumps(
+            {
+                "explicit_info": [
+                    {
+                        "category": "工作流偏好",
+                        "description": "用户偏好使用自动化工具推进技术任务。",
+                        "evidence": "历史对话中多次采用自动化工具完成技术操作。",
+                    }
+                ],
+                "implicit_traits": [
+                    {
+                        "trait": "[目标导向]",
+                        "description": "用户倾向于直接推进可验证的技术结果。",
+                        "basis": "多次要求直接执行并核验结果。",
+                        "evidence": "多轮技术排障中持续要求用实际状态验证。",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+    fake_llm = FakeLLM(response_factory=response_factory)
+    guarded = BoundedProfileLLMClient(fake_llm)
+
+    rewritten = await rewrite_profile_for_quality(profile, guarded, force=True)
+
+    assert rewritten.timestamp == 4321
+    assert rewritten.profile_watermark_memcell_ids == ["mc_a", "mc_b"]
+    assert profile_quality_violations(rewritten) == []
+    assert PROFILE_QUALITY_POLICY_MARKER in fake_llm.captured_prompts[0]
 
 
 def _event(

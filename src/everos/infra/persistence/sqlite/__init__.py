@@ -30,7 +30,6 @@ not need to manage either.
 # ``create_all`` without callers having to import each model module.
 from . import tables as tables  # noqa: F401
 from .repos import QueueSummary as QueueSummary
-from .repos import canonical_json as canonical_json
 from .repos import cluster_repo as cluster_repo
 from .repos import conversation_status_repo as conversation_status_repo
 from .repos import md_change_state_repo as md_change_state_repo
@@ -58,7 +57,6 @@ __all__ = [
     "MemoryOperation",
     "QueueSummary",
     "UnprocessedBuffer",
-    "canonical_json",
     "cluster_repo",
     "conversation_status_repo",
     "dispose_engine",

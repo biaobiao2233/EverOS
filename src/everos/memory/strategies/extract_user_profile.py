@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -26,6 +28,7 @@ from everalgo.user_memory.profile import (
     format_message_timestamp,
 )
 
+from everos.component.llm import ChatMessage as LLMChatMessage
 from everos.component.llm import get_llm_client
 from everos.core.persistence import MemoryRoot
 from everos.infra.ome.context import StrategyContext
@@ -49,12 +52,86 @@ DEFAULT_MAX_PROMPT_CHARS: int = 40_000
 DEFAULT_MAX_BATCH_MEMCELLS: int = 25
 DEFAULT_MAX_SINGLE_MESSAGE_CHARS: int = 15_000
 
+PROFILE_QUALITY_POLICY_MARKER = "=== EVEROS PROFILE QUALITY POLICY v1 ==="
+PROFILE_QUALITY_POLICY = f"""{PROFILE_QUALITY_POLICY_MARKER}
+You are maintaining a durable user profile, not a transcript, task ledger, or
+credential store. These rules override any weaker profile-extraction guidance:
+
+1. PRIVACY MINIMIZATION: Never store or repeat passwords, API keys, access or
+   refresh tokens, cookies, Authorization headers, private keys, recovery codes,
+   secret suffixes, or other authentication material. If such material appears in
+   the conversation or existing profile, omit it. A durable non-secret fact such as
+   "the user uses Groq/Gemini" may be retained without credential details.
+2. HIGH-SIGNAL ONLY: Keep stable facts, durable preferences, recurring workflows,
+   and well-supported traits. Do not store assistant plans, error traces, command
+   output, temporary task status, one-off troubleshooting steps, or long project
+   inventories. Summarize instead of accumulating chronology.
+3. CONCISE MERGE: Prefer update/merge/delete over add. Keep at most 30 total
+   explicit_info + implicit_traits items. One item should cover one reusable
+   dimension, not a numbered list of many unrelated events.
+4. BOUNDED FIELDS: Keep description <= 600 characters, evidence <= 350 characters,
+   basis <= 350 characters, and category/trait labels <= 80 characters. Evidence
+   should be one concise grounded sentence, not copied transcript text.
+5. CLEAN LANGUAGE: Write natural fluent text in the profile's dominant language.
+   For Chinese profiles, do not use stray English connector words such as "and" or
+   "of" as grammar. Keep unavoidable product names and technical terms as-is.
+6. PATH / IDENTIFIER HYGIENE: Do not copy serialized/escaped path blobs, long IDs,
+   IP inventories, or host lists. If a filesystem location is genuinely a durable
+   preference, keep only the shortest useful human-readable form and never repeated
+   escaping. Prefer generalized infrastructure facts over exact coordinates.
+7. NO SECRET EVIDENCE: The evidence/basis fields must obey the same privacy rules;
+   never preserve a secret merely because it appeared as evidence.
+
+Return only the JSON shape requested by the underlying profile task.
+"""
+
+QUALITY_MAX_PROFILE_ITEMS = 30
+QUALITY_MAX_PROFILE_SERIALIZED_CHARS = 28_000
+QUALITY_FIELD_LIMITS: dict[str, int] = {
+    "category": 80,
+    "trait": 80,
+    "description": 600,
+    "evidence": 350,
+    "basis": 350,
+}
+
+_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", re.IGNORECASE),
+    re.compile(
+        r"\b(?:gsk_[A-Za-z0-9]{16,}|sk-[A-Za-z0-9_-]{16,}|"
+        r"ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
+        r"AIza[0-9A-Za-z_-]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})\b"
+    ),
+    re.compile(
+        r"(?i)(?:password|passwd|api[ _-]?key|access[ _-]?token|"
+        r"refresh[ _-]?token|client[ _-]?secret|密码|口令|密钥|令牌)"
+        r"\s*(?:=|:|：|is|为|是)?\s*[`'\"\[]?"
+        r"[A-Za-z0-9_./+=-]{8,}"
+    ),
+)
+
+_CJK_CONNECTOR_ARTIFACT = re.compile(
+    r"[\u3400-\u9fff]\s+(?:and|of)\s+[\u3400-\u9fff]",
+    re.IGNORECASE,
+)
+
+_TRANSIENT_TASK_CATEGORY = re.compile(
+    r"(?:当前|近期|最近|临时).{0,8}(?:任务|目标|进展|项目)|"
+    r"(?:任务与目标|项目进展|待办|下一步|todo)",
+    re.IGNORECASE,
+)
+_TRANSIENT_TASK_DESCRIPTION = re.compile(
+    r"^(?:当前|近期|最近|临时).{0,16}(?:任务|目标|项目|进展)"
+    r"(?:包括|是|为|有|[:：])",
+    re.IGNORECASE,
+)
+
 _writer: ProfileWriter | None = None
 _reader: ProfileReader | None = None
 
 
 class BoundedProfileLLMClient:
-    """Wrapper around LLMClient that strictly enforces prompt character limit."""
+    """Profile-only LLM wrapper enforcing prompt budget and output quality."""
 
     def __init__(
         self,
@@ -70,10 +147,11 @@ class BoundedProfileLLMClient:
         self._max_prompt_chars = max_prompt_chars
 
     async def chat(self, messages: Sequence[Any], **kwargs: Any) -> Any:
-        if messages:
-            content = getattr(messages[0], "content", None)
-            if content is None and isinstance(messages[0], dict):
-                content = messages[0].get("content", "")
+        guarded_messages = _guard_profile_messages(messages)
+        if guarded_messages:
+            content = getattr(guarded_messages[0], "content", None)
+            if content is None and isinstance(guarded_messages[0], dict):
+                content = guarded_messages[0].get("content", "")
             content_len = len(str(content or ""))
             if content_len > self._max_prompt_chars:
                 logger.error(
@@ -86,7 +164,230 @@ class BoundedProfileLLMClient:
                     f"exceeds hard budget ({self._max_prompt_chars} chars). "
                     "Fail closed without calling provider."
                 )
-        return await self._delegate.chat(messages, **kwargs)
+        response = await self._delegate.chat(guarded_messages, **kwargs)
+        response_text = str(getattr(response, "content", "") or "")
+        _assert_profile_response_quality(response_text)
+        return response
+
+
+def _with_quality_policy(prompt: str) -> str:
+    if PROFILE_QUALITY_POLICY_MARKER in prompt:
+        return prompt
+    return f"{PROFILE_QUALITY_POLICY}\n\n{prompt}"
+
+
+def _replace_message_content(message: Any, content: str) -> Any:
+    if isinstance(message, dict):
+        updated = dict(message)
+        updated["content"] = content
+        return updated
+    model_copy = getattr(message, "model_copy", None)
+    if callable(model_copy):
+        return model_copy(update={"content": content})
+    if dataclasses.is_dataclass(message):
+        return dataclasses.replace(message, content=content)
+    raise TypeError(f"Unsupported Profile LLM message type: {type(message).__name__}")
+
+
+def _guard_profile_messages(messages: Sequence[Any]) -> list[Any]:
+    guarded = list(messages)
+    if not guarded:
+        return guarded
+    first = guarded[0]
+    content = getattr(first, "content", None)
+    if content is None and isinstance(first, dict):
+        content = first.get("content", "")
+    guarded[0] = _replace_message_content(
+        first, _with_quality_policy(str(content or ""))
+    )
+    return guarded
+
+
+def _decode_first_json_object(text: str) -> dict[str, Any]:
+    start = text.find("{")
+    if start < 0:
+        raise ValueError("Profile LLM response did not contain a JSON object")
+    try:
+        value, _ = json.JSONDecoder().raw_decode(text[start:])
+    except json.JSONDecodeError as exc:
+        raise ValueError("Profile LLM response did not contain valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ValueError("Profile LLM response JSON root must be an object")
+    return value
+
+
+def _contains_secret_value(text: str) -> bool:
+    return any(pattern.search(text) is not None for pattern in _SECRET_PATTERNS)
+
+
+def _validate_quality_value(value: Any, *, key: str | None = None) -> None:
+    if isinstance(value, dict):
+        for child_key, child_value in value.items():
+            _validate_quality_value(child_value, key=str(child_key))
+        return
+    if isinstance(value, list):
+        for child in value:
+            _validate_quality_value(child, key=key)
+        return
+    if not isinstance(value, str):
+        return
+
+    if _contains_secret_value(value):
+        raise ValueError("Profile quality guard rejected credential-like content")
+    if key in QUALITY_FIELD_LIMITS and len(value) > QUALITY_FIELD_LIMITS[key]:
+        raise ValueError(
+            f"Profile quality guard rejected oversized {key} field "
+            f"({len(value)} > {QUALITY_FIELD_LIMITS[key]} chars)"
+        )
+    if "\\\\\\\\" in value:
+        raise ValueError("Profile quality guard rejected repeated path escaping")
+
+
+def _assert_profile_response_quality(text: str) -> None:
+    data = _decode_first_json_object(text)
+    serialized = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    if _contains_secret_value(serialized):
+        raise ValueError("Profile quality guard rejected credential-like content")
+
+
+def _profile_payload(profile: AlgoProfile) -> dict[str, Any]:
+    return {
+        "explicit_info": list(getattr(profile, "explicit_info", []) or []),
+        "implicit_traits": list(getattr(profile, "implicit_traits", []) or []),
+    }
+
+
+def profile_quality_violations(profile: AlgoProfile) -> list[str]:
+    payload = _profile_payload(profile)
+    violations: list[str] = []
+    explicit = payload["explicit_info"]
+    implicit = payload["implicit_traits"]
+    if len(explicit) + len(implicit) > QUALITY_MAX_PROFILE_ITEMS:
+        violations.append("too_many_items")
+
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if len(serialized) > QUALITY_MAX_PROFILE_SERIALIZED_CHARS:
+        violations.append("profile_too_large")
+    if _contains_secret_value(serialized):
+        violations.append("credential_like_content")
+    if "\\\\\\\\" in serialized:
+        violations.append("repeated_path_escaping")
+    if _CJK_CONNECTOR_ARTIFACT.search(serialized):
+        violations.append("mixed_language_connector_artifact")
+
+    for item in explicit:
+        if not isinstance(item, dict):
+            continue
+        category = str(item.get("category", "") or "")
+        description = str(item.get("description", "") or "")
+        if _TRANSIENT_TASK_CATEGORY.search(
+            category
+        ) or _TRANSIENT_TASK_DESCRIPTION.search(description):
+            violations.append("transient_task_ledger")
+            break
+
+    try:
+        _validate_quality_value(payload)
+    except ValueError as exc:
+        violations.append(str(exc))
+    return list(dict.fromkeys(violations))
+
+
+def _build_profile_summary(
+    explicit_info: Sequence[Any], implicit_traits: Sequence[Any]
+) -> str:
+    for item in list(explicit_info) + list(implicit_traits):
+        if not isinstance(item, dict):
+            continue
+        description = item.get("description") or item.get("trait")
+        if isinstance(description, str) and description.strip():
+            return description.strip()
+    return "(no summary)"
+
+
+async def rewrite_profile_for_quality(
+    profile: AlgoProfile,
+    llm: Any,
+    *,
+    force: bool = False,
+) -> AlgoProfile:
+    """Use the Profile LLM to compact/sanitize an existing profile when needed."""
+    violations = profile_quality_violations(profile)
+    if not force and not violations:
+        return profile
+
+    source_profile = profile
+    current_violations = violations
+    original_violations = list(violations)
+    last_remaining: list[str] = []
+
+    for attempt in range(1, 4):
+        payload = _profile_payload(source_profile)
+        current_profile = json.dumps(payload, ensure_ascii=False, indent=2)
+        violation_note = ", ".join(current_violations) or "forced_quality_rewrite"
+        prompt = f"""Repair the existing user profile below under the quality policy.
+This is a rewrite, not an extraction of new facts. Preserve durable high-signal
+meaning, merge duplicates, remove transient/task-ledger detail, remove all
+credential/authentication material, normalize language and path escaping, and
+return at most {QUALITY_MAX_PROFILE_ITEMS} total items.
+
+Violations that MUST be fixed on this pass: {violation_note}
+If mixed_language_connector_artifact is listed, replace stray English grammar
+connectors such as "and" and "of" with natural wording in the profile language.
+If transient_task_ledger is listed, remove categories that describe current tasks,
+project progress, TODOs, or next steps. Keep only genuinely durable preferences,
+skills, recurring workflows, or long-term goals, merged into stable categories.
+
+Return exactly one JSON object with only these top-level keys:
+{{"explicit_info": [...], "implicit_traits": [...]}}
+
+CURRENT_PROFILE_JSON:
+{current_profile}
+"""
+        response = await llm.chat(
+            messages=[LLMChatMessage(role="user", content=prompt)]
+        )
+        data = _decode_first_json_object(str(response.content))
+        explicit = data.get("explicit_info")
+        implicit = data.get("implicit_traits")
+        if not isinstance(explicit, list) or not isinstance(implicit, list):
+            raise ValueError(
+                "Profile quality rewrite missing explicit_info/implicit_traits"
+            )
+
+        rewritten = AlgoProfile.model_validate(
+            {
+                "owner_id": profile.owner_id,
+                "summary": _build_profile_summary(explicit, implicit),
+                "timestamp": profile.timestamp,
+                "explicit_info": explicit,
+                "implicit_traits": implicit,
+            }
+        )
+        rewritten.profile_watermark_memcell_ids = list(
+            getattr(profile, "profile_watermark_memcell_ids", []) or []
+        )
+        remaining = profile_quality_violations(rewritten)
+        if not remaining:
+            logger.info(
+                "profile_quality_rewritten",
+                previous_violations=original_violations,
+                rewrite_attempt=attempt,
+                item_count=len(explicit) + len(implicit),
+                serialized_chars=len(
+                    json.dumps(_profile_payload(rewritten), ensure_ascii=False)
+                ),
+            )
+            return rewritten
+
+        source_profile = rewritten
+        current_violations = remaining
+        last_remaining = remaining
+
+    raise ValueError(
+        "Profile quality rewrite still violates guard after 3 attempts: "
+        + ", ".join(last_remaining)
+    )
 
 
 def _get_writer() -> ProfileWriter:
@@ -160,19 +461,21 @@ def render_full_prompt(
     """Render the exact prompt that ProfileExtractor passes to LLM."""
     conversation_text = _render_conversation(memcells)
     if old_profile is None:
-        return render_prompt(
+        rendered = render_prompt(
             PROFILE_INITIAL_EXTRACTION_PROMPT,
             None,
             conversation_text=conversation_text,
         )
+        return _with_quality_policy(rendered)
     else:
         current_profile_text = _render_profile_for_update(old_profile)
-        return render_prompt(
+        rendered = render_prompt(
             PROFILE_UPDATE_PROMPT,
             None,
             current_profile=current_profile_text,
             conversations=conversation_text,
         )
+        return _with_quality_policy(rendered)
 
 
 def split_memcell_losslessly(
@@ -439,6 +742,12 @@ async def _persist_profile(
     project_id: str,
 ) -> None:
     """Persist updated profile frontmatter and summary markdown to disk."""
+    violations = profile_quality_violations(profile)
+    if violations:
+        raise ValueError(
+            "Refusing to persist Profile with quality violations: "
+            + ", ".join(violations)
+        )
     writer = _get_writer()
     frontmatter = _to_frontmatter(
         profile,
@@ -691,6 +1000,8 @@ async def extract_user_profile(
                 sender_id=owner_id,
                 old_profile=current_profile,
             )
+
+            new_profile = await rewrite_profile_for_quality(new_profile, bounded_llm)
 
             current_profile = new_profile
 

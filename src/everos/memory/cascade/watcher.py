@@ -14,11 +14,7 @@ file content — that's the worker's job after :meth:`claim_one`.
 from __future__ import annotations
 
 import asyncio
-import threading
-from collections.abc import Callable
-from contextlib import suppress
 from pathlib import Path
-from typing import Any
 
 from watchdog.events import FileMovedEvent, FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
@@ -50,12 +46,6 @@ class CascadeWatcher:
         self._loop = loop
         self._observer = Observer()
         self._handler = _Handler(memory_root, loop)
-        self._root_handler = _RootHandler(
-            on_add=self._schedule_app_root,
-            on_remove=self._forget_app_root,
-        )
-        self._watch_lock = threading.Lock()
-        self._app_watches: dict[Path, Any] = {}
         self._started = False
 
     def start(self) -> None:
@@ -64,17 +54,11 @@ class CascadeWatcher:
         # The memory root is created lazily by other layers; watchdog
         # rejects non-existent paths so we ensure it exists here.
         self._memory_root.ensure()
-        # Watch only direct children at the memory root. New app directories
-        # get their own recursive watch, while hidden .index/LanceDB trees
-        # never consume an inotify watch.
-        self._observer.schedule(
-            self._root_handler,
-            str(self._memory_root.root),
-            recursive=False,
-        )
         watch_roots = _watch_roots(self._memory_root.root)
         for watch_root in watch_roots:
-            self._schedule_app_root(watch_root, catch_up=False)
+            self._observer.schedule(
+                self._handler, str(watch_root), recursive=True
+            )
         self._observer.start()
         self._started = True
         logger.info(
@@ -90,49 +74,6 @@ class CascadeWatcher:
         self._observer.join(timeout=5)
         self._started = False
         logger.info("cascade_watcher_stopped")
-
-    def _schedule_app_root(
-        self,
-        raw_path: str | Path,
-        *,
-        catch_up: bool = True,
-    ) -> None:
-        """Recursively watch one direct app directory and close the create race."""
-
-        path = Path(raw_path).resolve()
-        if not _is_app_root(self._memory_root.root, path) or not path.is_dir():
-            return
-        with self._watch_lock:
-            if path in self._app_watches:
-                return
-            try:
-                watch = self._observer.schedule(
-                    self._handler,
-                    str(path),
-                    recursive=True,
-                )
-            except OSError:
-                # The directory may have been moved/deleted between the root
-                # event and schedule(). The periodic scanner remains a
-                # correctness fallback.
-                return
-            self._app_watches[path] = watch
-        if catch_up:
-            # Files can be created between mkdir(app) and schedule(). The
-            # recursive watch is active first; this scan repairs that window.
-            self._handler.enqueue_existing_tree(path)
-
-    def _forget_app_root(self, raw_path: str | Path) -> None:
-        """Drop bookkeeping when a direct app directory leaves the root."""
-
-        path = Path(raw_path).resolve()
-        if not _is_app_root(self._memory_root.root, path):
-            return
-        with self._watch_lock:
-            watch = self._app_watches.pop(path, None)
-        if watch is not None:
-            with suppress(KeyError):
-                self._observer.unschedule(watch)
 
 
 class _Handler(FileSystemEventHandler):
@@ -180,17 +121,6 @@ class _Handler(FileSystemEventHandler):
         if isinstance(event, FileMovedEvent):
             self._enqueue(event.dest_path, "added")
 
-    def enqueue_existing_tree(self, root: Path) -> None:
-        """Enqueue markdown already present when a new app watch is attached."""
-
-        try:
-            paths = sorted(root.rglob("*.md"))
-        except OSError:
-            return
-        for path in paths:
-            if path.is_file():
-                self._enqueue(str(path), "added")
-
     def _enqueue(self, raw_path: str, change_type: str) -> None:
         rel = _relative_to_root(self._memory_root.root, raw_path)
         if rel is None:
@@ -203,34 +133,6 @@ class _Handler(FileSystemEventHandler):
             _enqueue_async(spec, rel, change_type, mtime),
             self._loop,
         )
-
-
-class _RootHandler(FileSystemEventHandler):
-    """Maintain recursive watches for direct app directories only."""
-
-    def __init__(
-        self,
-        *,
-        on_add: Callable[[str], None],
-        on_remove: Callable[[str], None],
-    ) -> None:
-        self._on_add = on_add
-        self._on_remove = on_remove
-
-    def on_created(self, event: FileSystemEvent) -> None:
-        if event.is_directory:
-            self._on_add(event.src_path)
-
-    def on_deleted(self, event: FileSystemEvent) -> None:
-        if event.is_directory:
-            self._on_remove(event.src_path)
-
-    def on_moved(self, event: FileSystemEvent) -> None:
-        if not event.is_directory:
-            return
-        self._on_remove(event.src_path)
-        if isinstance(event, FileMovedEvent):
-            self._on_add(event.dest_path)
 
 
 async def _enqueue_async(
@@ -278,9 +180,10 @@ def _safe_mtime(raw: str) -> float:
 def _watch_roots(root: Path) -> list[Path]:
     """Return app roots that may contain memory markdown.
 
-    Never recursively watch the hidden .index storage tree: LanceDB can create
-    hundreds of thousands of UUID directories and exhaust Linux inotify before
-    the service starts. A shallow root watch adds new app roots dynamically.
+    Never recursively watch the hidden .index storage tree: LanceDB can
+    create hundreds of thousands of UUID directories and exhaust Linux
+    inotify before the service starts. The periodic scanner is the fallback
+    for a brand-new app directory until the next process start.
     """
     ignored = {"lancedb"}
     try:
@@ -291,25 +194,9 @@ def _watch_roots(root: Path) -> list[Path]:
         (
             child
             for child in children
-            if child.is_dir() and _is_app_root(root, child, ignored=ignored)
+            if child.is_dir()
+            and not child.name.startswith(".")
+            and child.name not in ignored
         ),
         key=lambda path: path.name,
-    )
-
-
-def _is_app_root(
-    root: Path,
-    candidate: Path,
-    *,
-    ignored: set[str] | None = None,
-) -> bool:
-    """Return whether ``candidate`` is an allowed direct app directory."""
-
-    ignored = ignored or {"lancedb"}
-    root_resolved = root.resolve()
-    candidate_resolved = candidate.resolve()
-    return (
-        candidate_resolved.parent == root_resolved
-        and not candidate_resolved.name.startswith(".")
-        and candidate_resolved.name not in ignored
     )

@@ -75,6 +75,7 @@ class AgyCLIProvider:
         *,
         executable: str = "agy",
         workdir: str | Path = "~/.local/share/everos/agy-worker",
+        homes: list[str | Path] | None = None,
         agent: str = "everos-text",
         model: str | None = None,
         timeout_seconds: float = 300.0,
@@ -83,10 +84,25 @@ class AgyCLIProvider:
         self._executable = executable
         self._workdir = Path(workdir).expanduser()
         self._workdir.mkdir(parents=True, exist_ok=True)
+        self._homes = tuple(Path(home).expanduser() for home in (homes or []))
+        if len(set(self._homes)) != len(self._homes):
+            raise ValueError("agy account homes must be unique")
+        self._next_home_index = 0
         self._agent = agent
         self._model = model
         self._timeout_seconds = timeout_seconds
         self._semaphore = asyncio.Semaphore(max_concurrency)
+
+    def _candidate_homes(self) -> tuple[Path | None, ...]:
+        """Return round-robin primary HOME followed by failover HOMEs."""
+        if not self._homes:
+            return (None,)
+        start = self._next_home_index
+        self._next_home_index = (start + 1) % len(self._homes)
+        return tuple(
+            self._homes[(start + offset) % len(self._homes)]
+            for offset in range(len(self._homes))
+        )
 
     @staticmethod
     def _serialize_messages(messages: list[ChatMessage]) -> str:
@@ -165,7 +181,13 @@ class AgyCLIProvider:
         with suppress(asyncio.CancelledError, Exception):
             await communicate_task
 
-    async def _run(self, command: list[str], prompt: str) -> tuple[int, bytes]:
+    async def _run(
+        self,
+        command: list[str],
+        prompt: str,
+        *,
+        home: Path | None = None,
+    ) -> tuple[int, bytes]:
         process: asyncio.subprocess.Process | None = None
         communicate_task: asyncio.Task[tuple[None, None]] | None = None
         with (
@@ -173,12 +195,17 @@ class AgyCLIProvider:
             tempfile.TemporaryFile() as stderr_file,
         ):
             try:
+                process_env = None
+                if home is not None:
+                    process_env = os.environ.copy()
+                    process_env["HOME"] = str(home)
                 process = await asyncio.create_subprocess_exec(
                     *command,
                     stdin=asyncio.subprocess.PIPE,
                     stdout=stdout_file,
                     stderr=stderr_file,
                     cwd=str(self._workdir),
+                    env=process_env,
                 )
                 communicate_task = asyncio.create_task(
                     process.communicate(input=prompt.encode("utf-8"))
@@ -251,9 +278,14 @@ class AgyCLIProvider:
         prompt = self._build_prompt(messages, response_format)
         effective_model = model or self._model
         async with self._semaphore:
-            return_code, stdout = await self._run(
-                self._command(effective_model), prompt
-            )
+            return_code = 1
+            stdout = b""
+            for home in self._candidate_homes():
+                return_code, stdout = await self._run(
+                    self._command(effective_model), prompt, home=home
+                )
+                if return_code == 0:
+                    break
 
         if return_code != 0:
             raise LLMError(f"agy CLI exited with status {return_code}")

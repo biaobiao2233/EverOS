@@ -41,6 +41,7 @@ from everos.memory.strategies.extract_user_profile import (
     plan_next_step,
     prepare_pending_items,
     render_full_prompt,
+    rewrite_profile_for_quality,
 )
 
 app = typer.Typer(
@@ -119,6 +120,76 @@ async def _readonly_runtime():  # type: ignore[no-untyped-def]
         await ro_engine.dispose()
         sm._engine = old_engine
         sm._session_factory = old_sf
+
+
+@app.command("clean")
+def clean(
+    owner_id: Annotated[
+        str,
+        typer.Option("--owner-id", "-o", help="Owner ID whose profile to clean."),
+    ],
+    app_id: Annotated[
+        str,
+        typer.Option("--app-id", "-a", help="App ID scope partition."),
+    ],
+    project_id: Annotated[
+        str,
+        typer.Option("--project-id", "-p", help="Project ID scope partition."),
+    ],
+) -> None:
+    """Offline one-shot quality rewrite of the Profile at the same watermark."""
+
+    async def _run() -> None:
+        if is_everos_service_active():
+            typer.echo(
+                "Error: EverOS server is currently active; "
+                "stop it before profile clean.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+        memory_root = MemoryRoot.default()
+        partition = f"{app_id}:{project_id}:{owner_id}"
+        try:
+            async with (
+                memory_root_lock(memory_root, blocking=False),
+                get_partition_lock("extract_user_profile", partition),
+            ):
+                reader = ProfileReader(root=memory_root)
+                existing = await reader.read(
+                    owner_id,
+                    schema=UserProfileFrontmatter,
+                    app_id=app_id,
+                    project_id=project_id,
+                )
+                if not existing:
+                    typer.echo("No existing Profile found to clean.")
+                    return
+
+                original = _to_algo_profile(existing[0])
+                bounded_llm = BoundedProfileLLMClient(
+                    get_llm_client(), max_prompt_chars=DEFAULT_MAX_PROMPT_CHARS
+                )
+                cleaned = await rewrite_profile_for_quality(
+                    original, bounded_llm, force=True
+                )
+                await _persist_profile(
+                    cleaned,
+                    owner_id=owner_id,
+                    app_id=app_id,
+                    project_id=project_id,
+                )
+                typer.echo(
+                    "Profile quality clean complete at unchanged watermark "
+                    f"{cleaned.timestamp}."
+                )
+        except LockError:
+            typer.echo(
+                "Error: another process holds the EverOS memory-root lock.", err=True
+            )
+            raise typer.Exit(code=1) from None
+
+    asyncio.run(_run())
 
 
 @app.command("status")
@@ -258,12 +329,28 @@ def recover(
             help="Max total prompt character budget per batch.",
         ),
     ] = DEFAULT_MAX_PROMPT_CHARS,
+    max_checkpoints: Annotated[
+        int,
+        typer.Option(
+            "--max-checkpoints",
+            help=(
+                "Stop after this many successful profile checkpoint writes. "
+                "Use 0 for unlimited recovery."
+            ),
+        ),
+    ] = 0,
 ) -> None:
     """Recover pending MemCells into user profile safely."""
     if max_prompt_chars > DEFAULT_MAX_PROMPT_CHARS:
         typer.echo(
             f"Error: --max-prompt-chars ({max_prompt_chars}) exceeds hard safety limit "
             f"of {DEFAULT_MAX_PROMPT_CHARS}.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    if max_checkpoints < 0:
+        typer.echo(
+            "Error: --max-checkpoints must be 0 (unlimited) or a positive integer.",
             err=True,
         )
         raise typer.Exit(code=1)
@@ -457,6 +544,7 @@ def recover(
                 current_watermark = last_profile_ts
                 current_watermark_ids = list(current_cursor_ids)
                 batch_idx = 1
+                checkpoints_written = 0
 
                 while pending_items:
                     batch, pending_items = plan_next_step(
@@ -477,6 +565,10 @@ def recover(
                         batch.memcells,
                         sender_id=owner_id,
                         old_profile=current_profile,
+                    )
+
+                    new_profile = await rewrite_profile_for_quality(
+                        new_profile, bounded_llm
                     )
 
                     current_profile = new_profile
@@ -507,11 +599,23 @@ def recover(
                         )
 
                         current_watermark = new_watermark
+                        checkpoints_written += 1
                         typer.echo(
                             f"  [Batch {batch_idx}] Done. "
                             f"Watermark advanced to {new_watermark} "
                             f"(cursor items: {len(current_watermark_ids)})."
                         )
+
+                        if (
+                            max_checkpoints > 0
+                            and checkpoints_written >= max_checkpoints
+                        ):
+                            typer.echo(
+                                "Recovery stopped after "
+                                f"{checkpoints_written} checkpoint(s) as requested. "
+                                f"Current watermark: {current_watermark}."
+                            )
+                            return
                     else:
                         typer.echo(
                             f"  [Batch {batch_idx}] Done sub-chunk. "
