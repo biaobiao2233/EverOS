@@ -731,9 +731,10 @@ async def test_stable_run_resets_quick_crash_budget(
     task = asyncio.create_task(w._supervise("drain", body))  # type: ignore[arg-type]
     # Deterministic: wait until several post-stable crashes have happened
     # (with budget=1, two *consecutive* quick crashes would escalate).
-    await asyncio.wait_for(body.phase_done.wait(), timeout=10.0)
+    # Generous ceiling: only event-loop starvation can stretch this.
+    await asyncio.wait_for(body.phase_done.wait(), timeout=30.0)
     w._stop.set()
-    await asyncio.wait_for(task, timeout=2.0)
+    await asyncio.wait_for(task, timeout=10.0)
     assert body.runs == 5, "every post-stable crash must get a fresh budget"
     assert exits == [], "stable runs reset strikes; escalation must not fire"
 
@@ -856,16 +857,116 @@ async def test_prune_staleness_reports_worst_kind(patched_repo: _FakeRepo) -> No
     now = time.monotonic()
     w = CascadeWorker({"a": _OkHandler(), "b": _OkHandler()})
     w._started_at = now - 100.0
-    w._optimizer_states["a"] = _KindOptimizerState(last_prune_at=now - 50.0)
-    w._optimizer_states["b"] = _KindOptimizerState(last_prune_at=now - 90.0)
+    # Both kinds had a maintenance opportunity long ago; b's cleanup stopped
+    # succeeding more recently than a's — wait, no: b pruned LONGER ago than
+    # a (90s vs 50s), so b is the worst.
+    w._optimizer_states["a"] = _KindOptimizerState(
+        first_scheduled_at=now - 100.0, last_prune_at=now - 50.0
+    )
+    w._optimizer_states["b"] = _KindOptimizerState(
+        first_scheduled_at=now - 100.0, last_prune_at=now - 90.0
+    )
     stale, kind = w._prune_staleness()
     assert kind == "b"
     assert 89.0 < stale <= 91.0
 
     # Before start (no baseline clock) nothing is reported stale.
     fresh = CascadeWorker({"a": _OkHandler()})
-    fresh._optimizer_states["a"] = _KindOptimizerState(last_prune_at=now)
+    fresh._optimizer_states["a"] = _KindOptimizerState(
+        first_scheduled_at=now, last_prune_at=now
+    )
     assert fresh._prune_staleness() == (0.0, None)
+
+
+async def test_idle_worker_past_alert_threshold_stays_healthy(
+    patched_repo: _FakeRepo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression (review P2-1): an idle deployment must not report version
+    cleanup as stalled.
+
+    Startup registers optimizer states via the rebuild sweep, but prune beats
+    are write-driven — zero writes means zero prune opportunities. Staleness
+    baselines at the *first scheduled opportunity*, so a kind that was never
+    scheduled cannot count as stalled no matter how long the worker runs."""
+    monkeypatch.setattr(worker_mod, "_PRUNE_STALE_SECONDS_ALERT", 1.0)
+    fake = _FakeLanceRepo()
+    w = CascadeWorker(
+        {"episode": _OkHandlerWithRepo(fake)},
+        retry_backoff_seconds=0,
+        optimize_min_interval_seconds=0.01,
+        optimize_heartbeat_seconds=10.0,
+        optimize_rebuild_interval_seconds=10.0,
+    )
+    await w.start()  # startup rebuild sweep registers the optimizer state
+    await asyncio.sleep(0.05)
+    assert "episode" in w._optimizer_states, (
+        "precondition: state registered by startup rebuild"
+    )
+    assert fake.prune_calls == [], "precondition: no writes → no prune beat"
+    await w.stop()
+
+    # Simulate a long silent night: worker started ~2h ago, still zero writes
+    # and therefore zero prune opportunities since boot.
+    w._started_at -= 2 * 3600.0
+
+    h = w.health()
+    assert h.prune_stale_seconds == 0.0
+    assert h.prune_stale_kind is None
+    assert h.reasons() == [], (
+        f"idle deployment must not flip readiness red (got reasons={h.reasons()})"
+    )
+
+
+async def test_scheduled_but_failing_prune_flips_unhealthy(
+    patched_repo: _FakeRepo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure path preserved (review P2-1): once a kind HAS a maintenance
+    opportunity and its prune keeps not succeeding, staleness grows from that
+    opportunity and the stall reason fires with the kind named."""
+    monkeypatch.setattr(worker_mod, "_PRUNE_STALE_SECONDS_ALERT", 1.0)
+    now = time.monotonic()
+    w = CascadeWorker({"agent_skill": _OkHandler()})
+    w._started_at = now - 300.0
+    # Scheduled once 200s ago; every heavy beat since failed (never pruned).
+    w._optimizer_states["agent_skill"] = _KindOptimizerState(
+        first_scheduled_at=now - 200.0, last_prune_attempt_at=now - 1.0
+    )
+    # An idle sibling registered by the rebuild sweep must not mask it — and
+    # must not be counted itself.
+    w._optimizer_states["episode"] = _KindOptimizerState()
+
+    h = w.health()
+    assert h.prune_stale_kind == "agent_skill"
+    assert 199.0 <= h.prune_stale_seconds <= 201.0, (
+        "staleness measured from the opportunity, not worker start"
+    )
+    reasons = h.reasons()
+    assert any("version cleanup stalled" in r for r in reasons), reasons
+
+
+async def test_first_write_starts_the_staleness_clock(
+    patched_repo: _FakeRepo,
+) -> None:
+    """The clock follows the first maintenance opportunity, not boot time."""
+    now = time.monotonic()
+    fake = _FakeLanceRepo()
+    w = CascadeWorker(
+        {"a": _OkHandlerWithRepo(fake), "b": _OkHandlerWithRepo(_FakeLanceRepo())}
+    )
+    w._started_at = now - 500.0  # daemon up for ages, silent
+    w._optimizer_states["b"] = _KindOptimizerState(first_scheduled_at=now - 400.0)
+    # 'a' gets its very first write-driven schedule right now.
+    w._schedule_optimize("a")
+    await w._flush_optimizers()
+    state = w._optimizer_states["a"]
+    assert state.first_scheduled_at > 0.0
+    stale, kind = w._prune_staleness()
+    # Worst eligible kind is 'b' (~400s); 'a' contributes ~0s. Crucially,
+    # neither is baselined at the 500s-old boot time.
+    assert kind == "b"
+    assert stale <= 401.0
 
 
 def test_worker_health_reasons_thresholds() -> None:

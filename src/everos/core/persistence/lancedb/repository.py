@@ -157,6 +157,14 @@ def _remove_empty_index_dirs(table_uri: str, *, min_age_seconds: float) -> int:
     expressed here. The two guarantees above are what make the sweep safe;
     the UUID check was redundant with them.
 
+    **When to remove this sweep** — lance-format/lance#8322 (merged
+    2026-08-06, not in any release as of lancedb 0.34.0 / lance 8.0.0 — the
+    merge sits ahead of v11.0.0-beta.2) makes lance's own cleanup remove the
+    directories it empties, under this same 7-day / ``delete_unverified``
+    policy. Once a release carrying it is pinned, delete this function and
+    its call site rather than keep a second implementation of upstream's
+    rule.
+
     Best-effort throughout: a directory that becomes non-empty, vanishes, or is
     unreadable between listing and ``rmdir`` is skipped, not an error.
     """
