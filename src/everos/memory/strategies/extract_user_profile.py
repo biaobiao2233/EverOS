@@ -528,6 +528,59 @@ def render_full_prompt(
         return _with_quality_policy(rendered)
 
 
+def _has_profile_owner(cell: AlgoMemCell, owner_id: str) -> bool:
+    """Return whether ``owner_id`` is a human speaker in this Profile-only cell."""
+    return any(
+        isinstance(item, ChatMessage)
+        and getattr(item, "role", None) == "user"
+        and getattr(item, "sender_id", None) == owner_id
+        for item in cell.items
+    )
+
+
+def _restore_profile_owner_after_split(
+    sub_cells: Sequence[AlgoMemCell],
+    *,
+    source_cell: AlgoMemCell,
+    owner_id: str | None,
+    display_name: str | None,
+) -> list[AlgoMemCell]:
+    """Preserve EverAlgo's sender-validation invariant after local splitting.
+
+    EverAlgo user-memory 0.3.2+ requires ``ProfileExtractor.sender_id`` to be a
+    ``role=user`` speaker in *every* extraction batch.  A valid multi-speaker
+    MemCell can lose that speaker when EverOS slices it only for prompt-budget
+    reasons.  In that narrow case add an ephemeral, empty owner anchor to the
+    derived sub-cell.  EverAlgo sees the attribution anchor for validation and
+    display-name resolution, while ``_render_conversation`` drops its empty
+    content so no synthetic claim reaches the model.
+
+    If the original source cell did not contain the owner, do nothing.  That
+    preserves EverAlgo's fail-loud protection for genuinely cross-owner/corrupt
+    cluster membership instead of masking it with a synthetic sender.
+    """
+    if not owner_id or not _has_profile_owner(source_cell, owner_id):
+        return list(sub_cells)
+
+    restored: list[AlgoMemCell] = []
+    for idx, sub_cell in enumerate(sub_cells):
+        if _has_profile_owner(sub_cell, owner_id):
+            restored.append(sub_cell)
+            continue
+        anchor = ChatMessage(
+            id=f"__everos_profile_owner_anchor_{idx}",
+            role="user",
+            content="",
+            timestamp=sub_cell.timestamp,
+            sender_id=owner_id,
+            sender_name=display_name,
+        )
+        restored.append(
+            AlgoMemCell(items=[anchor, *sub_cell.items], timestamp=sub_cell.timestamp)
+        )
+    return restored
+
+
 def split_memcell_losslessly(
     cell: AlgoMemCell,
     *,
@@ -645,6 +698,13 @@ def split_memcell_losslessly(
 
     if current_items:
         sub_cells.append(AlgoMemCell(items=current_items, timestamp=cell.timestamp))
+
+    sub_cells = _restore_profile_owner_after_split(
+        sub_cells,
+        source_cell=cell,
+        owner_id=owner_id,
+        display_name=display_name,
+    )
 
     # Final assertion on all generated sub-cells
     for sc in sub_cells:

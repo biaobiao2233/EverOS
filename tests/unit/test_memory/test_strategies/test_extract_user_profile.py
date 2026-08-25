@@ -181,6 +181,114 @@ async def test_budget_renderer_matches_algo_update_prompt_exactly() -> None:
 
 
 @pytest.mark.asyncio
+async def test_split_keeps_owner_validation_without_synthetic_prompt_content() -> None:
+    """Prompt-budget splits keep owner attribution without inventing evidence."""
+    cell = MemCell(
+        items=[
+            ChatMessage(
+                id="owner",
+                role="user",
+                content="OWNER_CONTEXT",
+                timestamp=1_700_000_010_000,
+                sender_id="u_alice",
+                sender_name="Alice",
+            ),
+            ChatMessage(
+                id="assistant-long",
+                role="assistant",
+                content="ASSISTANT_PAYLOAD_" * 3500,
+                timestamp=1_700_000_011_000,
+                sender_id="assistant",
+                sender_name="Assistant",
+            ),
+            ChatMessage(
+                id="other-user-long",
+                role="user",
+                content="OTHER_USER_PAYLOAD_" * 3500,
+                timestamp=1_700_000_012_000,
+                sender_id="u_bob",
+                sender_name="Bob",
+            ),
+        ],
+        timestamp=1_700_000_012_000,
+    )
+
+    sub_cells = split_memcell_losslessly(cell, owner_id="u_alice")
+
+    assert len(sub_cells) > 1
+    assert all(
+        any(
+            isinstance(item, ChatMessage)
+            and item.role == "user"
+            and item.sender_id == "u_alice"
+            for item in sub_cell.items
+        )
+        for sub_cell in sub_cells
+    )
+    anchors = [
+        item
+        for sub_cell in sub_cells
+        for item in sub_cell.items
+        if isinstance(item, ChatMessage)
+        and str(item.id).startswith("__everos_profile_owner_anchor_")
+    ]
+    assert anchors
+    assert all(anchor.content == "" for anchor in anchors)
+
+    fake = FakeLLM()
+    extractor = ProfileExtractor(llm=BoundedProfileLLMClient(fake))
+    for sub_cell in sub_cells:
+        await extractor.aextract([sub_cell], sender_id="u_alice")
+
+    combined_prompts = "".join(fake.captured_prompts)
+    assert combined_prompts.count("OWNER_CONTEXT") == 1
+    assert combined_prompts.count("Alice(user_id:u_alice):") == 1
+
+
+@pytest.mark.asyncio
+async def test_split_does_not_mask_genuinely_cross_owner_source_cell() -> None:
+    """A corrupt source cell still fails EverAlgo's sender-presence validation."""
+    cell = MemCell(
+        items=[
+            ChatMessage(
+                id="bob",
+                role="user",
+                content="BOB_ONLY_" * 5000,
+                timestamp=1_700_000_020_000,
+                sender_id="u_bob",
+                sender_name="Bob",
+            ),
+            ChatMessage(
+                id="assistant",
+                role="assistant",
+                content="ASSISTANT_ONLY_" * 5000,
+                timestamp=1_700_000_021_000,
+                sender_id="assistant",
+                sender_name="Assistant",
+            ),
+        ],
+        timestamp=1_700_000_021_000,
+    )
+
+    sub_cells = split_memcell_losslessly(cell, owner_id="u_alice")
+
+    assert len(sub_cells) > 1
+    assert all(
+        not any(
+            isinstance(item, ChatMessage)
+            and item.role == "user"
+            and item.sender_id == "u_alice"
+            for item in sub_cell.items
+        )
+        for sub_cell in sub_cells
+    )
+
+    extractor = ProfileExtractor(llm=BoundedProfileLLMClient(FakeLLM()))
+    with pytest.raises(ValueError, match="not a user speaker"):
+        await extractor.aextract([sub_cells[0]], sender_id="u_alice")
+
+
+@pytest.mark.asyncio
 async def test_r7_quality_policy_injected_and_secret_response_fails_closed() -> None:
     class SecretDelegate:
         def __init__(self) -> None:
