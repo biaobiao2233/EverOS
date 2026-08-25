@@ -491,7 +491,7 @@ async def test_p0_compaction_prompt_budget_exceeded_fails_closed(
                         "type": "explicit_info",
                         "data": {
                             "category": f"HugeCat_{i}",
-                            "description": "giant_trait_content_" * 150,
+                            "description": f"unique_{i}_" + "giant_trait_content_" * 150,
                         },
                     }
                     for i in range(15)
