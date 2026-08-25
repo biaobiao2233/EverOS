@@ -139,3 +139,96 @@ async def test_emit_episode_extracted_after_md_write() -> None:
     assert extracted[0].episode_text == "they said hello"
     assert extracted[0].episode_timestamp_ms == 1_700_000_000_000
     assert extracted[0].owner_id == "u1"
+
+
+@pytest.mark.asyncio
+async def test_episode_fanout_owners_are_user_speakers_in_source_memcell() -> None:
+    """Profile-cluster owners must originate from role=user speakers in the MemCell.
+
+    EverAlgo user-memory >=0.3.2 fails loud when ProfileExtractor.sender_id is
+    absent from the batch's human speakers.  Profile clusters are downstream of
+    EpisodeExtracted, so this fan-out rule is the invariant that makes that
+    validation safe for normal multi-speaker conversations.
+    """
+    engine = _CapturingEngine()
+    episode_writer = MagicMock()
+    eid = EntryId(prefix="ep", date=_dt.date(2026, 5, 17), seq=1)
+    episode_writer.append_entry_once = AsyncMock(
+        return_value=AppendOnceResult(
+            entries=(
+                AppendOnceEntry(
+                    entry_id=eid,
+                    marker_id=eid.format(),
+                    inline={"timestamp": "2023-11-14T22:13:20+00:00"},
+                    sections={"Content": "multi-speaker cell"},
+                ),
+            ),
+            created=True,
+        )
+    )
+    episode_writer.path_for = MagicMock(
+        return_value="users/example/episodes/episode-2026-05-17.md"
+    )
+    prompt_loader = MagicMock()
+    prompt_loader.load = MagicMock(return_value="<prompt>")
+    llm_client = MagicMock()
+    pipeline = UserMemoryPipeline(
+        episode_writer=episode_writer,
+        prompt_loader=prompt_loader,
+        llm_client=llm_client,
+        engine=engine,
+    )
+
+    cell = MemCell(
+        items=[
+            ChatMessage(
+                id="m1",
+                role="user",
+                content="first user",
+                timestamp=1_700_000_000_000,
+                sender_id="u1",
+            ),
+            ChatMessage(
+                id="m2",
+                role="assistant",
+                content="assistant turn",
+                timestamp=1_700_000_001_000,
+                sender_id="assistant",
+            ),
+            ChatMessage(
+                id="m3",
+                role="user",
+                content="second user",
+                timestamp=1_700_000_002_000,
+                sender_id="u2",
+            ),
+        ],
+        timestamp=1_700_000_002_000,
+    )
+    ingested = IngestResult(session_id="s1", messages=[])
+    algo_ep = AlgoEpisode(
+        owner_id=None,
+        summary="Multi-speaker exchange.",
+        episode="multi-speaker cell",
+        timestamp=1_700_000_002_000,
+    )
+
+    with patch.object(  # noqa: SLF001
+        pipeline._ep_ext, "aextract", new=AsyncMock(return_value=algo_ep)
+    ):
+        outcome = await pipeline.run(
+            ingested=ingested,
+            cells=[cell],
+            memcell_ids=["mc_multi"],
+            per_cell_all_senders=[["u1", "assistant", "u2"]],
+        )
+
+    assert outcome.status == "extracted"
+    extracted = [e for e in engine.emitted if isinstance(e, EpisodeExtracted)]
+    assert [e.owner_id for e in extracted] == ["u1", "u2"]
+    source_user_senders = {
+        item.sender_id
+        for item in cell.items
+        if isinstance(item, ChatMessage) and item.role == "user"
+    }
+    assert all(e.owner_id in source_user_senders for e in extracted)
