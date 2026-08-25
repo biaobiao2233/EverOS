@@ -544,9 +544,7 @@ def split_memcell_losslessly(
     If metadata overhead alone exceeds max_prompt_chars, fails closed with
     ValueError.
     """
-    display_name = (
-        _sender_display_name([cell], owner_id) if owner_id else None
-    )
+    display_name = _sender_display_name([cell], owner_id) if owner_id else None
 
     # 1. If the entire cell already fits within prompt budget, return as is
     if (

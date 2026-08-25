@@ -85,10 +85,7 @@ class FakeLLM:
                 ],
                 "implicit_traits": [{"trait": "analytical"}],
             }
-        elif (
-            "【Operations】" in content
-            or "=== explicit_info ===" in content
-        ):
+        elif "【Operations】" in content or "=== explicit_info ===" in content:
             resp = {
                 "operations": [
                     {
@@ -176,9 +173,7 @@ async def test_budget_renderer_matches_algo_update_prompt_exactly() -> None:
     )
     extractor = ProfileExtractor(llm=BoundedProfileLLMClient(fake))
 
-    await extractor.aextract(
-        [cell], sender_id="u_alice", old_profile=old_profile
-    )
+    await extractor.aextract([cell], sender_id="u_alice", old_profile=old_profile)
 
     assert fake.captured_prompts == [
         render_full_prompt([cell], old_profile, owner_id="u_alice")
@@ -567,7 +562,9 @@ async def test_p0_compaction_prompt_budget_exceeded_fails_closed(
                         "type": "explicit_info",
                         "data": {
                             "category": f"HugeCat_{i}",
-                            "description": f"unique_{i}_" + "giant_trait_content_" * 150,
+                            "description": (
+                                f"unique_{i}_" + "giant_trait_content_" * 150
+                            ),
                         },
                     }
                     for i in range(15)
