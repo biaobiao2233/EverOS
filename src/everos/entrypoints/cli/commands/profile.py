@@ -256,13 +256,14 @@ def status(
 
             current_profile = _to_algo_profile(existing[0]) if existing else None
             pending_items = prepare_pending_items(
-                valid_memcells, old_profile=current_profile
+                valid_memcells, old_profile=current_profile, owner_id=owner_id
             )
             est_batches = 0
             while pending_items:
                 batch, pending_items = plan_next_step(
                     pending_items,
                     current_profile,
+                    owner_id=owner_id,
                     max_prompt_chars=DEFAULT_MAX_PROMPT_CHARS,
                     max_batch_memcells=DEFAULT_MAX_BATCH_MEMCELLS,
                 )
@@ -394,7 +395,9 @@ def recover(
                 )
 
                 pending_items = prepare_pending_items(
-                    valid_memcells, old_profile=current_algo_profile
+                    valid_memcells,
+                    old_profile=current_algo_profile,
+                    owner_id=owner_id,
                 )
                 simulated_batches: list[tuple[int, int, int, int, int | None]] = []
 
@@ -402,11 +405,16 @@ def recover(
                     batch, pending_items = plan_next_step(
                         pending_items,
                         current_algo_profile,
+                        owner_id=owner_id,
                         max_prompt_chars=max_prompt_chars,
                         max_batch_memcells=batch_size,
                     )
                     p_chars = len(
-                        render_full_prompt(batch.memcells, current_algo_profile)
+                        render_full_prompt(
+                            batch.memcells,
+                            current_algo_profile,
+                            owner_id=owner_id,
+                        )
                     )
                     b_min_ts = min(mc.timestamp for mc in batch.memcells)
                     b_max_ts = max(mc.timestamp for mc in batch.memcells)
@@ -528,7 +536,9 @@ def recover(
                     _to_algo_profile(existing[0]) if existing else None
                 )
                 pending_items = prepare_pending_items(
-                    valid_memcells, old_profile=current_algo_profile
+                    valid_memcells,
+                    old_profile=current_algo_profile,
+                    owner_id=owner_id,
                 )
 
                 typer.echo(
@@ -550,11 +560,18 @@ def recover(
                     batch, pending_items = plan_next_step(
                         pending_items,
                         current_profile,
+                        owner_id=owner_id,
                         max_prompt_chars=max_prompt_chars,
                         max_batch_memcells=batch_size,
                     )
 
-                    p_chars = len(render_full_prompt(batch.memcells, current_profile))
+                    p_chars = len(
+                        render_full_prompt(
+                            batch.memcells,
+                            current_profile,
+                            owner_id=owner_id,
+                        )
+                    )
                     typer.echo(
                         f"  [Batch {batch_idx}] "
                         f"Processing {len(batch.memcells)} cells "

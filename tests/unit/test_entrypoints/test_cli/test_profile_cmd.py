@@ -150,6 +150,91 @@ def test_recover_dry_run_is_readonly_and_privacy_safe() -> None:
         assert "SECRET PRIVATE SUMMARY" not in result.stdout
 
 
+def test_profile_cli_planning_preserves_owner_contract() -> None:
+    """CLI planning must use the same owner-aware 0.7 render/split contract.
+
+    The runtime strategy passes ``owner_id`` so prompt-budget splits can retain
+    EverAlgo's sender-validation anchor.  Status and recovery are alternative
+    callers of the same helpers and must not silently fall back to the synthetic
+    budgeting placeholder introduced for direct helper tests.
+    """
+    existing_fm = UserProfileFrontmatter(
+        id="profile_user",
+        user_id="user",
+        summary="",
+        profile_timestamp_ms=1000,
+    )
+    mock_cell = _sample_memcell("mc_owner_contract", 1500, sender_id="user")
+
+    real_prepare = profile_mod.prepare_pending_items
+    real_plan = profile_mod.plan_next_step
+    real_render = profile_mod.render_full_prompt
+
+    with (
+        patch(
+            "everos.entrypoints.cli.commands.profile.ProfileReader"
+        ) as mock_reader_cls,
+        patch(
+            "everos.entrypoints.cli.commands.profile.cluster_repo"
+        ) as mock_cluster_repo,
+        patch(
+            "everos.entrypoints.cli.commands.profile.get_unprocessed_memcells_for_owner",
+            return_value=([("mc_owner_contract", mock_cell)], 0, 0),
+        ),
+        patch(
+            "everos.entrypoints.cli.commands.profile.prepare_pending_items",
+            wraps=real_prepare,
+        ) as prepare_spy,
+        patch(
+            "everos.entrypoints.cli.commands.profile.plan_next_step",
+            wraps=real_plan,
+        ) as plan_spy,
+        patch(
+            "everos.entrypoints.cli.commands.profile.render_full_prompt",
+            wraps=real_render,
+        ) as render_spy,
+    ):
+        mock_reader_cls.return_value.read = AsyncMock(return_value=[existing_fm])
+        mock_cluster_repo.list_for_owner = AsyncMock(return_value=[])
+
+        status_result = CliRunner().invoke(
+            profile_mod.app,
+            [
+                "status",
+                "--owner-id",
+                "user",
+                "--app-id",
+                "codex",
+                "--project-id",
+                "solo",
+            ],
+        )
+        assert status_result.exit_code == 0
+        assert prepare_spy.call_args.kwargs["owner_id"] == "user"
+        assert plan_spy.call_args.kwargs["owner_id"] == "user"
+
+        prepare_spy.reset_mock()
+        plan_spy.reset_mock()
+        render_spy.reset_mock()
+        dry_run_result = CliRunner().invoke(
+            profile_mod.app,
+            [
+                "recover",
+                "--owner-id",
+                "user",
+                "--app-id",
+                "codex",
+                "--project-id",
+                "solo",
+                "--dry-run",
+            ],
+        )
+        assert dry_run_result.exit_code == 0
+        assert prepare_spy.call_args.kwargs["owner_id"] == "user"
+        assert plan_spy.call_args.kwargs["owner_id"] == "user"
+        assert render_spy.call_args.kwargs["owner_id"] == "user"
+
+
 def test_recover_dry_run_real_sqlite_engine_and_immutability(
     tmp_path: Path,
 ) -> None:
