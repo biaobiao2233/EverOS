@@ -116,7 +116,10 @@ async def test_emit_episode_extracted_after_md_write() -> None:
         ],
     )
     algo_ep = AlgoEpisode(
-        owner_id="u1", episode="they said hello", timestamp=1_700_000_000_000
+        owner_id="u1",
+        summary="They said hello.",
+        episode="they said hello",
+        timestamp=1_700_000_000_000,
     )
     with patch.object(  # noqa: SLF001
         pipeline._ep_ext, "aextract", new=AsyncMock(return_value=algo_ep)

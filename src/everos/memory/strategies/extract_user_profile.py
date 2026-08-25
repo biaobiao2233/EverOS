@@ -20,6 +20,11 @@ from everalgo.types import (
     Profile as AlgoProfile,
 )
 from everalgo.user_memory import ProfileExtractor
+from everalgo.user_memory._language import (
+    EXISTING_PROFILE_LANGUAGE_RULE,
+    PROFILE_INIT_LANGUAGE_RULE,
+    build_language_rule,
+)
 from everalgo.user_memory.profile import (
     PROFILE_INITIAL_EXTRACTION_PROMPT,
     PROFILE_UPDATE_PROMPT,
@@ -457,14 +462,44 @@ def _to_frontmatter(
 def render_full_prompt(
     memcells: Sequence[AlgoMemCell],
     old_profile: AlgoProfile | None,
+    *,
+    owner_id: str | None = None,
 ) -> str:
-    """Render the exact prompt that ProfileExtractor passes to LLM."""
+    """Render the exact 0.6+ prompt that ProfileExtractor passes to LLM.
+
+    Budgeting must follow the algorithm's real rendering contract.  EverAlgo
+    0.3.2+ injects ``target_user`` and 0.5+ injects ``language_rule``; omitting
+    either here makes the local splitter underestimate what the bounded client
+    will actually receive.
+    """
+    resolved_owner = owner_id
+    if resolved_owner is None and old_profile is not None:
+        resolved_owner = str(getattr(old_profile, "owner_id", "") or "")
+    if not resolved_owner:
+        user_senders = {
+            str(getattr(item, "sender_id", "") or "")
+            for cell in memcells
+            for item in cell.items
+            if isinstance(item, ChatMessage) and getattr(item, "role", None) == "user"
+        }
+        user_senders.discard("")
+        if len(user_senders) == 1:
+            resolved_owner = next(iter(user_senders))
+    # Empty-conversation overhead probes cannot infer the sender. Production
+    # callers pass owner_id explicitly; the fallback keeps direct helper tests
+    # deterministic without understating the fixed placeholder overhead.
+    resolved_owner = resolved_owner or "__everos_profile_owner__"
+
     conversation_text = _render_conversation(memcells)
     if old_profile is None:
         rendered = render_prompt(
             PROFILE_INITIAL_EXTRACTION_PROMPT,
             None,
             conversation_text=conversation_text,
+            target_user=resolved_owner,
+            language_rule=build_language_rule(
+                None, fallback=PROFILE_INIT_LANGUAGE_RULE
+            ),
         )
         return _with_quality_policy(rendered)
     else:
@@ -474,6 +509,10 @@ def render_full_prompt(
             None,
             current_profile=current_profile_text,
             conversations=conversation_text,
+            target_user=resolved_owner,
+            language_rule=build_language_rule(
+                None, fallback=EXISTING_PROFILE_LANGUAGE_RULE
+            ),
         )
         return _with_quality_policy(rendered)
 
@@ -482,6 +521,7 @@ def split_memcell_losslessly(
     cell: AlgoMemCell,
     *,
     old_profile: AlgoProfile | None = None,
+    owner_id: str | None = None,
     max_prompt_chars: int = DEFAULT_MAX_PROMPT_CHARS,
 ) -> list[AlgoMemCell]:
     """Split a MemCell into sub-MemCells without dropping any message or text.
@@ -494,11 +534,13 @@ def split_memcell_losslessly(
     ValueError.
     """
     # 1. If the entire cell already fits within prompt budget, return as is
-    if len(render_full_prompt([cell], old_profile)) <= max_prompt_chars:
+    if len(render_full_prompt([cell], old_profile, owner_id=owner_id)) <= max_prompt_chars:
         return [cell]
 
     # Calculate prompt overhead without any conversation text
-    base_prompt_overhead = len(render_full_prompt([], old_profile))
+    base_prompt_overhead = len(
+        render_full_prompt([], old_profile, owner_id=owner_id)
+    )
     if base_prompt_overhead >= max_prompt_chars:
         raise ValueError(
             f"Prompt overhead with current profile ({base_prompt_overhead} chars) "
@@ -558,7 +600,10 @@ def split_memcell_losslessly(
         test_cell = AlgoMemCell(items=current_items + [item], timestamp=cell.timestamp)
         if (
             current_items
-            and len(render_full_prompt([test_cell], old_profile)) > max_prompt_chars
+            and len(
+                render_full_prompt([test_cell], old_profile, owner_id=owner_id)
+            )
+            > max_prompt_chars
         ):
             sub_cells.append(AlgoMemCell(items=current_items, timestamp=cell.timestamp))
             current_items = [item]
@@ -570,7 +615,7 @@ def split_memcell_losslessly(
 
     # Final assertion on all generated sub-cells
     for sc in sub_cells:
-        sc_len = len(render_full_prompt([sc], old_profile))
+        sc_len = len(render_full_prompt([sc], old_profile, owner_id=owner_id))
         if sc_len > max_prompt_chars:
             raise ValueError(
                 f"Generated sub-cell prompt length ({sc_len} chars) "
@@ -597,6 +642,7 @@ def prepare_pending_items(
     valid_items: Sequence[tuple[str, AlgoMemCell]],
     *,
     old_profile: AlgoProfile | None = None,
+    owner_id: str | None = None,
     max_prompt_chars: int = DEFAULT_MAX_PROMPT_CHARS,
 ) -> list[PendingItem]:
     """Tag each sub-cell with timestamp group membership and commit boundaries."""
@@ -616,7 +662,10 @@ def prepare_pending_items(
 
         for cell_idx, (stable_id, mc) in enumerate(group_cells):
             sub_cells = split_memcell_losslessly(
-                mc, old_profile=old_profile, max_prompt_chars=max_prompt_chars
+                mc,
+                old_profile=old_profile,
+                owner_id=owner_id,
+                max_prompt_chars=max_prompt_chars,
             )
             is_last_cell_in_group = cell_idx == (total_cells_in_group - 1)
             total_sub_cells = len(sub_cells)
@@ -635,6 +684,7 @@ def plan_next_step(
     pending_items: Sequence[PendingItem],
     current_profile: AlgoProfile | None,
     *,
+    owner_id: str | None = None,
     max_prompt_chars: int = DEFAULT_MAX_PROMPT_CHARS,
     max_batch_memcells: int = DEFAULT_MAX_BATCH_MEMCELLS,
 ) -> tuple[NextBatch, Sequence[PendingItem]]:
@@ -661,10 +711,14 @@ def plan_next_step(
     ) = pending_items[0]
 
     # Re-slice first cell if profile growth caused it to exceed budget
-    if len(render_full_prompt([first_mc], current_profile)) > max_prompt_chars:
+    if (
+        len(render_full_prompt([first_mc], current_profile, owner_id=owner_id))
+        > max_prompt_chars
+    ):
         sub_cells = split_memcell_losslessly(
             first_mc,
             old_profile=current_profile,
+            owner_id=owner_id,
             max_prompt_chars=max_prompt_chars,
         )
         if len(sub_cells) > 1:
@@ -697,7 +751,10 @@ def plan_next_step(
         _group_ids,
     ) in enumerate(pending_items[:max_batch_memcells]):
         test_batch = batch_cells + [mc]
-        if len(render_full_prompt(test_batch, current_profile)) <= max_prompt_chars:
+        if (
+            len(render_full_prompt(test_batch, current_profile, owner_id=owner_id))
+            <= max_prompt_chars
+        ):
             batch_cells.append(mc)
             consumed = idx + 1
         else:
@@ -971,7 +1028,7 @@ async def extract_user_profile(
             return
 
         pending_items = prepare_pending_items(
-            valid_memcells, old_profile=current_profile
+            valid_memcells, old_profile=current_profile, owner_id=owner_id
         )
         bounded_llm = BoundedProfileLLMClient(
             get_llm_client(), max_prompt_chars=DEFAULT_MAX_PROMPT_CHARS
@@ -985,6 +1042,7 @@ async def extract_user_profile(
             batch, pending_items = plan_next_step(
                 pending_items,
                 current_profile,
+                owner_id=owner_id,
                 max_prompt_chars=DEFAULT_MAX_PROMPT_CHARS,
                 max_batch_memcells=DEFAULT_MAX_BATCH_MEMCELLS,
             )

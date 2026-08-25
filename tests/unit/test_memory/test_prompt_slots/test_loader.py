@@ -54,6 +54,14 @@ def test_returns_template_when_enabled_and_non_empty(tmp_path: Path) -> None:
     assert loader.load("x") == "detect now"
 
 
+def test_shipped_episode_prompt_requires_summary() -> None:
+    """EverAlgo core>=0.5 requires Episode.summary; the enabled override must too."""
+    config_root = Path(__file__).parents[4] / "src" / "everos" / "config"
+    template = PromptLoader(config_root).load("episode_extract")
+    assert template is not None
+    assert '"summary"' in template
+
+
 def test_template_must_be_string(tmp_path: Path) -> None:
     """Non-string ``template`` (e.g. accidental int) is treated as None."""
     _write_slot(tmp_path, "x", "enabled: true\ntemplate: 42\n")

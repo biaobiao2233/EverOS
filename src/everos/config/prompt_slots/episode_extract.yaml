@@ -26,9 +26,13 @@ template: |
   6. Do not invent causality, motivation, dates, completion, or success. Resolve a
      relative date only when the reference time makes the resolution unambiguous.
   7. Keep the title specific and the content concise. Prefer one short paragraph.
+  8. Write a short summary that faithfully previews the content without adding any
+     claim, decision, outcome, or certainty not present in the content. Keep it under
+     50 words.
 
   Return only valid JSON with exactly these fields:
   {
     "title": "specific event title with date when supported",
+    "summary": "faithful preview under 50 words",
     "content": "objective concise narrative"
   }
