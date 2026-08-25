@@ -19,6 +19,7 @@ import pytest
 from everalgo.clustering import Cluster as AlgoCluster
 from everalgo.types import ChatMessage, MemCell
 from everalgo.types import Profile as AlgoProfile
+from everalgo.user_memory import ProfileExtractor
 
 from everos.core.persistence import MemoryRoot
 from everos.infra.ome.testing import FakeStrategyContext
@@ -35,6 +36,7 @@ from everos.memory.strategies.extract_user_profile import (
     _persist_profile,
     extract_user_profile,
     profile_quality_violations,
+    render_full_prompt,
     rewrite_profile_for_quality,
     split_memcell_losslessly,
 )
@@ -83,7 +85,10 @@ class FakeLLM:
                 ],
                 "implicit_traits": [{"trait": "analytical"}],
             }
-        elif "operations" in content or "=== explicit_info ===" in content:
+        elif (
+            "【Operations】" in content
+            or "=== explicit_info ===" in content
+        ):
             resp = {
                 "operations": [
                     {
@@ -107,6 +112,77 @@ class FakeLLM:
                 "implicit_traits": [{"trait": "analytical"}],
             }
         return FakeLLMResponse(json.dumps(resp))
+
+
+@pytest.mark.asyncio
+async def test_budget_renderer_matches_algo_init_prompt_exactly() -> None:
+    """R7 batching must size the exact prompt EverAlgo 0.7 sends to the LLM."""
+    cell = MemCell(
+        items=[
+            ChatMessage(
+                id="m1",
+                role="user",
+                content="I prefer explicit rollback gates.",
+                timestamp=1_700_000_000_000,
+                sender_id="u_alice",
+                sender_name="Alice",
+            )
+        ],
+        timestamp=1_700_000_000_000,
+    )
+    fake = FakeLLM(
+        response_factory=lambda _prompt, _n: json.dumps(
+            {"explicit_info": [], "implicit_traits": []}
+        )
+    )
+    extractor = ProfileExtractor(llm=BoundedProfileLLMClient(fake))
+
+    await extractor.aextract([cell], sender_id="u_alice")
+
+    assert fake.captured_prompts == [
+        render_full_prompt([cell], None, owner_id="u_alice")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_budget_renderer_matches_algo_update_prompt_exactly() -> None:
+    """The UPDATE sizing replica includes display name, id, and language rule."""
+    cell = MemCell(
+        items=[
+            ChatMessage(
+                id="m2",
+                role="user",
+                content="Keep the rollback gate.",
+                timestamp=1_700_000_001_000,
+                sender_id="u_alice",
+                sender_name="Alice",
+            )
+        ],
+        timestamp=1_700_000_001_000,
+    )
+    old_profile = AlgoProfile.model_validate(
+        {
+            "owner_id": "u_alice",
+            "summary": "",
+            "timestamp": 1_700_000_000_000,
+            "explicit_info": [],
+            "implicit_traits": [],
+        }
+    )
+    fake = FakeLLM(
+        response_factory=lambda _prompt, _n: json.dumps(
+            {"operations": [{"action": "none"}]}
+        )
+    )
+    extractor = ProfileExtractor(llm=BoundedProfileLLMClient(fake))
+
+    await extractor.aextract(
+        [cell], sender_id="u_alice", old_profile=old_profile
+    )
+
+    assert fake.captured_prompts == [
+        render_full_prompt([cell], old_profile, owner_id="u_alice")
+    ]
 
 
 @pytest.mark.asyncio

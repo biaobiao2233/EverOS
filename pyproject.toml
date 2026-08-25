@@ -60,7 +60,7 @@ dependencies = [
     # Algorithm library (everalgo monorepo, published on PyPI).
     "everalgo-core==0.5.0",
     "everalgo-boundary==0.3.0",
-    "everalgo-user-memory==0.6.0",
+    "everalgo-user-memory==0.7.0",
     "everalgo-agent-memory==0.5.0",
     "everalgo-rank==0.4.1",
 ]

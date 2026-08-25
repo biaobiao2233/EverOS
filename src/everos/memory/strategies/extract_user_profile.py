@@ -30,6 +30,7 @@ from everalgo.user_memory.profile import (
     PROFILE_UPDATE_PROMPT,
     _render_conversation,
     _render_profile_for_update,
+    _sender_display_name,
     format_message_timestamp,
 )
 
@@ -464,6 +465,7 @@ def render_full_prompt(
     old_profile: AlgoProfile | None,
     *,
     owner_id: str | None = None,
+    owner_display_name: str | None = None,
 ) -> str:
     """Render the exact 0.6+ prompt that ProfileExtractor passes to LLM.
 
@@ -489,6 +491,13 @@ def render_full_prompt(
     # callers pass owner_id explicitly; the fallback keeps direct helper tests
     # deterministic without understating the fixed placeholder overhead.
     resolved_owner = resolved_owner or "__everos_profile_owner__"
+    resolved_display_name = owner_display_name
+    if resolved_display_name is None:
+        resolved_display_name = (
+            _sender_display_name(memcells, resolved_owner)
+            if memcells
+            else resolved_owner
+        )
 
     conversation_text = _render_conversation(memcells)
     if old_profile is None:
@@ -496,7 +505,8 @@ def render_full_prompt(
             PROFILE_INITIAL_EXTRACTION_PROMPT,
             None,
             conversation_text=conversation_text,
-            target_user=resolved_owner,
+            target_user=resolved_display_name,
+            target_user_id=resolved_owner,
             language_rule=build_language_rule(
                 None, fallback=PROFILE_INIT_LANGUAGE_RULE
             ),
@@ -509,7 +519,8 @@ def render_full_prompt(
             None,
             current_profile=current_profile_text,
             conversations=conversation_text,
-            target_user=resolved_owner,
+            target_user=resolved_display_name,
+            target_user_id=resolved_owner,
             language_rule=build_language_rule(
                 None, fallback=EXISTING_PROFILE_LANGUAGE_RULE
             ),
@@ -533,13 +544,32 @@ def split_memcell_losslessly(
     If metadata overhead alone exceeds max_prompt_chars, fails closed with
     ValueError.
     """
+    display_name = (
+        _sender_display_name([cell], owner_id) if owner_id else None
+    )
+
     # 1. If the entire cell already fits within prompt budget, return as is
-    if len(render_full_prompt([cell], old_profile, owner_id=owner_id)) <= max_prompt_chars:
+    if (
+        len(
+            render_full_prompt(
+                [cell],
+                old_profile,
+                owner_id=owner_id,
+                owner_display_name=display_name,
+            )
+        )
+        <= max_prompt_chars
+    ):
         return [cell]
 
     # Calculate prompt overhead without any conversation text
     base_prompt_overhead = len(
-        render_full_prompt([], old_profile, owner_id=owner_id)
+        render_full_prompt(
+            [],
+            old_profile,
+            owner_id=owner_id,
+            owner_display_name=display_name,
+        )
     )
     if base_prompt_overhead >= max_prompt_chars:
         raise ValueError(
@@ -601,7 +631,12 @@ def split_memcell_losslessly(
         if (
             current_items
             and len(
-                render_full_prompt([test_cell], old_profile, owner_id=owner_id)
+                render_full_prompt(
+                    [test_cell],
+                    old_profile,
+                    owner_id=owner_id,
+                    owner_display_name=display_name,
+                )
             )
             > max_prompt_chars
         ):
@@ -615,7 +650,14 @@ def split_memcell_losslessly(
 
     # Final assertion on all generated sub-cells
     for sc in sub_cells:
-        sc_len = len(render_full_prompt([sc], old_profile, owner_id=owner_id))
+        sc_len = len(
+            render_full_prompt(
+                [sc],
+                old_profile,
+                owner_id=owner_id,
+                owner_display_name=display_name,
+            )
+        )
         if sc_len > max_prompt_chars:
             raise ValueError(
                 f"Generated sub-cell prompt length ({sc_len} chars) "
