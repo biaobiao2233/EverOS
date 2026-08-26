@@ -502,6 +502,9 @@ class SearchManager:
             dense=dense,
             reranker=self._reranker,  # type: ignore[arg-type]
             top_k=top_k,
+            candidate_filter=lambda candidates: self._truth_filter(
+                candidates, req, len(candidates)
+            ),
         )
 
     # ── Profile ─────────────────────────────────────────────────────

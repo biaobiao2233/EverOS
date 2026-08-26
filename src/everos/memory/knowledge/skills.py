@@ -18,6 +18,8 @@ from uuid import uuid4
 
 import portalocker
 
+from .observability import observe_skill_transition
+
 
 class SkillCandidateState(StrEnum):
     OBSERVED = "observed"
@@ -120,6 +122,10 @@ class SkillLifecycleManager:
             },
         )
         self._items[candidate_id] = candidate
+        observe_skill_transition(
+            current.state.value if current is not None else "none",
+            candidate.state.value,
+        )
         return candidate
 
     def observe_failure(self, candidate_id: str, case_id: str) -> SkillCandidate | None:
@@ -137,6 +143,7 @@ class SkillLifecycleManager:
         state = SkillCandidateState.REJECTED if failures else current.state
         updated = self._build_from(current, state=state, failure_case_ids=failures)
         self._items[candidate_id] = updated
+        observe_skill_transition(current.state.value, updated.state.value)
         return updated
 
     def submit_for_review(self, candidate_id: str) -> SkillCandidate:
@@ -213,6 +220,7 @@ class SkillLifecycleManager:
     def _replace(self, current: SkillCandidate, **changes: object) -> SkillCandidate:
         updated = self._build_from(current, **changes)
         self._items[current.candidate_id] = updated
+        observe_skill_transition(current.state.value, updated.state.value)
         return updated
 
     def _require(self, candidate_id: str) -> SkillCandidate:

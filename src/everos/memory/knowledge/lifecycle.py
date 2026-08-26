@@ -17,6 +17,8 @@ from enum import StrEnum
 from everos.component.utils.datetime import ensure_utc, get_utc_now
 from everos.infra.persistence.sqlite import BoundaryLifecycle, boundary_lifecycle_repo
 
+from .observability import observe_lifecycle_decision
+
 
 class BoundaryLifecycleState(StrEnum):
     WAITING = "waiting"
@@ -87,29 +89,68 @@ def evaluate_boundary_lifecycle(
     now = _aware(now or get_utc_now())
     authority = authority_state or record.authority_state
     if record.consumed or record.state == BoundaryLifecycleState.CONSUMED:
-        return BoundaryLifecycleDecision("skip", "consumed", record)
-    if authority == "pending_publish":
-        blocked = _replace(record, state=BoundaryLifecycleState.BLOCKED_PENDING_PUBLISH)
-        return BoundaryLifecycleDecision("block", "pending_publish", blocked)
-    if authority not in {"published", "legacy"}:
-        blocked = _replace(record, state=BoundaryLifecycleState.BLOCKED_PENDING_PUBLISH)
-        return BoundaryLifecycleDecision("block", "unknown_authority", blocked)
-    if explicit_final or session_end or force_flush or record.final_requested:
-        ready = _replace(
-            record, state=BoundaryLifecycleState.READY, final_requested=True
+        return _decision(
+            record,
+            now=now,
+            action="skip",
+            reason="consumed",
+            state=BoundaryLifecycleState.CONSUMED,
         )
-        return BoundaryLifecycleDecision("process", "explicit_or_session_final", ready)
+    if authority == "pending_publish":
+        return _decision(
+            record,
+            now=now,
+            action="block",
+            reason="pending_publish",
+            state=BoundaryLifecycleState.BLOCKED_PENDING_PUBLISH,
+        )
+    if authority not in {"published", "legacy"}:
+        return _decision(
+            record,
+            now=now,
+            action="block",
+            reason="unknown_authority",
+            state=BoundaryLifecycleState.BLOCKED_PENDING_PUBLISH,
+        )
+    if explicit_final or session_end or force_flush or record.final_requested:
+        return _decision(
+            record,
+            now=now,
+            action="process",
+            reason="explicit_or_session_final",
+            state=BoundaryLifecycleState.READY,
+            final_requested=True,
+        )
     if record.should_wait is False:
-        ready = _replace(record, state=BoundaryLifecycleState.READY)
-        return BoundaryLifecycleDecision("process", "detector_says_no_wait", ready)
+        return _decision(
+            record,
+            now=now,
+            action="process",
+            reason="detector_says_no_wait",
+            state=BoundaryLifecycleState.READY,
+        )
     if record.max_deadline is not None and now >= _aware(record.max_deadline):
-        ready = _replace(record, state=BoundaryLifecycleState.READY)
-        return BoundaryLifecycleDecision("process", "max_delay_elapsed", ready)
+        return _decision(
+            record,
+            now=now,
+            action="process",
+            reason="max_delay_elapsed",
+            state=BoundaryLifecycleState.READY,
+        )
     if record.idle_deadline is not None and now >= _aware(record.idle_deadline):
-        ready = _replace(record, state=BoundaryLifecycleState.READY)
-        return BoundaryLifecycleDecision("process", "idle_timeout_elapsed", ready)
-    return BoundaryLifecycleDecision(
-        "wait", "tail_not_ready", _replace(record, state=BoundaryLifecycleState.WAITING)
+        return _decision(
+            record,
+            now=now,
+            action="process",
+            reason="idle_timeout_elapsed",
+            state=BoundaryLifecycleState.READY,
+        )
+    return _decision(
+        record,
+        now=now,
+        action="wait",
+        reason="tail_not_ready",
+        state=BoundaryLifecycleState.WAITING,
     )
 
 
@@ -218,6 +259,24 @@ def _replace(
     }
     data.update(changes)
     return BoundaryLifecycleRecord(**data)
+
+
+def _decision(
+    record: BoundaryLifecycleRecord,
+    *,
+    now: dt.datetime,
+    action: str,
+    reason: str,
+    state: BoundaryLifecycleState,
+    final_requested: bool | None = None,
+) -> BoundaryLifecycleDecision:
+    changes: dict[str, object] = {"state": state}
+    if final_requested is not None:
+        changes["final_requested"] = final_requested
+    updated = _replace(record, **changes)
+    elapsed = max(0.0, (now - _aware(record.observed_at)).total_seconds())
+    observe_lifecycle_decision(action=action, reason=reason, elapsed_seconds=elapsed)
+    return BoundaryLifecycleDecision(action, reason, updated)
 
 
 def _from_row(row: BoundaryLifecycle) -> BoundaryLifecycleRecord:

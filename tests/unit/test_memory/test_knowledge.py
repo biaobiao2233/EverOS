@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from everalgo.types import Candidate
+from prometheus_client import CollectorRegistry
 
 from everos.memory.knowledge import (
     AuthorityState,
@@ -187,6 +188,51 @@ def test_truth_gate_rejects_wrong_scope_candidate_superseded_and_expired() -> No
     assert [hit.claim.claim_id for hit in history] == ["history"]
 
 
+def test_explicit_candidates_cannot_displace_accepted_current_truth() -> None:
+    claims = [
+        _claim("accepted", "accepted deployment", score=0.1),
+        _claim(
+            "candidate",
+            "new candidate deployment",
+            authority=AuthorityState.CANDIDATE,
+            score=1.0,
+        ),
+    ]
+    hits = TruthAwareRetriever().retrieve(
+        claims,
+        TruthAwareQuery(
+            query="deployment",
+            scope=SCOPE,
+            include_candidates=True,
+            top_k=10,
+        ),
+    )
+    assert [hit.claim.claim_id for hit in hits] == ["accepted", "candidate"]
+
+
+def test_candidate_conflict_does_not_hide_the_only_accepted_claim() -> None:
+    claims = [
+        _claim("accepted", "accepted deployment", score=0.1, conflict_group="g"),
+        _claim(
+            "candidate",
+            "candidate deployment",
+            authority=AuthorityState.CANDIDATE,
+            score=1.0,
+            conflict_group="g",
+        ),
+    ]
+    hits = TruthAwareRetriever().retrieve(
+        claims,
+        TruthAwareQuery(
+            query="deployment",
+            scope=SCOPE,
+            include_candidates=True,
+            top_k=10,
+        ),
+    )
+    assert [hit.claim.claim_id for hit in hits] == ["accepted", "candidate"]
+
+
 def test_truth_conflict_does_not_choose_by_semantic_score() -> None:
     claims = [
         _claim("a", "claim A", conflict_group="c", score=0.1),
@@ -240,6 +286,15 @@ def test_candidate_adapter_keeps_legacy_rows_compatible_and_gates_enveloped_rows
     )
     assert {item.id for item in mixed} == {"legacy", "accepted"}
     assert mixed[-1].score > 0
+    assert [
+        item.id
+        for item in retrieve_candidates(
+            [legacy, Candidate(id="legacy-2", score=0.1, source="vector", metadata={})],
+            query="x",
+            scope={},
+            top_k=-1,
+        )
+    ] == ["legacy", "legacy-2"]
 
 
 def test_current_view_excludes_unresolved_conflict_class_without_group() -> None:
@@ -512,3 +567,46 @@ async def test_due_lifecycle_flush_delegates_session_lock_to_memorize(
         is_final=True,
         background_worker=True,
     )
+
+
+def test_knowledge_surfaces_export_low_cardinality_metrics() -> None:
+    from everos.core.observability.metrics import (
+        generate_metrics_response,
+        reset_metrics_registry,
+        set_metrics_registry,
+    )
+
+    registry = CollectorRegistry()
+    set_metrics_registry(registry)
+    try:
+        TruthAwareRetriever().retrieve(
+            [_claim("metric", "metric deployment")],
+            TruthAwareQuery(query="deployment", scope=SCOPE),
+        )
+        WikiCompiler().compile(
+            snapshot_id="metric-snapshot",
+            title="Metrics",
+            claims=[_claim("metric", "metric deployment")],
+        )
+        score_promotion(PromotionObservation(candidate_id="metric"))
+        evaluate_boundary_lifecycle(
+            build_lifecycle_record(
+                app_id="a",
+                project_id="p",
+                session_id="s",
+                track="memorize",
+                message_ids=["m"],
+                revision=1,
+                should_wait=True,
+                authority_state="published",
+                observed_at=NOW,
+            ),
+            now=NOW,
+        )
+        payload = generate_metrics_response().decode("utf-8")
+        assert "everos_knowledge_retrieval_duration_seconds_count" in payload
+        assert "everos_knowledge_wiki_build_duration_seconds_count" in payload
+        assert "everos_knowledge_promotion_recommendations_total" in payload
+        assert "everos_boundary_lifecycle_decisions_total" in payload
+    finally:
+        reset_metrics_registry()

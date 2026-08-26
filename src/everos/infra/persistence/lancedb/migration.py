@@ -104,9 +104,7 @@ def probe_local_api() -> LanceDBApiProbe:
         package_version=str(getattr(lancedb, "__version__", "unknown")),
         has_sync_connect=callable(getattr(lancedb, "connect", None)),
         has_async_connect=callable(getattr(lancedb, "connect_async", None)),
-        has_fts_index=bool(
-            lance_table_type and hasattr(lance_table_type, "create_fts_index")
-        ),
+        has_fts_index=_has_fts_index_api(lance_table_type),
         has_optimize=bool(lance_table_type and hasattr(lance_table_type, "optimize")),
         has_index_stats=bool(
             lance_table_type and hasattr(lance_table_type, "index_stats")
@@ -264,10 +262,7 @@ def _rebuild_fts_index(table: Any, column: str) -> None:
     """Rebuild FTS across the pre/post-0.33 LanceDB API boundary."""
 
     create_index = getattr(table, "create_index", None)
-    if (
-        callable(create_index)
-        and "config" in inspect.signature(create_index).parameters
-    ):
+    if callable(create_index) and _accepts_config(create_index):
         try:
             from lancedb.index import FTS
         except ImportError:  # pragma: no cover - defensive for partial installs
@@ -279,6 +274,22 @@ def _rebuild_fts_index(table: Any, column: str) -> None:
     if not callable(create_fts_index):
         raise LanceDBMigrationProbeError("local LanceDB has no FTS index API")
     create_fts_index(column, replace=True)
+
+
+def _has_fts_index_api(table_type: Any) -> bool:
+    if table_type is None:
+        return False
+    if callable(getattr(table_type, "create_fts_index", None)):
+        return True
+    create_index = getattr(table_type, "create_index", None)
+    return callable(create_index) and _accepts_config(create_index)
+
+
+def _accepts_config(callable_object: Any) -> bool:
+    try:
+        return "config" in inspect.signature(callable_object).parameters
+    except (TypeError, ValueError):  # pragma: no cover - extension methods
+        return False
 
 
 def canonical_rows(rows: list[dict[str, Any]]) -> tuple[str, ...]:

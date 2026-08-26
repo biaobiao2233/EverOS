@@ -819,9 +819,15 @@ async def test_agent_hybrid_no_llm_rerank_runs_cross_encoder_lane(
         dense: list[Candidate],
         reranker: Any,
         top_k: int,
+        candidate_filter: Any = None,
     ) -> list:
         captured.update(
-            query=query, sparse=sparse, dense=dense, reranker=reranker, top_k=top_k
+            query=query,
+            sparse=sparse,
+            dense=dense,
+            reranker=reranker,
+            top_k=top_k,
+            candidate_filter=candidate_filter,
         )
         return []
 

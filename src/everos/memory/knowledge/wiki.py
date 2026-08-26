@@ -10,9 +10,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from .observability import observe_wiki
 from .truth import AuthorityState, TruthClaim, TruthClass
 
 COMPILER_VERSION = "wiki-compiler-v1"
@@ -96,6 +98,7 @@ class WikiCompiler:
         claims: Iterable[TruthClaim],
         scope: dict[str, str] | None = None,
     ) -> WikiPage:
+        started = time.perf_counter()
         selected = [
             claim
             for claim in claims
@@ -119,7 +122,7 @@ class WikiCompiler:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        return WikiPage(
+        page = WikiPage(
             snapshot_id=snapshot_id,
             compiler_version=self.version,
             slug=slugify(title),
@@ -134,6 +137,11 @@ class WikiCompiler:
             ),
             claim_set_sha256=hashlib.sha256(payload).hexdigest(),
         )
+        observe_wiki(
+            elapsed_seconds=time.perf_counter() - started,
+            rendered_count=page.rendered_claim_count,
+        )
+        return page
 
 
 def slugify(value: str) -> str:

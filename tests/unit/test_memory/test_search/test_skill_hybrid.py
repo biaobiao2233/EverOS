@@ -132,6 +132,41 @@ class TestSearchAgentSkillsHybridRerank:
         ]
         assert kw["instruction"] == _SKILL_RERANK_INSTRUCTION
 
+    async def test_truth_filter_runs_before_top_k_truncation(self) -> None:
+        accepted = _skill_candidate("accepted", score=0.1)
+        candidate = _skill_candidate("candidate", score=1.0)
+        candidate.metadata.update(
+            {
+                "app_id": "default",
+                "project_id": "default",
+                "authority": "candidate",
+                "truth_class": "current",
+            }
+        )
+        accepted.metadata.update(
+            {
+                "app_id": "default",
+                "project_id": "default",
+                "authority": "accepted",
+                "truth_class": "current",
+            }
+        )
+        reranker = _make_reranker([candidate, accepted])
+
+        def keep_accepted(rows: list[Candidate]) -> list[Candidate]:
+            return [row for row in rows if row.metadata.get("authority") == "accepted"]
+
+        result = await search_agent_skills_hybrid(
+            "deployment",
+            sparse=[candidate, accepted],
+            dense=[],
+            reranker=reranker,
+            top_k=1,
+            candidate_filter=keep_accepted,
+        )
+
+        assert [item.id for item in result] == ["accepted"]
+
 
 class TestSearchAgentSkillsHybridEmpty:
     """Empty input / degenerate cases."""

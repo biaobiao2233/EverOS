@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from .observability import observe_promotion
+
 
 class PromotionLevel(StrEnum):
     HIGH = "HIGH"
@@ -93,7 +95,7 @@ def score_promotion(observation: PromotionObservation) -> PromotionRecommendatio
         reasons.append("later_correction_penalty")
     if observation.contradiction_count:
         reasons.append("contradiction_penalty")
-    return PromotionRecommendation(
+    recommendation = PromotionRecommendation(
         candidate_id=observation.candidate_id,
         level=level,
         score=score,
@@ -101,3 +103,5 @@ def score_promotion(observation: PromotionObservation) -> PromotionRecommendatio
         contributing_signals={**signals, "penalty": penalty},
         evidence_refs=observation.evidence_refs,
     )
+    observe_promotion(recommendation.level.value)
+    return recommendation

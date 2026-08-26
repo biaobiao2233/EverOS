@@ -8,6 +8,7 @@ at the orchestration layer. Passage shape + skill instruction live in
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from everalgo.rank.fusion import rrf
@@ -32,6 +33,7 @@ async def search_agent_skills_hybrid(
     dense: list[Candidate],
     reranker: RerankProvider,
     top_k: int,
+    candidate_filter: Callable[[list[Candidate]], list[Candidate]] | None = None,
 ) -> list[SearchAgentSkillItem]:
     """Skill HYBRID retrieval: rrf → cross-encoder rerank → shape.
 
@@ -46,7 +48,9 @@ async def search_agent_skills_hybrid(
         Ranked list of at most ``top_k`` ``SearchAgentSkillItem`` objects.
     """
     fused = _fuse(sparse, dense)
-    reranked = await _cross_encoder_rerank(query, fused, reranker, top_k)
+    reranked = await _cross_encoder_rerank(
+        query, fused, reranker, top_k, candidate_filter=candidate_filter
+    )
     return _shape_results(reranked)
 
 
@@ -63,12 +67,18 @@ async def _cross_encoder_rerank(
     candidates: list[Candidate],
     reranker: RerankProvider,
     top_k: int,
+    candidate_filter: Callable[[list[Candidate]], list[Candidate]] | None = None,
 ) -> list[Candidate]:
     """Cross-encoder rerank via the skill-shaped factory, then slice to top_k."""
     if not candidates:
         return []
     rerank_fn = build_skill_rerank_fn(reranker)
     reranked = await rerank_fn(query, candidates)
+    # Truth filtering must happen after cross-encoder scores are assigned but
+    # before top_k truncation. Otherwise a candidate/rejected row can evict an
+    # accepted CURRENT row and the later filter cannot recover it.
+    if candidate_filter is not None:
+        reranked = candidate_filter(reranked)
     return reranked[:top_k]
 
 

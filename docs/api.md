@@ -50,6 +50,12 @@ The operational endpoints `GET /health` and `GET /metrics` exist but
 are intentionally outside this reference — they are runtime probes for
 deployment, not part of the application contract.
 
+The knowledge-access runtime also exports low-cardinality Prometheus series
+through `/metrics`: retrieval duration/results/filter counts, deterministic
+Wiki build duration/claim counts, promotion recommendation levels, Skill
+lifecycle transitions, and Boundary lifecycle decisions/wait time. Query
+text, claim ids, paths, owner ids, and memory content are never metric labels.
+
 ### Private local admin endpoints
 
 The bearer-protected local control-plane endpoints live under `/api/v1/admin/`.

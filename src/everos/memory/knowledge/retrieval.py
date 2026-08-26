@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -19,6 +20,7 @@ from everalgo.types import Candidate
 
 from everos.component.utils.datetime import ensure_utc, get_utc_now
 
+from .observability import observe_retrieval
 from .truth import AuthorityState, TruthClaim, TruthClass
 
 
@@ -65,6 +67,7 @@ class TruthAwareRetriever:
         claims: Iterable[TruthClaim],
         request: TruthAwareQuery,
     ) -> list[RankedTruthClaim]:
+        started = time.perf_counter()
         scoped = [c for c in claims if _scope_matches(c, request.scope)]
         gated = self._truth_gate(scoped, request)
         ranked = [self._rank(c, request) for c in gated]
@@ -75,7 +78,15 @@ class TruthAwareRetriever:
                 len(ranked) if request.top_k < 0 else request.top_k,
                 request.mmr_lambda,
             )
-        return ranked if request.top_k < 0 else ranked[: request.top_k]
+        result = ranked if request.top_k < 0 else ranked[: request.top_k]
+        observe_retrieval(
+            view=request.view.value,
+            elapsed_seconds=time.perf_counter() - started,
+            scoped_count=len(scoped),
+            gated_count=len(gated),
+            returned_count=len(result),
+        )
+        return result
 
     def _truth_gate(
         self,
@@ -141,7 +152,14 @@ class TruthAwareRetriever:
                 (reference_time - _aware(claim.created_at)).total_seconds() / 86400.0,
             )
             score += 0.05 / (1.0 + age_days / 30.0)
-        priority = 0 if claim.truth_class == TruthClass.CURRENT else 1
+        # Accepted truth always ranks before an explicitly requested
+        # candidate.  This keeps a newer/unaccepted candidate from displacing
+        # an older accepted CURRENT claim merely because its vector score is
+        # larger.  Truth class remains the next ordering dimension.
+        authority_offset = 0 if claim.authority == AuthorityState.ACCEPTED else 2
+        priority = authority_offset + (
+            0 if claim.truth_class == TruthClass.CURRENT else 1
+        )
         reasons = ("scope_pass", "accepted_authority", "hybrid_fused")
         return RankedTruthClaim(claim, score, priority, reasons)
 
@@ -178,7 +196,7 @@ def retrieve_candidates(
         # Existing 0.30.2 rows are already the accepted semantic-memory
         # projection and have no envelope columns. Preserve their exact
         # ranking/score until a writer adds explicit truth metadata.
-        return list(candidates[:top_k])
+        return list(candidates) if top_k < 0 else list(candidates[:top_k])
     for candidate in candidates:
         by_id[candidate.id] = candidate
         metadata = candidate.metadata
@@ -240,9 +258,20 @@ def _unresolved_conflict_ids(claims: list[TruthClaim]) -> set[str]:
     for claim in claims:
         if claim.conflict_group:
             groups.setdefault(claim.conflict_group, []).append(claim)
-    return {
-        claim.claim_id for group in groups.values() if len(group) > 1 for claim in group
-    }
+    conflicted: set[str] = set()
+    for group in groups.values():
+        accepted = [
+            claim for claim in group if claim.authority == AuthorityState.ACCEPTED
+        ]
+        # A candidate that conflicts with one accepted claim is review
+        # material, not evidence that the accepted claim is unresolved.  If
+        # multiple accepted claims conflict, or only candidates conflict,
+        # fail closed for that group.
+        if len(accepted) > 1:
+            conflicted.update(claim.claim_id for claim in accepted)
+        elif not accepted and len(group) > 1:
+            conflicted.update(claim.claim_id for claim in group)
+    return conflicted
 
 
 def _sort_key(hit: RankedTruthClaim) -> tuple[int, float, str]:
