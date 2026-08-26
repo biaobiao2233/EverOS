@@ -231,6 +231,7 @@ def retrieve_candidates(
                 ),
             )
         )
+    all_legacy = len(legacy_ids) == len(candidates)
     ranked = TruthAwareRetriever().retrieve(
         claims,
         TruthAwareQuery(
@@ -239,10 +240,14 @@ def retrieve_candidates(
             view=view,
             as_of=as_of,
             include_candidates=include_candidates,
-            top_k=top_k,
+            # A homogeneous legacy pool must be fully gated before the
+            # compatibility ordering/slice below.  Slicing inside the
+            # retriever first could discard an earlier recall row solely
+            # because a later legacy score is numerically larger.
+            top_k=-1 if all_legacy else top_k,
         ),
     )
-    if len(legacy_ids) == len(candidates):
+    if all_legacy:
         # The pre-envelope LanceDB recall order is already the engine's
         # relevance order.  Preserve it for a homogeneous legacy pool after
         # the common truth gate has run, so adding the gate does not change

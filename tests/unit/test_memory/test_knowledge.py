@@ -295,6 +295,18 @@ def test_candidate_adapter_keeps_legacy_rows_compatible_and_gates_enveloped_rows
             top_k=-1,
         )
     ] == ["legacy", "legacy-2"]
+    assert [
+        item.id
+        for item in retrieve_candidates(
+            [
+                Candidate(id="first", score=0.1, source="vector", metadata={}),
+                Candidate(id="second", score=1.0, source="vector", metadata={}),
+            ],
+            query="x",
+            scope={},
+            top_k=1,
+        )
+    ] == ["first"]
 
 
 def test_legacy_rows_still_pass_truth_gate_and_enforce_complete_scope() -> None:
