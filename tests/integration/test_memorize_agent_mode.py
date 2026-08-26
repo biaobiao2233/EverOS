@@ -49,7 +49,10 @@ def _make_fake_llm(boundary_responses: list[list[int]] | None = None) -> FakeLLM
             cuts = queue.pop(0) if queue else []
             return ChatResponse(content=_boundary_response(cuts), model="fake")
         return ChatResponse(
-            content=json.dumps({"title": "T", "content": "B"}), model="fake"
+            content=json.dumps(
+                {"title": "T", "summary": "Test summary", "content": "B"}
+            ),
+            model="fake",
         )
 
     return FakeLLMClient(handler=handler)

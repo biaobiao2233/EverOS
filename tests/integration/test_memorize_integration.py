@@ -87,7 +87,7 @@ def _make_fake_llm(
 
     Pops one ``boundaries=...`` from ``boundary_responses`` per boundary
     prompt seen; every episode prompt returns the same canned
-    ``{title, content}``.
+    ``{title, summary, content}``.
     """
     boundary_queue: list[list[int]] = list(boundary_responses or [])
 

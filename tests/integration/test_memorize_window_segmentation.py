@@ -62,7 +62,7 @@ def _boundary_response(boundaries: list[int]) -> str:
 
 
 def _episode_response(title: str = "T", content: str = "B") -> str:
-    return json.dumps({"title": title, "content": content})
+    return json.dumps({"title": title, "summary": "Test summary", "content": content})
 
 
 def _make_scripted_llm(
