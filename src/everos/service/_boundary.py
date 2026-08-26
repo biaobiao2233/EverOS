@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import replace
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 from everalgo.agent_memory import AgentBoundaryDetector
@@ -61,6 +62,13 @@ from everos.memory.extract.ingest.id_gen import (
     external_idem_key,
     staged_message_identity,
 )
+from everos.memory.knowledge.lifecycle import (
+    BoundaryLifecycleState,
+    BoundaryLifecycleStore,
+    LifecyclePolicy,
+    build_lifecycle_record,
+    evaluate_boundary_lifecycle,
+)
 from everos.service._deferred_errors import (
     MemoryMessageConflictError,
     MemoryMessageRecoveryError,
@@ -89,6 +97,7 @@ Status = Literal["accumulated", "extracted", "skipped"]
 _AUTH_PENDING = "pending_publish"
 _AUTH_PUBLISHED = "published"
 _AUTH_CONSUMED = "consumed"
+_lifecycle_store = BoundaryLifecycleStore()
 
 
 class BoundaryOutcome(NamedTuple):
@@ -140,13 +149,13 @@ async def prepare_cells(
     hard_token_limit: int,
     hard_msg_limit: int,
     operation_id: str | None = None,
+    lifecycle_policy: LifecyclePolicy | None = None,
 ) -> BoundaryOutcome:
     """Run the boundary stage end-to-end and persist tail back to buffer."""
     app_id = ingested.app_id
     project_id = ingested.project_id
+    policy = lifecycle_policy or LifecyclePolicy()
     fresh = _filter_for_mode(ingested.messages, mode)
-    if not fresh and not is_final:
-        return _empty_outcome(status="skipped", message_count=0)
 
     buffer_rows = await unprocessed_buffer_repo.list_for_track(
         ingested.session_id, _TRACK, app_id=app_id, project_id=project_id
@@ -155,6 +164,40 @@ async def prepare_cells(
         buffer_rows
     )
     protected = [_row_to_canonical(r) for r in protected_rows]
+    lifecycle_force = False
+    lifecycle_process = False
+    existing_lifecycle = None
+    if not fresh:
+        existing_lifecycle = await _lifecycle_store.load(
+            ingested.session_id, app_id=app_id, project_id=project_id, track=_TRACK
+        )
+        if existing_lifecycle is None:
+            if protected_rows:
+                # A staged batch may be flushed before it has ever crossed
+                # the boundary. Create a blocked checkpoint now so restart
+                # and explicit-final paths have the same fail-closed record.
+                await _persist_pending_lifecycle(ingested, protected, policy=policy)
+                return _empty_outcome(status="accumulated", message_count=0)
+            if not is_final:
+                return _empty_outcome(status="skipped", message_count=0)
+        else:
+            decision = evaluate_boundary_lifecycle(
+                existing_lifecycle,
+                policy=policy,
+                explicit_final=is_final,
+                session_end=is_final,
+                authority_state=(
+                    "pending_publish"
+                    if protected_rows
+                    else existing_lifecycle.authority_state
+                ),
+            )
+            if decision.action != "process":
+                if decision.action == "block":
+                    await _lifecycle_store.save(decision.record)
+                return _empty_outcome(status="accumulated", message_count=0)
+            lifecycle_force = not is_final
+            lifecycle_process = True
     # A legacy /add carrying the same logical row as an unpublished /stage
     # must not bypass the server-side authority gate during a rolling client
     # migration. Pending staged rows therefore act as a dedupe fence even
@@ -163,6 +206,18 @@ async def prepare_cells(
     buffered = [_row_to_canonical(r) for r in eligible_rows]
     merged = _merge_dedupe_sort(buffered, fresh)
     if not merged:
+        if lifecycle_process and existing_lifecycle is not None:
+            # Crash recovery can observe a committed memcell after the
+            # separate lifecycle checkpoint was not persisted. No buffer
+            # means there is no remaining extraction input; consume the
+            # checkpoint instead of retrying forever.
+            await _lifecycle_store.save(
+                replace(
+                    existing_lifecycle,
+                    consumed=True,
+                    state=BoundaryLifecycleState.CONSUMED,
+                )
+            )
         return _empty_outcome(status="accumulated", message_count=0)
 
     # Need a role=user anchor for downstream episode extraction; assistant-
@@ -193,7 +248,7 @@ async def prepare_cells(
         return _empty_outcome(status="skipped", message_count=len(fresh))
 
     boundary_prompt = prompt_loader.load("boundary_detection")
-    cells, tail = await _detect(
+    detected = await _detect(
         merged,
         mode=mode,
         llm_client=llm_client,
@@ -202,6 +257,19 @@ async def prepare_cells(
         hard_token_limit=hard_token_limit,
         hard_msg_limit=hard_msg_limit,
     )
+    cells, tail, should_wait = detected
+
+    # ``should_wait`` is a semantic signal about the tail, not a synonym for
+    # "tail is non-empty".  It is checkpointed below; a subsequent background
+    # wake/final flush may close a false-signal tail, while the ordinary /add
+    # call keeps the historical accumulate-until-flush contract. A due
+    # lifecycle (idle/max-delay) is allowed to close even when the detector
+    # previously asked us to wait. Neither branch grants authority: pending
+    # rows never entered ``merged`` above.
+    if tail and not is_final and lifecycle_force:
+        cells = [*cells, MemCell(items=list(tail), timestamp=tail[-1].timestamp)]
+        tail = []
+        should_wait = False
 
     if not cells:
         # boundary returned an empty cells set → roll the merged slice
@@ -214,6 +282,13 @@ async def prepare_cells(
             protected=protected,
         )
         await _touch_last_message_ts(ingested.session_id, merged, app_id, project_id)
+        await _persist_lifecycle(
+            ingested,
+            merged,
+            tail=merged,
+            should_wait=should_wait,
+            policy=policy,
+        )
         return _empty_outcome(status="accumulated", message_count=len(fresh))
 
     memcell_ids = [_mint_memcell_id() for _ in cells]
@@ -249,6 +324,14 @@ async def prepare_cells(
         protected=protected,
         last_cell_ts=last_cell_ts,
         operation_id=operation_id,
+    )
+    await _persist_lifecycle(
+        ingested,
+        merged,
+        tail=tail_canonical,
+        should_wait=should_wait,
+        policy=policy,
+        consumed=not tail_canonical,
     )
 
     return BoundaryOutcome(
@@ -578,6 +661,11 @@ async def publish_messages(
         operation.error_code = None
         operation.retryable = False
         await session.commit()
+    await _rearm_lifecycle_after_publish(
+        session_id=session_id,
+        app_id=app_id,
+        project_id=project_id,
+    )
     return summary
 
 
@@ -608,7 +696,7 @@ async def _detect(
     is_final: bool,
     hard_token_limit: int,
     hard_msg_limit: int,
-) -> tuple[list[MemCell], list[ConversationItem]]:
+) -> tuple[list[MemCell], list[ConversationItem], bool | None]:
     # Retry on ValueError to absorb transient LLM JSON-parse failures from
     # the everalgo boundary detector; non-ValueError errors propagate.
     last_err: ValueError | None = None
@@ -624,14 +712,14 @@ async def _detect(
                     hard_token_limit=hard_token_limit,
                     hard_msg_limit=hard_msg_limit,
                 )
-                return list(result.cells), list(result.tail)
+                return list(result.cells), list(result.tail), result.should_wait
             # Agent mode — facade does filter→detect→remap to preserve tool
             # items. AgentBoundaryDetector intentionally does not expose hard
             # limits; the boundary primitive's defaults apply.
             items = [_to_conversation_item(m) for m in merged]
             detector = AgentBoundaryDetector(llm=llm_client)
             result = await detector.adetect(items, is_final=is_final, prompt=prompt)
-            return list(result.cells), list(result.tail)
+            return list(result.cells), list(result.tail), result.should_wait
         except ValueError as err:
             last_err = err
             logger.warning(
@@ -907,6 +995,122 @@ async def _touch_last_message_ts(
         max(m.timestamp for m in merged),
         app_id=app_id,
         project_id=project_id,
+    )
+
+
+async def _persist_lifecycle(
+    ingested: IngestResult,
+    merged: list[CanonicalMessage],
+    *,
+    tail: list[CanonicalMessage],
+    should_wait: bool | None,
+    policy: LifecyclePolicy,
+    consumed: bool = False,
+) -> None:
+    """Persist a checkpoint after the corresponding buffer transaction.
+
+    Missing/late checkpoints are safe to reconstruct from the durable buffer;
+    the checkpoint itself is never used as an authority source.
+    """
+
+    if not merged:
+        return
+    message_ids = [message.message_id for message in (tail or merged)]
+    receipts = await memory_message_receipt_repo.map_by_message_ids(
+        [message.message_id for message in merged]
+    )
+    revision = max((receipt.revision for receipt in receipts.values()), default=0)
+    receipt_authorities = {receipt.authority_state for receipt in receipts.values()}
+    if "pending_publish" in receipt_authorities or any(
+        message.message_id.startswith("ms_") and message.message_id not in receipts
+        for message in merged
+    ):
+        authority = _AUTH_PENDING
+    elif receipts or not any(
+        message.message_id.startswith("ms_") for message in merged
+    ):
+        authority = _AUTH_PUBLISHED
+    else:
+        authority = _AUTH_PENDING
+    record = build_lifecycle_record(
+        app_id=ingested.app_id,
+        project_id=ingested.project_id,
+        session_id=ingested.session_id,
+        track=_TRACK,
+        message_ids=message_ids,
+        revision=revision,
+        should_wait=should_wait,
+        authority_state=authority,
+        policy=policy,
+        consumed=consumed,
+    )
+    if consumed:
+        record = record.__class__(
+            **{
+                **{name: getattr(record, name) for name in record.__dataclass_fields__},
+                "state": BoundaryLifecycleState.CONSUMED,
+            }
+        )
+    await _lifecycle_store.save(record)
+
+
+async def _persist_pending_lifecycle(
+    ingested: IngestResult,
+    protected: list[CanonicalMessage],
+    *,
+    policy: LifecyclePolicy,
+) -> None:
+    """Checkpoint a staged-but-not-yet-authorized batch without extraction."""
+
+    message_ids = [message.message_id for message in protected]
+    receipts = await memory_message_receipt_repo.map_by_message_ids(message_ids)
+    revision = max((receipt.revision for receipt in receipts.values()), default=0)
+    record = build_lifecycle_record(
+        app_id=ingested.app_id,
+        project_id=ingested.project_id,
+        session_id=ingested.session_id,
+        track=_TRACK,
+        message_ids=message_ids,
+        revision=revision,
+        should_wait=True,
+        authority_state=_AUTH_PENDING,
+        policy=policy,
+    )
+    await _lifecycle_store.save(
+        replace(record, state=BoundaryLifecycleState.BLOCKED_PENDING_PUBLISH)
+    )
+
+
+async def _rearm_lifecycle_after_publish(
+    *, session_id: str, app_id: str, project_id: str
+) -> None:
+    """Move a blocked checkpoint back to waiting after live authority changes.
+
+    Publish is the only transition that can make a staged tail eligible. The
+    re-arm itself only mirrors already-committed receipt state; if the process
+    crashes before this checkpoint update, an explicit final flush still
+    remains safe and the next fresh request reconstructs the state.
+    """
+
+    record = await _lifecycle_store.load(
+        session_id, app_id=app_id, project_id=project_id, track=_TRACK
+    )
+    if record is None or record.state != BoundaryLifecycleState.BLOCKED_PENDING_PUBLISH:
+        return
+    receipts = await memory_message_receipt_repo.map_by_message_ids(record.message_ids)
+    if not record.message_ids or len(receipts) != len(record.message_ids):
+        return
+    if not all(
+        receipt.authority_state in {_AUTH_PUBLISHED, _AUTH_CONSUMED}
+        for receipt in receipts.values()
+    ):
+        return
+    await _lifecycle_store.save(
+        replace(
+            record,
+            authority_state=_AUTH_PUBLISHED,
+            state=BoundaryLifecycleState.WAITING,
+        )
     )
 
 

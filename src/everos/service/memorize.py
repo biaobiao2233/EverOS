@@ -48,6 +48,7 @@ from everos.memory.extract.pipeline import (
     AgentMemoryPipeline,
     UserMemoryPipeline,
 )
+from everos.memory.knowledge.lifecycle import LifecyclePolicy
 from everos.memory.prompt_slots import PromptLoader
 from everos.memory.strategies import (
     extract_agent_case,
@@ -763,6 +764,10 @@ async def _memorize_locked(
             hard_token_limit=hard_token_limit,
             hard_msg_limit=hard_msg_limit,
             operation_id=operation.operation_id if operation is not None else None,
+            lifecycle_policy=LifecyclePolicy(
+                idle_timeout_seconds=load_settings().boundary_detection.idle_timeout_seconds,
+                max_delay_seconds=load_settings().boundary_detection.max_delay_seconds,
+            ),
         )
 
     if not boundary.cells:

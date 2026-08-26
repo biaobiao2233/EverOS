@@ -27,6 +27,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from everos.memory.knowledge.retrieval import TruthView
+
 
 class SearchMethod(StrEnum):
     """Public method enum. RRF / LR / vector_anchored are hidden under HYBRID."""
@@ -91,6 +93,9 @@ class SearchRequest(BaseModel):
         ),
     )
     filters: FilterNode | None = None
+    truth_view: TruthView = TruthView.CURRENT
+    as_of: _dt.datetime | None = None
+    include_candidates: bool = False
 
     @model_validator(mode="after")
     def _validate_user_xor_agent(self) -> SearchRequest:

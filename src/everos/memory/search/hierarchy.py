@@ -11,6 +11,7 @@ via recaller callbacks.  No changes to the everalgo library are required.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from everalgo.rank import amaxsim_retrieve
@@ -42,6 +43,7 @@ async def hierarchy_retrieve_episodes(
     where: str,
     top_k: int,
     fact_child_candidates: int = 200,
+    candidate_filter: Callable[[list[Candidate]], list[Candidate]] | None = None,
 ) -> list[SearchEpisodeItem]:
     """Run the four-layer hierarchical episode retrieval pipeline.
 
@@ -81,6 +83,7 @@ async def hierarchy_retrieve_episodes(
         episode_recaller=episode_recaller,
         where=where,
         child_candidates=fact_child_candidates,
+        candidate_filter=candidate_filter,
     )
 
     # Layer 3 — RRF merge of episode-level results, slice to top_k
@@ -98,6 +101,11 @@ async def hierarchy_retrieve_episodes(
         per_episode=max(top_k * 2, 20),
         query_vector=query_vector,
     )
+    if candidate_filter:
+        episode_to_facts = {
+            episode_id: _filter_fact_candidates(facts, candidate_filter)
+            for episode_id, facts in episode_to_facts.items()
+        }
 
     # Layer 4b — single-pass eviction
     scored_items = _hierarchy_eviction_pass(merged, episode_to_facts)
@@ -180,6 +188,7 @@ async def _maxsim_episode_rescore(
     episode_recaller: EpisodeRecaller,
     where: str,
     child_candidates: int,
+    candidate_filter: Callable[[list[Candidate]], list[Candidate]] | None,
 ) -> list[Candidate]:
     """Run amaxsim_retrieve to produce MaxSim-rescored episode candidates.
 
@@ -207,10 +216,12 @@ async def _maxsim_episode_rescore(
     async def child_retrieve(_q: str, n: int) -> Sequence[Candidate]:
         # amaxsim_retrieve calls this exactly once with the original query string.
         # Reuse the pre-computed query_vector instead of re-embedding.
-        return await fact_recaller.dense_recall(query_vector, where, limit=n)
+        candidates = await fact_recaller.dense_recall(query_vector, where, limit=n)
+        return candidate_filter(candidates) if candidate_filter else candidates
 
     async def parent_fetch(memcell_ids: list[str]) -> list[Candidate]:
-        return await episode_recaller.fetch_by_parent_ids(memcell_ids, where)
+        candidates = await episode_recaller.fetch_by_parent_ids(memcell_ids, where)
+        return candidate_filter(candidates) if candidate_filter else candidates
 
     return await amaxsim_retrieve(
         query,
@@ -219,6 +230,23 @@ async def _maxsim_episode_rescore(
         top_n=50,
         child_candidates=child_candidates,
     )
+
+
+def _filter_fact_candidates(
+    facts: list[FactCandidate],
+    candidate_filter: Callable[[list[Candidate]], list[Candidate]],
+) -> list[FactCandidate]:
+    filtered = candidate_filter(list(facts))
+    return [
+        FactCandidate(
+            id=fact.id,
+            parent_episode_id=fact.parent_episode_id,
+            score=fact.score,
+            metadata=dict(fact.metadata),
+        )
+        for fact in filtered
+        if isinstance(fact, FactCandidate)
+    ]
 
 
 def _build_ep_to_memcell(episodes: list[Candidate]) -> dict[str, str]:

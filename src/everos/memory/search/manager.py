@@ -44,6 +44,7 @@ from everos.infra.persistence.sqlite import (
     memory_message_receipt_repo,
     unprocessed_buffer_repo,
 )
+from everos.memory.knowledge.retrieval import retrieve_candidates
 
 from .adapter import resolve_pipeline
 from .agentic import search_episodes_agentic
@@ -280,6 +281,9 @@ class SearchManager:
                 reranker=self._reranker,  # type: ignore[arg-type]
                 llm=self._llm,  # type: ignore[arg-type]
                 top_k=self._top_k(req.top_k),
+                candidate_filter=lambda candidates: self._truth_filter(
+                    candidates, req, len(candidates)
+                ),
             )
 
         fusion_mode, _ = resolve_pipeline(req.method, "episode")
@@ -305,6 +309,7 @@ class SearchManager:
             # Single-route recall has no per-fact score against the query, so
             # we do not back-fill — that would emit ``score=0.0`` facts whose
             # semantics are ambiguous.
+            cands = self._truth_filter(cands, req, top_k)
             return [
                 ep
                 for ep in (shape_episode_from_candidate(c) for c in cands[:top_k])
@@ -317,6 +322,8 @@ class SearchManager:
         )
 
         if fusion_mode == "hierarchy":
+            sparse = self._truth_filter(sparse, req, len(sparse))
+            dense = self._truth_filter(dense, req, len(dense))
             return await hierarchy_retrieve_episodes(
                 req.query,
                 sparse=sparse,
@@ -326,6 +333,9 @@ class SearchManager:
                 episode_recaller=self._ep,
                 where=where,
                 top_k=top_k,
+                candidate_filter=lambda candidates: self._truth_filter(
+                    candidates, req, len(candidates)
+                ),
             )
 
         # rrf / lr: standard everalgo fusion path (fallback).
@@ -333,8 +343,8 @@ class SearchManager:
             RankInput(
                 query=req.query,
                 memory_type=self._ep.everalgo_memory_type,  # type: ignore[arg-type]
-                sparse_candidates=sparse,
-                dense_candidates=dense,
+                sparse_candidates=self._truth_filter(sparse, req, len(sparse)),
+                dense_candidates=self._truth_filter(dense, req, len(dense)),
                 top_k=top_k,
                 radius=_effective_radius(req),
             ),
@@ -346,6 +356,7 @@ class SearchManager:
             rerank_top_k=top_k,
         )
         ep_candidates = (_scored_as_candidate(s) for s in output.items)
+        ep_candidates = iter(self._truth_filter(list(ep_candidates), req, top_k))
         return [
             ep
             for ep in (shape_episode_from_candidate(c) for c in ep_candidates)
@@ -366,6 +377,9 @@ class SearchManager:
                 reranker=self._reranker,  # type: ignore[arg-type]
                 llm=self._llm,  # type: ignore[arg-type]
                 top_k=self._top_k(req.top_k),
+                candidate_filter=lambda candidates: self._truth_filter(
+                    candidates, req, len(candidates)
+                ),
             )
         fusion_mode, _ = resolve_pipeline(req.method, "agent_case")
         enable_rerank = _effective_llm_rerank(req)
@@ -375,6 +389,7 @@ class SearchManager:
             cands = await self._single_route_recall(
                 self._case, req, where, top_k, cap=_AGENT_TOP_K_CAP
             )
+            cands = self._truth_filter(cands, req, top_k)
             shaped = (shape_agent_case_from_candidate(c) for c in cands[:top_k])
             return [item for item in shaped if item is not None]
 
@@ -385,8 +400,8 @@ class SearchManager:
             RankInput(
                 query=req.query,
                 memory_type=self._case.everalgo_memory_type,  # type: ignore[arg-type]
-                sparse_candidates=sparse,
-                dense_candidates=dense,
+                sparse_candidates=self._truth_filter(sparse, req, len(sparse)),
+                dense_candidates=self._truth_filter(dense, req, len(dense)),
                 top_k=top_k,
                 radius=_effective_radius(req),
             ),
@@ -398,6 +413,7 @@ class SearchManager:
             rerank_top_k=top_k,
         )
         case_candidates = (_scored_as_candidate(s) for s in output.items)
+        case_candidates = iter(self._truth_filter(list(case_candidates), req, top_k))
         shaped = (shape_agent_case_from_candidate(c) for c in case_candidates)
         return [item for item in shaped if item is not None]
 
@@ -423,6 +439,9 @@ class SearchManager:
                 reranker=self._reranker,  # type: ignore[arg-type]
                 llm=self._llm,  # type: ignore[arg-type]
                 top_k=self._top_k(req.top_k, cap=_AGENT_TOP_K_CAP),
+                candidate_filter=lambda candidates: self._truth_filter(
+                    candidates, req, len(candidates)
+                ),
             )
         fusion_mode, _ = resolve_pipeline(req.method, "agent_skill")
         top_k = self._top_k(req.top_k, cap=_AGENT_TOP_K_CAP)
@@ -431,17 +450,22 @@ class SearchManager:
             cands = await self._single_route_recall(
                 self._skill, req, where, top_k, cap=_AGENT_TOP_K_CAP
             )
+            cands = self._truth_filter(cands, req, top_k)
             shaped = (shape_agent_skill_from_candidate(c) for c in cands[:top_k])
             return [item for item in shaped if item is not None]
 
         sparse, dense, _ = await self._recall_sparse_dense(
             self._skill, req, where, top_k, cap=_AGENT_TOP_K_CAP
         )
+        sparse = self._truth_filter(sparse, req, len(sparse))
+        dense = self._truth_filter(dense, req, len(dense))
 
         # Case→skill bridge: union skills surfaced via lineage cases into
         # the dense pool with their max-pooled source-case score.
         bridged = await self._case_bridged_skills(bridge_cases, where, top_k)
-        dense = _merge_by_id_max(dense, bridged)
+        dense = self._truth_filter(
+            _merge_by_id_max(dense, bridged), req, len(dense) + len(bridged)
+        )
 
         # Lane selection lives here so ``skill_hybrid`` stays single-purpose
         # (cross-encoder) and symmetry with the case path is preserved.
@@ -465,6 +489,9 @@ class SearchManager:
                 rerank_top_k=top_k,
             )
             skill_candidates = (_scored_as_candidate(s) for s in output.items)
+            skill_candidates = iter(
+                self._truth_filter(list(skill_candidates), req, top_k)
+            )
             shaped = (shape_agent_skill_from_candidate(c) for c in skill_candidates)
             return [item for item in shaped if item is not None]
 
@@ -478,6 +505,26 @@ class SearchManager:
         )
 
     # ── Profile ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _truth_filter(
+        candidates: list[Candidate], req: SearchRequest, top_k: int
+    ) -> list[Candidate]:
+        """Apply authority/temporal policy after recall and before shaping."""
+
+        return retrieve_candidates(
+            candidates,
+            query=req.query,
+            scope={
+                "app_id": req.app_id,
+                "project_id": req.project_id,
+                "owner_id": req.owner_id,
+            },
+            view=req.truth_view,
+            as_of=req.as_of,
+            top_k=max(top_k, len(candidates)),
+            include_candidates=req.include_candidates,
+        )
 
     async def _fetch_profile(self, req: SearchRequest) -> list[SearchProfileItem]:
         if not req.include_profile or req.owner_type != "user":
@@ -549,6 +596,10 @@ class SearchManager:
             return []
         fact_limit = min(top_k * _MAXSIM_FACT_MULTIPLIER, _MAXSIM_FACT_POOL_CAP)
         fact_cands = await self._fact.dense_recall(vector, where, limit=fact_limit)
+        # A rejected, expired, or superseded fact must not improve the parent
+        # episode's score before the episode-level truth gate runs. Apply the
+        # same hard envelope gate to the child lane before max-pooling.
+        fact_cands = self._truth_filter(fact_cands, req, len(fact_cands))
         # Max-pool fact scores by their parent memcell. ``atomic_fact``
         # rows always carry ``parent_id = memcell_id`` (cascade contract).
         mc_score: dict[str, float] = {}

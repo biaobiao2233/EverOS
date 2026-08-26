@@ -363,7 +363,7 @@ async def test_skill_chain_e2e(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Chain: AgentCaseExtracted → trigger_skill_clustering (sqlite) →
-    SkillClusterUpdated → extract_agent_skill → SUCCESS.
+    SkillClusterUpdated → extract_agent_skill → durable candidate.
 
     Real ``cluster_by_llm`` algorithm path: hash-based deterministic
     embedder feeds the top-K nearest-neighbor stage, a ``FakeLLMClient``
@@ -497,11 +497,15 @@ async def test_skill_chain_e2e(
     skill_logs = [r for r in logs if r.get("event") == "agent_skills_extracted"]
     assert cluster_logs, "expected skill_cluster_updated log line"
     assert skill_logs, "expected agent_skills_extracted log line"
-    # Writer received exactly one SKILL.md write call with cluster_id stamped.
-    write_args = mock_writer_cls.return_value.write_main.call_args
-    fm = write_args.kwargs["frontmatter"]
-    assert fm.cluster_id == cluster_logs[0]["cluster_id"]
-    assert fm.name == "summarise_doc"
+    # A first successful Case is intentionally a durable candidate checkpoint,
+    # not an automatic SKILL.md materialization.  Explicit review/acceptance
+    # is the authority boundary for turning it into a searchable Skill.
+    mock_writer_cls.return_value.write_main.assert_not_called()
+    sidecars = list((tmp_path / ".index" / "skill-lifecycle").glob("*.json"))
+    assert len(sidecars) == 1
+    payload = sidecars[0].read_text(encoding="utf-8")
+    assert '"state": "observed"' in payload
+    assert '"summarise_doc"' in payload
 
 
 @pytest.mark.asyncio

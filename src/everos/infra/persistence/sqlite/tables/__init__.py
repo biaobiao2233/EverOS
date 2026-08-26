@@ -7,6 +7,7 @@ Each business table lives in its own module here (e.g. ``memcell.py``,
 every registered table.
 """
 
+from .boundary_lifecycle import BoundaryLifecycle as BoundaryLifecycle
 from .cluster import Cluster as Cluster
 from .cluster import ClusterMember as ClusterMember
 from .conversation_status import ConversationStatus as ConversationStatus
@@ -19,6 +20,7 @@ from .unprocessed_buffer import UnprocessedBuffer as UnprocessedBuffer
 __all__ = [
     "Cluster",
     "ClusterMember",
+    "BoundaryLifecycle",
     "ConversationStatus",
     "MdChangeState",
     "Memcell",

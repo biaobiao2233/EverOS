@@ -64,6 +64,7 @@ async def search_agent_cases_agentic(
     reranker: RerankProvider,
     llm: LLMClient,
     top_k: int,
+    candidate_filter: Callable[[list[Candidate]], list[Candidate]] | None = None,
 ) -> list[SearchAgentCaseItem]:
     """Agent-case AGENTIC search via flat hybrid retrieve + aagentic_retrieve.
 
@@ -75,6 +76,8 @@ async def search_agent_cases_agentic(
         reranker: Cross-encoder rerank provider.
         llm: LLM client for sufficiency check + multi-query generation.
         top_k: Maximum cases to return.
+        candidate_filter: Optional truth/authority gate applied before any
+            candidate can enter the agentic prompt or rerank lanes.
 
     Returns:
         Ranked list of at most ``top_k`` ``SearchAgentCaseItem`` objects.
@@ -87,6 +90,7 @@ async def search_agent_cases_agentic(
         reranker=reranker,
         llm=llm,
         top_k=top_k,
+        candidate_filter=candidate_filter,
     )
     return [
         item
@@ -105,6 +109,7 @@ async def search_agent_skills_agentic(
     reranker: RerankProvider,
     llm: LLMClient,
     top_k: int,
+    candidate_filter: Callable[[list[Candidate]], list[Candidate]] | None = None,
 ) -> list[SearchAgentSkillItem]:
     """Agent-skill AGENTIC search via flat hybrid retrieve + aagentic_retrieve.
 
@@ -116,6 +121,8 @@ async def search_agent_skills_agentic(
         reranker: Cross-encoder rerank provider.
         llm: LLM client for sufficiency check + multi-query generation.
         top_k: Maximum skills to return.
+        candidate_filter: Optional truth/authority gate applied before any
+            candidate can enter the agentic prompt or rerank lanes.
 
     Returns:
         Ranked list of at most ``top_k`` ``SearchAgentSkillItem`` objects.
@@ -128,6 +135,7 @@ async def search_agent_skills_agentic(
         reranker=reranker,
         llm=llm,
         top_k=top_k,
+        candidate_filter=candidate_filter,
     )
     return [
         item
@@ -146,6 +154,7 @@ async def _run_agentic_retrieve(
     reranker: RerankProvider,
     llm: LLMClient,
     top_k: int,
+    candidate_filter: Callable[[list[Candidate]], list[Candidate]] | None = None,
 ) -> list[Candidate]:
     """Shared flat agentic retrieve pipeline for agent memory kinds.
 
@@ -159,10 +168,12 @@ async def _run_agentic_retrieve(
         vec = await embed_query_fn(q)
         if not vec:
             return []
-        return await recaller.dense_recall(vec, where, limit=k)
+        candidates = await recaller.dense_recall(vec, where, limit=k)
+        return candidate_filter(candidates) if candidate_filter else candidates
 
     async def _sparse(q: str, k: int) -> list[Candidate]:
-        return await recaller.sparse_recall(q, where, limit=k)
+        candidates = await recaller.sparse_recall(q, where, limit=k)
+        return candidate_filter(candidates) if candidate_filter else candidates
 
     async def hybrid_full(q: str, k: int) -> list[Candidate]:
         return await ahybrid_retrieve(

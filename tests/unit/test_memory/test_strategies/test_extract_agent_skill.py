@@ -42,6 +42,11 @@ from everos.infra.persistence.markdown import (
     AgentSkillWriter,
 )
 from everos.memory.events import SkillClusterUpdated
+from everos.memory.knowledge.skills import (
+    SkillCandidateState,
+    SkillLifecycleFileStore,
+    SkillLifecycleManager,
+)
 from everos.memory.strategies._partition_locks import _reset_for_tests
 from everos.memory.strategies.extract_agent_skill import (
     MAX_SKILLS_IN_PROMPT,
@@ -54,7 +59,9 @@ from everos.memory.strategies.extract_agent_skill import (
     _select_existing_skills,
     _select_supporting_cases,
     _skill_rejection_reason,
+    accept_skill_candidate,
     extract_agent_skill,
+    retire_skill_candidate,
 )
 
 mod = importlib.import_module("everos.memory.strategies.extract_agent_skill")
@@ -333,14 +340,18 @@ async def test_cascade_lag_rescues_case_from_markdown(
         _dt.datetime(2026, 5, 17, tzinfo=_dt.UTC).timestamp() * 1000
     )
 
-    # And the skill was durably written.
-    assert (
+    # A single successful Case is only a durable candidate, never SKILL.md.
+    lifecycle = SkillLifecycleManager(repeated_success_threshold=3)
+    store = mod._skill_lifecycle_store(md_root, "agent_42", "default", "default")
+    assert SkillLifecycleFileStore(store.path).load(lifecycle) == 1
+    assert lifecycle.all()[0].state == SkillCandidateState.OBSERVED
+    assert not (
         md_root.agents_dir()
         / "agent_42"
         / "skills"
         / "skill_fix_autoreloader"
         / "SKILL.md"
-    ).is_file()
+    ).exists()
 
 
 async def test_rescue_degrades_on_partial_md_fields(
@@ -417,6 +428,7 @@ async def test_rescue_degrades_on_partial_md_fields(
 
 async def test_extracts_and_persists_with_cluster_id_stamped(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """End-to-end (mocked): extractor emits skills → writer stamps cluster_id."""
     target = _lance_case("ac_20260517_0001", vector=[0.1] * 1024)
@@ -431,6 +443,12 @@ async def test_extracts_and_persists_with_cluster_id_stamped(
     prompt_loader = MagicMock()
     prompt_loader.load.side_effect = lambda name: f"prompt:{name}"
     monkeypatch.setattr(mod, "_prompt_loader", prompt_loader, raising=False)
+    candidate_path = tmp_path / "skill-candidates.json"
+    monkeypatch.setattr(
+        mod,
+        "_skill_lifecycle_store",
+        lambda *_args: SkillLifecycleFileStore(candidate_path),
+    )
 
     with (
         patch(
@@ -489,17 +507,56 @@ async def test_extracts_and_persists_with_cluster_id_stamped(
     assert extractor_call.kwargs["prompt_success"] == "prompt:agent_skill_success"
     assert extractor_call.kwargs["prompt_failure"] == "prompt:agent_skill_failure"
 
-    write_calls = mock_writer_cls.return_value.write_main.call_args_list
-    assert len(write_calls) == 2
-    for call, expected in zip(write_calls, emitted, strict=True):
-        agent_id_arg, skill_name_arg = call.args
-        fm = call.kwargs["frontmatter"]
-        assert agent_id_arg == "agent_42"
-        assert skill_name_arg == expected.name
-        assert fm.cluster_id == "cl_xxxxxxxxxxx1"
-        assert fm.name == expected.name
-        assert fm.confidence == expected.confidence
-        assert call.kwargs["body"] == expected.content
+    # New LLM adds are checkpointed as observed candidates; no durable Skill
+    # is emitted before repeated-success review.
+    assert mock_writer_cls.return_value.write_main.call_count == 0
+    lifecycle = SkillLifecycleManager(repeated_success_threshold=3)
+    assert SkillLifecycleFileStore(candidate_path).load(lifecycle) == 2
+    assert all(item.state == SkillCandidateState.OBSERVED for item in lifecycle.all())
+
+
+async def test_candidate_materializes_only_after_explicit_review(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = MemoryRoot(tmp_path)
+    writer = AgentSkillWriter(root=root)
+    monkeypatch.setattr(mod, "_writer", writer, raising=False)
+    skill = _algo_skill(name="reviewed_skill")
+    event = _event()
+    candidate_id = mod._skill_candidate_id(event, skill, agent_id=event.agent_id)
+    store = mod._skill_lifecycle_store(root, event.agent_id, "default", "default")
+    manager = SkillLifecycleManager(repeated_success_threshold=2)
+    for case_id in ("case-a", "case-b"):
+        manager.observe_success(
+            candidate_id=candidate_id,
+            pattern_key=mod._skill_pattern_key(skill),
+            name=skill.name,
+            description=skill.description,
+            procedure=skill.content,
+            case_id=case_id,
+            project_id="default",
+            metadata={"cluster_id": event.cluster_id},
+        )
+    store.save(manager)
+
+    path = await accept_skill_candidate(
+        candidate_id,
+        agent_id=event.agent_id,
+        app_id="default",
+        project_id="default",
+        reusable=False,
+    )
+    assert path.is_file()
+    restored = SkillLifecycleManager(repeated_success_threshold=2)
+    store.load(restored)
+    assert restored.get(candidate_id).state == SkillCandidateState.ACCEPTED  # type: ignore[union-attr]
+    assert await retire_skill_candidate(
+        candidate_id,
+        agent_id=event.agent_id,
+        app_id="default",
+        project_id="default",
+    )
+    assert not path.exists()
 
 
 @pytest.mark.parametrize(

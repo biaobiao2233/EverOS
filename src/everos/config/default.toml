@@ -149,6 +149,11 @@ max_concurrent  = 5
 # Passed through to ``everalgo.BoundaryDetector.adetect``.
 hard_token_limit = 65536
 hard_msg_limit = 500
+# A detector may ask the caller to wait for a more interpretable tail. These
+# lifecycle deadlines only retry/close already-authorized rows; they never
+# grant stage/publish authority.
+idle_timeout_seconds = 3.0
+max_delay_seconds = 30.0
 
 [search]
 # Vector retrieval strategy when SearchMethod.VECTOR is selected.

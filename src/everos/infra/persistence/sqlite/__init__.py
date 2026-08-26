@@ -30,6 +30,7 @@ not need to manage either.
 # ``create_all`` without callers having to import each model module.
 from . import tables as tables  # noqa: F401
 from .repos import QueueSummary as QueueSummary
+from .repos import boundary_lifecycle_repo as boundary_lifecycle_repo
 from .repos import cluster_repo as cluster_repo
 from .repos import conversation_status_repo as conversation_status_repo
 from .repos import md_change_state_repo as md_change_state_repo
@@ -41,6 +42,7 @@ from .repos import unprocessed_buffer_repo as unprocessed_buffer_repo
 from .sqlite_manager import dispose_engine as dispose_engine
 from .sqlite_manager import get_engine as get_engine
 from .sqlite_manager import get_session_factory as get_session_factory
+from .tables import BoundaryLifecycle as BoundaryLifecycle
 from .tables import Cluster as Cluster
 from .tables import ClusterMember as ClusterMember
 from .tables import ConversationStatus as ConversationStatus
@@ -53,6 +55,7 @@ from .tables import UnprocessedBuffer as UnprocessedBuffer
 __all__ = [
     "Cluster",
     "ClusterMember",
+    "BoundaryLifecycle",
     "ConversationStatus",
     "MdChangeState",
     "Memcell",
@@ -61,6 +64,7 @@ __all__ = [
     "QueueSummary",
     "UnprocessedBuffer",
     "cluster_repo",
+    "boundary_lifecycle_repo",
     "conversation_status_repo",
     "dispose_engine",
     "get_engine",

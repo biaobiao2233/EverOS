@@ -79,6 +79,7 @@ async def search_episodes_agentic(
     reranker: RerankProvider,
     llm: LLMClient,
     top_k: int,
+    candidate_filter: Callable[[list[Candidate]], list[Candidate]] | None = None,
 ) -> list[SearchEpisodeItem]:
     """Episode AGENTIC search via cluster-scoped MaxSim — 1:1 with benchmark.
 
@@ -92,6 +93,8 @@ async def search_episodes_agentic(
         reranker: Cross-encoder rerank provider.
         llm: LLM client for sufficiency check + multi-query generation.
         top_k: Maximum episodes to return (maps to ``top_n`` in aagentic_retrieve).
+        candidate_filter: Optional truth/authority gate applied before any
+            candidate can enter the agentic prompt or rerank lanes.
 
     Returns:
         Ranked list of at most ``top_k`` ``SearchEpisodeItem`` objects.
@@ -104,17 +107,25 @@ async def search_episodes_agentic(
         if not vec:
             return []
         child_limit = min(k * _FACT_CHILD_MULTIPLIER, _FACT_CHILD_CAP)
-        return await atomic_fact_recaller.dense_recall(vec, where, limit=child_limit)
+        candidates = await atomic_fact_recaller.dense_recall(
+            vec, where, limit=child_limit
+        )
+        return candidate_filter(candidates) if candidate_filter else candidates
 
     async def _fact_sparse(q: str, k: int) -> list[Candidate]:
         child_limit = min(k * _FACT_CHILD_MULTIPLIER, _FACT_CHILD_CAP)
-        return await atomic_fact_recaller.sparse_recall(q, where, limit=child_limit)
+        candidates = await atomic_fact_recaller.sparse_recall(
+            q, where, limit=child_limit
+        )
+        return candidate_filter(candidates) if candidate_filter else candidates
 
     # 2. parent_fetch: maps memcell_ids -> Candidate(id=memcell_id) for the amaxsim
     #    score lookup. Stores the real LanceDB episode id in metadata["episode_id"]
     #    for final shaping.
     async def _parent_fetch(memcell_ids: list[str]) -> list[Candidate]:
         ep_cands = await episode_recaller.fetch_by_parent_ids(memcell_ids, where)
+        if candidate_filter:
+            ep_cands = candidate_filter(ep_cands)
         result: list[Candidate] = []
         for c in ep_cands:
             mc_id = c.metadata.get("parent_id")
@@ -169,6 +180,8 @@ async def search_episodes_agentic(
     #    body and a ms-epoch date instead of the memcell id.
     clusters: list[Cluster] = await cluster_repo.list_for_owner(owner_id, "user_memory")
     raw_all_docs = await episode_recaller.fetch_all_for_owner(where)
+    if candidate_filter:
+        raw_all_docs = candidate_filter(raw_all_docs)
     all_docs: list[Candidate] = [
         c.model_copy(update={"metadata": _to_everalgo_doc_metadata(c.metadata)})
         for c in raw_all_docs

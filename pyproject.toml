@@ -186,11 +186,13 @@ forbidden_modules = [
 # in this whitelist.
 ignore_imports = [
     "everos.infra.persistence.sqlite -> everos.infra.persistence.sqlite.tables",
+    "everos.infra.persistence.sqlite.tables -> everos.infra.persistence.sqlite.tables.boundary_lifecycle",
     "everos.infra.persistence.sqlite -> everos.infra.persistence.sqlite.repos",
     "everos.infra.persistence.sqlite -> everos.infra.persistence.sqlite.sqlite_manager",
     "everos.infra.persistence.lancedb -> everos.infra.persistence.lancedb.tables",
     "everos.infra.persistence.lancedb -> everos.infra.persistence.lancedb.repos",
     "everos.infra.persistence.lancedb -> everos.infra.persistence.lancedb.lancedb_manager",
+    "everos.infra.persistence.lancedb -> everos.infra.persistence.lancedb.migration",
     "everos.infra.persistence.markdown -> everos.infra.persistence.markdown.mds",
     "everos.infra.persistence.markdown -> everos.infra.persistence.markdown.writers",
     "everos.infra.persistence.markdown -> everos.infra.persistence.markdown.readers",

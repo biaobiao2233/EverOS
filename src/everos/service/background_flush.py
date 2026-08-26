@@ -13,15 +13,18 @@ from contextlib import suppress
 from everos.core.observability.logging import get_logger
 from everos.core.persistence import MemoryRoot
 from everos.infra.persistence.sqlite import memory_operation_repo
+from everos.memory.knowledge.lifecycle import BoundaryLifecycleStore
 
 from ._session_lock import scoped_session_lock
-from .memorize import run_background_flush_operation
+from .memorize import memorize, run_background_flush_operation
 
 logger = get_logger(__name__)
 
 
 class BackgroundFlushScheduler:
     """Single-worker dispatcher backed by the persistent operation ledger."""
+
+    _LIFECYCLE_SCAN_INTERVAL_SECONDS = 1.0
 
     def __init__(self) -> None:
         self._wake_queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
@@ -54,7 +57,22 @@ class BackgroundFlushScheduler:
 
     async def _run(self) -> None:
         while True:
-            await self._wake_queue.get()
+            # A lifecycle deadline must be serviced even when no new HTTP
+            # request arrives. The bounded timeout is only a wake-up poll;
+            # authority is still checked by the normal boundary state machine.
+            try:
+                await asyncio.wait_for(
+                    self._wake_queue.get(),
+                    timeout=self._LIFECYCLE_SCAN_INTERVAL_SECONDS,
+                )
+            except TimeoutError:
+                try:
+                    await run_due_lifecycle_flushes()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("background_lifecycle_flush_failed")
+                continue
             attempted: set[str] = set()
             while True:
                 pending = await memory_operation_repo.list_background_flush_pending()
@@ -87,9 +105,44 @@ class BackgroundFlushScheduler:
                         "background_flush_failed",
                         extra={"operation_id": operation.operation_id},
                     )
+            try:
+                await run_due_lifecycle_flushes()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("background_lifecycle_flush_failed")
 
 
 _scheduler = BackgroundFlushScheduler()
+
+
+async def run_due_lifecycle_flushes() -> int:
+    """Close due, already-authorized tails through the normal boundary path.
+
+    This helper is intentionally explicit so tests, a service heartbeat, or a
+    future scheduler can invoke it. It does not publish staged rows: the
+    boundary's authority partition remains the first gate.
+    """
+
+    records = await BoundaryLifecycleStore().list_due()
+    processed = 0
+    for record in records:
+        # ``memorize`` owns the per-session lock for its full
+        # read/merge/extract/write transaction. Do not acquire it here too:
+        # portalocker is intentionally non-reentrant, so a wrapper lock would
+        # deadlock the scheduler against itself.
+        await memorize(
+            {
+                "session_id": record.session_id,
+                "app_id": record.app_id,
+                "project_id": record.project_id,
+                "messages": [],
+            },
+            is_final=True,
+            background_worker=True,
+        )
+        processed += 1
+    return processed
 
 
 def get_background_flush_scheduler() -> BackgroundFlushScheduler:

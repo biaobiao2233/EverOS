@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, Field, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -236,6 +236,16 @@ class BoundaryDetectionSettings(BaseModel):
 
     hard_token_limit: int = Field(default=65536, ge=1)
     hard_msg_limit: int = Field(default=500, ge=1)
+    idle_timeout_seconds: float = Field(default=3.0, gt=0)
+    max_delay_seconds: float = Field(default=30.0, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_lifecycle_deadlines(self) -> BoundaryDetectionSettings:
+        if self.idle_timeout_seconds > self.max_delay_seconds:
+            raise ValueError(
+                "boundary idle_timeout_seconds cannot exceed max_delay_seconds"
+            )
+        return self
 
 
 class MemorizeSettings(BaseModel):

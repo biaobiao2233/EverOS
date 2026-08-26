@@ -45,24 +45,16 @@ has assigned the fresh case to its cluster. The strategy:
    thinner prompt this run (non-corrupting; the next run catches up),
    not a wrong write.
 4. Feeds the target + existing + supporting trio to
-   :class:`everalgo.agent_memory.AgentSkillExtractor`, then writes the
-   emitted skills back via :class:`AgentSkillWriter` and reaps the
-   directory an update left behind when it renamed a skill (see
-   :func:`_reap_renamed_skills`).
+   :class:`everalgo.agent_memory.AgentSkillExtractor`. Updates to already
+   accepted skills go through :class:`AgentSkillWriter`; new skills first
+   enter a durable candidate sidecar and need repeated success plus explicit
+   review before materialization (see :func:`accept_skill_candidate`).
 
-**Retire is not implemented.** ``AgentSkillExtractor.aextract`` returns a
-flat ``list[AgentSkill]`` with no op discriminator; its retire branch
-(``skill_ops._apply_update``, taken when ``confidence <
-retire_confidence``, default ``0.1``) is an ordinary skill carrying a
-lowered confidence and nothing else. This strategy writes every emitted
-skill back the same way, so a retirement persists as a normal skill: it
-stays in markdown, stays in the next run's prompt, and stays searchable.
-Honouring it means choosing between deleting the directory — handing an
-LLM-produced confidence score the authority to destroy the source of
-truth — and a ``retired`` frontmatter flag, which only works if the
-enumeration, cascade, and search all learn to filter on it. That is a
-design decision, not an omission to patch over, so it is deferred and
-stated here rather than left implied by a docstring listing three ops.
+Retirement remains explicit: the flat algo result cannot distinguish a
+retire operation from an ordinary update, so the strategy never lets a low
+confidence LLM output destroy an accepted source. The lifecycle manager
+supports review-time supersession/retirement; a caller may apply that
+decision explicitly after inspecting the candidate evidence.
 
 Per-case granularity (one strategy run per fresh case) — algo
 short-circuits low-quality cases internally via its own
@@ -72,6 +64,8 @@ short-circuits low-quality cases internally via its own
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -111,6 +105,12 @@ from everos.infra.persistence.markdown import (
 )
 from everos.infra.persistence.sqlite import cluster_repo
 from everos.memory.events import SkillClusterUpdated
+from everos.memory.knowledge.skills import (
+    SkillCandidateState,
+    SkillLifecycleFileStore,
+    SkillLifecycleManager,
+    sanitize_skill_name,
+)
 from everos.memory.prompt_slots import PromptLoader
 from everos.memory.strategies._partition_locks import get_partition_lock
 
@@ -146,6 +146,13 @@ class _CaseNotYetIndexedError(RuntimeError):
     markdown must never dead-letter merely because its LanceDB projection
     lags (see :func:`_load_target_case`).
     """
+
+
+SKILL_REPEATED_SUCCESS_THRESHOLD = 3
+"""Successful Case observations required before a new Skill can enter review."""
+
+SKILL_FAILURE_QUALITY_THRESHOLD = 0.5
+"""Cases below this quality do not create or update procedural memory."""
 
 
 @dataclass(frozen=True)
@@ -300,9 +307,23 @@ async def extract_agent_skill(event: SkillClusterUpdated, ctx: StrategyContext) 
             prompt_failure=prompt_loader.load("agent_skill_failure"),
         )
 
-        # 6. Write each emitted skill back to its SKILL.md, then reap the
-        #    directories that a rename left behind.
+        # 6. Existing accepted skills may be updated by a qualifying case.
+        #    A new skill is different: it enters the durable candidate queue
+        #    and cannot reach SKILL.md until repeated success plus explicit
+        #    review/acceptance have happened.
         writer = _get_writer()
+        writer_root = getattr(writer, "_root", None)
+        root = (
+            writer_root if isinstance(writer_root, MemoryRoot) else MemoryRoot.default()
+        )
+        lifecycle_store = _skill_lifecycle_store(
+            root, event.agent_id, event.app_id, event.project_id
+        )
+        lifecycle_manager = SkillLifecycleManager(
+            repeated_success_threshold=SKILL_REPEATED_SUCCESS_THRESHOLD
+        )
+        await asyncio.to_thread(lifecycle_store.load, lifecycle_manager)
+        existing_ids = {skill.id for skill in existing_skills}
         written_names: dict[str, str] = {}
         persisted = 0
         rejected = 0
@@ -318,6 +339,56 @@ async def extract_agent_skill(event: SkillClusterUpdated, ctx: StrategyContext) 
                     safety_rule=rejection_reason,
                 )
                 continue
+            if target.quality_score < SKILL_FAILURE_QUALITY_THRESHOLD:
+                candidate_id = _skill_candidate_id(
+                    event, skill, agent_id=event.agent_id
+                )
+                if lifecycle_manager.get(candidate_id) is not None:
+                    lifecycle_manager.observe_failure(candidate_id, event.case_entry_id)
+                    await asyncio.to_thread(lifecycle_store.save, lifecycle_manager)
+                rejected += 1
+                continue
+            if skill.id not in existing_ids:
+                candidate_id = _skill_candidate_id(
+                    event, skill, agent_id=event.agent_id
+                )
+                try:
+                    candidate = lifecycle_manager.observe_success(
+                        candidate_id=candidate_id,
+                        pattern_key=_skill_pattern_key(skill),
+                        name=skill.name,
+                        description=skill.description,
+                        procedure=skill.content,
+                        case_id=event.case_entry_id,
+                        project_id=event.project_id,
+                        metadata={
+                            "agent_id": event.agent_id,
+                            "app_id": event.app_id,
+                            "project_id": event.project_id,
+                            "cluster_id": event.cluster_id,
+                        },
+                    )
+                except ValueError:
+                    # A terminal/rejected candidate cannot be silently revived
+                    # by a repeated LLM add. Keep the event auditable and move
+                    # on; a future pattern gets a new deterministic identity.
+                    rejected += 1
+                    logger.warning(
+                        "agent_skill_candidate_rejected_by_lifecycle",
+                        case_entry_id=event.case_entry_id,
+                        candidate_id=candidate_id,
+                    )
+                    continue
+                await asyncio.to_thread(lifecycle_store.save, lifecycle_manager)
+                logger.info(
+                    "agent_skill_candidate_checkpointed",
+                    case_entry_id=event.case_entry_id,
+                    candidate_id=candidate.candidate_id,
+                    candidate_state=candidate.state.value,
+                    success_count=len(candidate.success_case_ids),
+                )
+                rejected += 1
+                continue
             written_names[skill.id] = await _persist_skill(
                 writer,
                 skill,
@@ -327,6 +398,9 @@ async def extract_agent_skill(event: SkillClusterUpdated, ctx: StrategyContext) 
                 project_id=event.project_id,
             )
             persisted += 1
+        # The queue is a review boundary, not an auto-accept path. The
+        # explicit ``accept_skill_candidate`` helper below is the only route
+        # that materializes a new candidate as a reusable/local Skill.
         await _reap_renamed_skills(
             writer,
             written_names,
@@ -385,6 +459,7 @@ async def _load_target_case(
     lance = await agent_case_repo.find_by_owner_entry(
         agent_id, case_entry_id, app_id=app_id, project_id=project_id
     )
+
     if lance is not None:
         return _lance_to_target(lance)
 
@@ -398,6 +473,117 @@ async def _load_target_case(
         f"AgentCase entry_id={case_entry_id} found neither in LanceDB nor "
         "in markdown yet; retrying"
     )
+
+
+def _skill_pattern_key(skill: AlgoAgentSkill) -> str:
+    """Build a stable, name-plus-description identity for repeated adds."""
+
+    name = sanitize_skill_name(skill.name)
+    description = " ".join(skill.description.casefold().split())
+    return f"{name}:{hashlib.sha256(description.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _skill_candidate_id(
+    event: SkillClusterUpdated, skill: AlgoAgentSkill, *, agent_id: str
+) -> str:
+    payload = "\0".join(
+        (event.app_id, event.project_id, agent_id, _skill_pattern_key(skill))
+    )
+    return f"sc_{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
+
+
+def _skill_lifecycle_store(
+    root: MemoryRoot, agent_id: str, app_id: str, project_id: str
+) -> SkillLifecycleFileStore:
+    """Resolve a scope-hashed sidecar so candidate paths reveal no IDs."""
+
+    scope = "\0".join((app_id, project_id, agent_id))
+    digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    return SkillLifecycleFileStore(
+        root.index_dir / "skill-lifecycle" / f"{digest}.json"
+    )
+
+
+async def accept_skill_candidate(
+    candidate_id: str,
+    *,
+    agent_id: str,
+    app_id: str = "default",
+    project_id: str = "default",
+    reusable: bool = False,
+) -> Path:
+    """Explicitly review and materialize one durable Skill candidate.
+
+    This is intentionally a callable authority boundary rather than an
+    automatic background transition. The candidate must first have reached
+    ``CANDIDATE`` through repeated successful Cases; callers choose whether
+    the result is local/project-specific or reusable.
+    """
+
+    writer = _get_writer()
+    root = getattr(writer, "_root", MemoryRoot.default())
+    store = _skill_lifecycle_store(root, agent_id, app_id, project_id)
+    manager = SkillLifecycleManager(
+        repeated_success_threshold=SKILL_REPEATED_SUCCESS_THRESHOLD
+    )
+    await asyncio.to_thread(store.load, manager)
+    candidate = manager.get(candidate_id)
+    if candidate is None:
+        raise KeyError(candidate_id)
+    if candidate.state == SkillCandidateState.CANDIDATE:
+        manager.submit_for_review(candidate_id)
+    accepted = manager.accept(candidate_id, reusable=reusable)
+    name = sanitize_skill_name(accepted.name)
+    frontmatter = AgentSkillFrontmatter(
+        id=f"{agent_id}_{name}",
+        agent_id=agent_id,
+        name=name,
+        description=accepted.description,
+        confidence=1.0,
+        maturity_score=1.0,
+        source_case_ids=list(accepted.success_case_ids),
+        cluster_id=accepted.metadata.get("cluster_id"),
+    )
+    path = await writer.write_main(
+        agent_id,
+        name,
+        frontmatter=frontmatter,
+        body=accepted.procedure,
+        app_id=app_id,
+        project_id=project_id,
+    )
+    await asyncio.to_thread(store.save, manager)
+    return path
+
+
+async def retire_skill_candidate(
+    candidate_id: str,
+    *,
+    agent_id: str,
+    app_id: str = "default",
+    project_id: str = "default",
+) -> bool:
+    """Explicitly retire a reviewed Skill and remove its searchable file."""
+
+    writer = _get_writer()
+    root = getattr(writer, "_root", None)
+    if not isinstance(root, MemoryRoot):
+        root = MemoryRoot.default()
+    store = _skill_lifecycle_store(root, agent_id, app_id, project_id)
+    manager = SkillLifecycleManager(
+        repeated_success_threshold=SKILL_REPEATED_SUCCESS_THRESHOLD
+    )
+    await asyncio.to_thread(store.load, manager)
+    candidate = manager.get(candidate_id)
+    if candidate is None:
+        raise KeyError(candidate_id)
+    name = sanitize_skill_name(candidate.name)
+    manager.retire(candidate_id)
+    removed = await writer.delete_skill(
+        agent_id, name, app_id=app_id, project_id=project_id
+    )
+    await asyncio.to_thread(store.save, manager)
+    return removed
 
 
 async def _rescue_target_from_markdown(

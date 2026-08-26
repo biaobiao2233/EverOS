@@ -4,6 +4,7 @@ Repository instances for business tables, wired to the process-wide
 engine singleton.
 """
 
+from .boundary_lifecycle import boundary_lifecycle_repo as boundary_lifecycle_repo
 from .cluster import cluster_repo as cluster_repo
 from .cluster import mint_cluster_id as mint_cluster_id
 from .conversation_status import conversation_status_repo as conversation_status_repo
@@ -19,6 +20,7 @@ from .unprocessed_buffer import unprocessed_buffer_repo as unprocessed_buffer_re
 __all__ = [
     "QueueSummary",
     "cluster_repo",
+    "boundary_lifecycle_repo",
     "conversation_status_repo",
     "md_change_state_repo",
     "memcell_repo",

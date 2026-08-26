@@ -28,6 +28,15 @@ from . import tables as tables  # noqa: F401
 from .lancedb_manager import dispose_connection as dispose_connection
 from .lancedb_manager import get_connection as get_connection
 from .lancedb_manager import get_table as get_table
+from .migration import (
+    LanceDBApiProbe as LanceDBApiProbe,
+    LanceDBCopyEvidence as LanceDBCopyEvidence,
+    LanceDBMigrationProbeError as LanceDBMigrationProbeError,
+    LanceDBUpgradeAssessment as LanceDBUpgradeAssessment,
+    assess_engine_upgrade as assess_engine_upgrade,
+    probe_isolated_copy as probe_isolated_copy,
+    probe_local_api as probe_local_api,
+)
 from .repos import agent_case_repo as agent_case_repo
 from .repos import agent_skill_repo as agent_skill_repo
 from .repos import atomic_fact_repo as atomic_fact_repo
@@ -116,10 +125,15 @@ __all__ = [
     "Episode",
     "Foresight",
     "LanceDBSchemaMismatchError",
+    "LanceDBApiProbe",
+    "LanceDBCopyEvidence",
+    "LanceDBMigrationProbeError",
+    "LanceDBUpgradeAssessment",
     "ParentType",
     "UserProfile",
     "agent_case_repo",
     "agent_skill_repo",
+    "assess_engine_upgrade",
     "atomic_fact_repo",
     "dispose_connection",
     "ensure_business_indexes",
@@ -129,4 +143,6 @@ __all__ = [
     "get_table",
     "user_profile_repo",
     "verify_business_schemas",
+    "probe_isolated_copy",
+    "probe_local_api",
 ]

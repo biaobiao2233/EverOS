@@ -321,6 +321,18 @@ def _receipt_rows(tmp_path: Path) -> list[sqlite3.Row]:
         conn.close()
 
 
+def _lifecycle_rows(tmp_path: Path) -> list[sqlite3.Row]:
+    db = tmp_path / ".index" / "sqlite" / "system.db"
+    if not db.is_file():
+        return []
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    try:
+        return list(conn.execute("SELECT * FROM boundary_lifecycle"))
+    finally:
+        conn.close()
+
+
 def _episode_paths(tmp_path: Path) -> list[Path]:
     base = tmp_path / "default_app" / "default_project" / "users"
     return sorted(base.rglob("episode-*.md"))
@@ -1040,6 +1052,7 @@ async def test_pending_publish_blocks_flush_then_consumes_and_late_replay_is_noo
     assert {row["authority_state"] for row in _receipt_rows(tmp_path)} == {
         "pending_publish"
     }
+    assert _lifecycle_rows(tmp_path)[0]["state"] == "blocked_pending_publish"
 
     publish_payload = {
         "operation_id": "evop1-publish-" + "a" * 64,
@@ -1064,11 +1077,13 @@ async def test_pending_publish_blocks_flush_then_consumes_and_late_replay_is_noo
     assert publish_receipt.kind == "publish"
     assert publish_receipt.stage == "messages_published"
     assert publish_receipt.state == "completed"
+    assert _lifecycle_rows(tmp_path)[0]["state"] == "waiting"
 
     flushed = await memorize({"session_id": sid, "messages": []}, is_final=True)
     assert flushed.status == "extracted"
     assert _buffer_count(tmp_path) == 0
     assert len(_memcell_rows(tmp_path)) == 1
+    assert _lifecycle_rows(tmp_path)[0]["state"] == "consumed"
     assert {row["authority_state"] for row in _receipt_rows(tmp_path)} == {"consumed"}
 
     late = await stage(

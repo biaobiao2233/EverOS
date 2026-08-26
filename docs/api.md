@@ -688,6 +688,9 @@ optional final LLM rerank. Returns ranked items grouped by kind.
 | `include_profile` | `boolean` | no | `false` | — |
 | `enable_llm_rerank` | `boolean` | no | `false` | — |
 | `filters` | [FilterNode](#filternode-filter-dsl) `\| null` | no | `null` | — |
+| `truth_view` | `current \| history \| all_accepted` | no | `"current"` | `current` hides history, expired, superseded, and unresolved-conflict claims |
+| `as_of` | `string \| null` | no | `null` | ISO-8601 timestamp used for temporal validity |
+| `include_candidates` | `boolean` | no | `false` | Explicitly opt in to candidate claims; authority is never inferred |
 
 **`user_id` / `agent_id`** — **Exactly one** must be set. Determines
 which track is searched: `user_id` → user-memory (episodes /
