@@ -30,11 +30,23 @@ from .lancedb_manager import get_connection as get_connection
 from .lancedb_manager import get_table as get_table
 from .migration import (
     LanceDBApiProbe as LanceDBApiProbe,
+)
+from .migration import (
     LanceDBCopyEvidence as LanceDBCopyEvidence,
+)
+from .migration import (
     LanceDBMigrationProbeError as LanceDBMigrationProbeError,
+)
+from .migration import (
     LanceDBUpgradeAssessment as LanceDBUpgradeAssessment,
+)
+from .migration import (
     assess_engine_upgrade as assess_engine_upgrade,
+)
+from .migration import (
     probe_isolated_copy as probe_isolated_copy,
+)
+from .migration import (
     probe_local_api as probe_local_api,
 )
 from .repos import agent_case_repo as agent_case_repo
