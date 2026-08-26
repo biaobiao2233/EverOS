@@ -192,25 +192,28 @@ def retrieve_candidates(
         "valid_until",
         "conflict_group",
     }
-    if not any(envelope_keys & candidate.metadata.keys() for candidate in candidates):
-        # Existing 0.30.2 rows are already the accepted semantic-memory
-        # projection and have no envelope columns. Preserve their exact
-        # ranking/score until a writer adds explicit truth metadata.
-        return list(candidates) if top_k < 0 else list(candidates[:top_k])
+    legacy_ids: set[str] = set()
     for candidate in candidates:
         by_id[candidate.id] = candidate
         metadata = candidate.metadata
         has_envelope = bool(envelope_keys & metadata.keys())
+        if not has_envelope:
+            legacy_ids.add(candidate.id)
         claims.append(
             TruthClaim(
                 claim_id=candidate.id,
                 text=_candidate_text(metadata),
                 kind=str(metadata.get("kind", "memory")),
-                # Rows from the pre-envelope schema have no tenant fields.
-                # Treat them as already accepted/current and inherit the
-                # caller's scope so a mixed old/new recall pool does not
-                # silently lose otherwise compatible legacy rows.
-                scope=(_candidate_scope(metadata) if has_envelope else dict(scope)),
+                # Rows from the pre-envelope schema are inferred as
+                # accepted/current, but they still pass the same scope and
+                # temporal/authority gate. Complete persisted scopes are
+                # authoritative; partial hand-built legacy fixtures retain
+                # the pre-envelope compatibility behaviour.
+                scope=(
+                    _candidate_scope(metadata)
+                    if has_envelope or set(scope).issubset(_candidate_scope(metadata))
+                    else dict(scope)
+                ),
                 authority=_authority(metadata),
                 truth_class=_truth_class(metadata),
                 superseded_by=_optional_str(metadata.get("superseded_by")),
@@ -221,7 +224,11 @@ def retrieve_candidates(
                 created_at=_optional_datetime(metadata.get("created_at")),
                 semantic_score=_score_for_source(candidate, "vector"),
                 bm25_score=_score_for_source(candidate, "keyword"),
-                metadata=metadata,
+                metadata=(
+                    {**metadata, "_legacy_schema_default": True}
+                    if not has_envelope
+                    else metadata
+                ),
             )
         )
     ranked = TruthAwareRetriever().retrieve(
@@ -241,7 +248,10 @@ def retrieve_candidates(
         result.append(
             Candidate(
                 id=source.id,
-                score=hit.score,
+                # The old schema has no persisted envelope or score fields.
+                # Keep its recall score stable while still making the row
+                # pass the common truth gate above.
+                score=source.score if source.id in legacy_ids else hit.score,
                 source=source.source,
                 metadata={**source.metadata, "truth_rank_reasons": list(hit.reasons)},
             )

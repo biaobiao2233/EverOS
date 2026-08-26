@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from everalgo.types import Candidate
+from everalgo.types import Candidate, FactCandidate
 from prometheus_client import CollectorRegistry
 
 from everos.memory.knowledge import (
@@ -297,6 +297,68 @@ def test_candidate_adapter_keeps_legacy_rows_compatible_and_gates_enveloped_rows
     ] == ["legacy", "legacy-2"]
 
 
+def test_legacy_rows_still_pass_truth_gate_and_enforce_complete_scope() -> None:
+    current = Candidate(
+        id="legacy-current",
+        score=0.8,
+        source="vector",
+        metadata={**SCOPE, "content": "current deployment"},
+    )
+    wrong_scope = Candidate(
+        id="legacy-wrong-scope",
+        score=1.0,
+        source="vector",
+        metadata={"app_id": "other", "project_id": "p", "owner_id": "u"},
+    )
+
+    visible = retrieve_candidates(
+        [current, wrong_scope], query="deployment", scope=SCOPE, top_k=10
+    )
+    assert [item.id for item in visible] == ["legacy-current"]
+    assert (
+        retrieve_candidates(
+            [current],
+            query="deployment history",
+            scope=SCOPE,
+            view=TruthView.HISTORY,
+            top_k=10,
+        )
+        == []
+    )
+
+
+def test_hierarchy_fact_filter_adapts_fact_candidates_before_truth_gate() -> None:
+    from everos.memory.search.hierarchy import _filter_fact_candidates
+
+    facts = [
+        FactCandidate(
+            id="accepted-fact",
+            parent_episode_id="episode-1",
+            score=0.8,
+            metadata={**SCOPE, "fact": "accepted deployment", "authority": "accepted"},
+        ),
+        FactCandidate(
+            id="candidate-fact",
+            parent_episode_id="episode-1",
+            score=1.0,
+            metadata={
+                **SCOPE,
+                "fact": "candidate deployment",
+                "authority": "candidate",
+            },
+        ),
+    ]
+
+    filtered = _filter_fact_candidates(
+        facts,
+        lambda candidates: retrieve_candidates(
+            candidates, query="deployment", scope=SCOPE, top_k=10
+        ),
+    )
+    assert [fact.id for fact in filtered] == ["accepted-fact"]
+    assert filtered[0].parent_episode_id == "episode-1"
+
+
 def test_current_view_excludes_unresolved_conflict_class_without_group() -> None:
     conflict = _claim(
         "conflict-class",
@@ -567,6 +629,62 @@ async def test_due_lifecycle_flush_delegates_session_lock_to_memorize(
         is_final=True,
         background_worker=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_due_lifecycle_recovers_after_publish_commit_before_rearm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A committed publish must not strand a due blocked checkpoint."""
+
+    from everos.infra.persistence.sqlite import BoundaryLifecycle
+    from everos.memory.knowledge import lifecycle as lifecycle_module
+
+    row = BoundaryLifecycle(
+        lifecycle_id="lifecycle-crash-window",
+        app_id="a",
+        project_id="p",
+        session_id="s",
+        track="memorize",
+        revision=1,
+        message_digest="digest",
+        message_ids_json='["m-1"]',
+        should_wait=True,
+        state="blocked_pending_publish",
+        authority_state="pending_publish",
+        observed_at=NOW,
+        idle_deadline=NOW - dt.timedelta(seconds=1),
+        max_deadline=NOW + dt.timedelta(seconds=10),
+    )
+
+    class FakeLifecycleRepo:
+        def __init__(self) -> None:
+            self.saved: list[BoundaryLifecycle] = []
+
+        async def list_due(self, _now: dt.datetime) -> list[BoundaryLifecycle]:
+            return [row]
+
+        async def upsert(self, saved: BoundaryLifecycle) -> None:
+            self.saved.append(saved)
+
+    class FakeReceiptRepo:
+        async def map_by_message_ids(
+            self, _message_ids: tuple[str, ...]
+        ) -> dict[str, SimpleNamespace]:
+            return {"m-1": SimpleNamespace(authority_state="published")}
+
+    lifecycle_repo = FakeLifecycleRepo()
+    monkeypatch.setattr(lifecycle_module, "boundary_lifecycle_repo", lifecycle_repo)
+    monkeypatch.setattr(
+        lifecycle_module, "memory_message_receipt_repo", FakeReceiptRepo()
+    )
+
+    due = await lifecycle_module.BoundaryLifecycleStore().list_due(now=NOW)
+
+    assert len(due) == 1
+    assert due[0].state == BoundaryLifecycleState.WAITING
+    assert due[0].authority_state == "published"
+    assert lifecycle_repo.saved[0].state == "waiting"
 
 
 def test_knowledge_surfaces_export_low_cardinality_metrics() -> None:

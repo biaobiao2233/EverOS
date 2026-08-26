@@ -15,7 +15,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from everos.component.utils.datetime import ensure_utc, get_utc_now
-from everos.infra.persistence.sqlite import BoundaryLifecycle, boundary_lifecycle_repo
+from everos.infra.persistence.sqlite import (
+    BoundaryLifecycle,
+    boundary_lifecycle_repo,
+    memory_message_receipt_repo,
+)
 
 from .observability import observe_lifecycle_decision
 
@@ -202,7 +206,33 @@ class BoundaryLifecycleStore:
         self, now: dt.datetime | None = None
     ) -> list[BoundaryLifecycleRecord]:
         rows = await boundary_lifecycle_repo.list_due(_aware(now or get_utc_now()))
-        return [_from_row(row) for row in rows]
+        due: list[BoundaryLifecycleRecord] = []
+        for row in rows:
+            record = _from_row(row)
+            if record.state == BoundaryLifecycleState.BLOCKED_PENDING_PUBLISH:
+                # Publish commits receipt authority before the separate
+                # lifecycle checkpoint can be re-armed. If the process dies
+                # in that narrow window, surface the durable row on the next
+                # scheduler scan and repair the checkpoint before dispatching
+                # it. Pending or incomplete receipts remain fail-closed.
+                receipts = await memory_message_receipt_repo.map_by_message_ids(
+                    record.message_ids
+                )
+                if not record.message_ids or len(receipts) != len(record.message_ids):
+                    continue
+                if not all(
+                    receipt.authority_state in {"published", "consumed"}
+                    for receipt in receipts.values()
+                ):
+                    continue
+                record = _replace(
+                    record,
+                    authority_state="published",
+                    state=BoundaryLifecycleState.WAITING,
+                )
+                await self.save(record)
+            due.append(record)
+        return due
 
 
 def build_lifecycle_record(

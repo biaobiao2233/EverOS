@@ -69,7 +69,7 @@ class _BoundaryLifecycleRepo(RepoBase[BoundaryLifecycle]):
     async def list_due(self, now: dt.datetime) -> list[BoundaryLifecycle]:
         async with session_scope(self._factory) as session:
             stmt = select(BoundaryLifecycle).where(
-                BoundaryLifecycle.state == "waiting",
+                BoundaryLifecycle.state.in_(("waiting", "blocked_pending_publish")),
                 BoundaryLifecycle.consumed.is_(False),
                 (BoundaryLifecycle.max_deadline <= now)
                 | (BoundaryLifecycle.idle_deadline <= now),

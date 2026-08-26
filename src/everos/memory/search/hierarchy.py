@@ -236,16 +236,32 @@ def _filter_fact_candidates(
     facts: list[FactCandidate],
     candidate_filter: Callable[[list[Candidate]], list[Candidate]],
 ) -> list[FactCandidate]:
-    filtered = candidate_filter(list(facts))
-    return [
-        FactCandidate(
+    # ``FactCandidate`` is a distinct everalgo model and intentionally does
+    # not expose the ``Candidate.source`` field.  Adapt it at the policy
+    # boundary instead of passing it to the Candidate-based truth filter;
+    # otherwise an enveloped fact raises AttributeError (or disappears when
+    # the filter reconstructs the result) after the child recall succeeds.
+    candidates = [
+        Candidate(
             id=fact.id,
-            parent_episode_id=fact.parent_episode_id,
             score=fact.score,
+            source="other",
             metadata=dict(fact.metadata),
         )
-        for fact in filtered
-        if isinstance(fact, FactCandidate)
+        for fact in facts
+    ]
+    filtered = candidate_filter(candidates)
+    return [
+        FactCandidate(
+            id=candidate.id,
+            parent_episode_id=next(
+                (fact.parent_episode_id for fact in facts if fact.id == candidate.id),
+                "",
+            ),
+            score=candidate.score,
+            metadata=dict(candidate.metadata),
+        )
+        for candidate in filtered
     ]
 
 
