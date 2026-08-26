@@ -34,6 +34,7 @@ from .repos import cluster_repo as cluster_repo
 from .repos import conversation_status_repo as conversation_status_repo
 from .repos import md_change_state_repo as md_change_state_repo
 from .repos import memcell_repo as memcell_repo
+from .repos import memory_message_receipt_repo as memory_message_receipt_repo
 from .repos import memory_operation_repo as memory_operation_repo
 from .repos import mint_cluster_id as mint_cluster_id
 from .repos import unprocessed_buffer_repo as unprocessed_buffer_repo
@@ -45,6 +46,7 @@ from .tables import ClusterMember as ClusterMember
 from .tables import ConversationStatus as ConversationStatus
 from .tables import MdChangeState as MdChangeState
 from .tables import Memcell as Memcell
+from .tables import MemoryMessageReceipt as MemoryMessageReceipt
 from .tables import MemoryOperation as MemoryOperation
 from .tables import UnprocessedBuffer as UnprocessedBuffer
 
@@ -54,6 +56,7 @@ __all__ = [
     "ConversationStatus",
     "MdChangeState",
     "Memcell",
+    "MemoryMessageReceipt",
     "MemoryOperation",
     "QueueSummary",
     "UnprocessedBuffer",
@@ -64,6 +67,7 @@ __all__ = [
     "get_session_factory",
     "md_change_state_repo",
     "memcell_repo",
+    "memory_message_receipt_repo",
     "memory_operation_repo",
     "mint_cluster_id",
     "unprocessed_buffer_repo",

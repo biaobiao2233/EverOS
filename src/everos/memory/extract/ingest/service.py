@@ -37,7 +37,7 @@ from everos.memory.extract.parser import (
     require_multimodal,
 )
 
-from .id_gen import gen_message_id, gen_staged_message_id
+from .id_gen import gen_message_id, staged_message_identity
 from .multimodal import coerce_items, derive_text
 
 
@@ -77,13 +77,12 @@ async def process(
 
         ts_ms: int = int(m["timestamp"])
         message_id = (
-            gen_staged_message_id(
+            staged_message_identity(
                 session_id,
-                ts_ms,
                 m,
                 app_id=app_id,
                 project_id=project_id,
-            )
+            ).message_id
             if deferred
             else gen_message_id(session_id, ts_ms, idx)
         )

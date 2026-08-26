@@ -13,11 +13,12 @@ from sqlalchemy import Index
 
 from everos.core.persistence.sqlite import BaseTable, Field
 
-OperationKind = Literal["add", "stage", "flush"]
+OperationKind = Literal["add", "stage", "publish", "flush"]
 OperationState = Literal["running", "completed", "failed"]
 OperationStage = Literal[
     "claimed",
     "messages_staged",
+    "messages_published",
     "queued",
     "processing",
     "memcells_committed",

@@ -12,6 +12,7 @@ from .cluster import ClusterMember as ClusterMember
 from .conversation_status import ConversationStatus as ConversationStatus
 from .md_change_state import MdChangeState as MdChangeState
 from .memcell import Memcell as Memcell
+from .memory_message_receipt import MemoryMessageReceipt as MemoryMessageReceipt
 from .memory_operation import MemoryOperation as MemoryOperation
 from .unprocessed_buffer import UnprocessedBuffer as UnprocessedBuffer
 
@@ -21,6 +22,7 @@ __all__ = [
     "ConversationStatus",
     "MdChangeState",
     "Memcell",
+    "MemoryMessageReceipt",
     "MemoryOperation",
     "UnprocessedBuffer",
 ]

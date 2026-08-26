@@ -41,6 +41,7 @@ from everos.core.observability.logging import get_logger
 from everos.core.observability.tracing import gen_request_id
 from everos.infra.persistence.sqlite import (
     UnprocessedBuffer,
+    memory_message_receipt_repo,
     unprocessed_buffer_repo,
 )
 
@@ -209,7 +210,30 @@ class SearchManager:
             app_id=req.app_id,
             project_id=req.project_id,
         )
-        return [_unprocessed_buffer_to_dto(r) for r in rows]
+        receipts = await memory_message_receipt_repo.map_by_message_ids(
+            [row.message_id for row in rows]
+        )
+        visible: list[UnprocessedBuffer] = []
+        for row in rows:
+            receipt = receipts.get(row.message_id)
+            if (
+                receipt is None
+                and not row.message_id.startswith("ms_")
+                or receipt is not None
+                and receipt.authority_state == "published"
+            ):
+                visible.append(row)
+            elif receipt is not None and receipt.authority_state != "pending_publish":
+                # Fail closed for impossible/corrupt sidecar state: never leak
+                # a row whose authority can no longer be proven.
+                logger.error(
+                    "unprocessed_message_authority_inconsistent",
+                    extra={
+                        "message_id": row.message_id,
+                        "authority_state": receipt.authority_state,
+                    },
+                )
+        return [_unprocessed_buffer_to_dto(r) for r in visible]
 
     # ── Agent partition ─────────────────────────────────────────────
 

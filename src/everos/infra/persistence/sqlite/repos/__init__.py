@@ -10,6 +10,9 @@ from .conversation_status import conversation_status_repo as conversation_status
 from .md_change_state import QueueSummary as QueueSummary
 from .md_change_state import md_change_state_repo as md_change_state_repo
 from .memcell import memcell_repo as memcell_repo
+from .memory_message_receipt import (
+    memory_message_receipt_repo as memory_message_receipt_repo,
+)
 from .memory_operation import memory_operation_repo as memory_operation_repo
 from .unprocessed_buffer import unprocessed_buffer_repo as unprocessed_buffer_repo
 
@@ -19,6 +22,7 @@ __all__ = [
     "conversation_status_repo",
     "md_change_state_repo",
     "memcell_repo",
+    "memory_message_receipt_repo",
     "memory_operation_repo",
     "mint_cluster_id",
     "unprocessed_buffer_repo",

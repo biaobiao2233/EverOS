@@ -19,11 +19,14 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validat
 from everos.core.errors import MultimodalError
 from everos.core.observability.tracing import gen_request_id
 from everos.service import (
+    MemoryMessageConflictError,
+    MemoryMessageRecoveryError,
     MemoryOperationConflictError,
     MemoryOperationRecoveryError,
     MemoryOperationStatus,
     get_memory_operation_status,
     memorize,
+    publish,
     queue_background_flush,
     stage,
 )
@@ -43,7 +46,9 @@ _PATH_TRAVERSAL_TOKENS = frozenset({".", ".."})
 _PATH_SAFE_RE = re.compile(_PATH_SAFE_CHARSET)
 _ADD_OPERATION_ID = r"^evop1-add-[0-9a-f]{64}$"
 _STAGE_OPERATION_ID = r"^evop1-stage-[0-9a-f]{64}$"
+_PUBLISH_OPERATION_ID = r"^evop1-publish-[0-9a-f]{64}$"
 _FLUSH_OPERATION_ID = r"^evop1-flush-[0-9a-f]{64}$"
+_STAGE_SOURCE = r"^[a-z0-9_.-]{1,32}$"
 
 
 def _reject_path_traversal(value: str) -> str:
@@ -111,6 +116,24 @@ class MessageItemDTO(BaseModel):
     tool_call_id: str | None = None
 
 
+class StagedMessageItemDTO(MessageItemDTO):
+    """Message plus caller-owned logical identity for deferred ingestion."""
+
+    source: str = Field(default="api", pattern=_STAGE_SOURCE)
+    external_ref: str | None = Field(default=None, min_length=1, max_length=512)
+    revision: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_staged_identity(self) -> StagedMessageItemDTO:
+        if self.source.startswith("__"):
+            raise ValueError("staged message source uses a reserved namespace")
+        if self.source == "web" and self.external_ref is None:
+            raise ValueError("web staged messages require external_ref")
+        if self.revision != 0 and self.external_ref is None:
+            raise ValueError("revision requires external_ref")
+        return self
+
+
 class MemorizeAddRequest(BaseModel):
     session_id: str = Field(..., min_length=1, max_length=128)
     app_id: PathSafeId = Field(
@@ -141,6 +164,7 @@ class AddResponseData(BaseModel):
 
 
 class MemorizeStageRequest(MemorizeAddRequest):
+    messages: list[StagedMessageItemDTO] = Field(..., min_length=1, max_length=500)
     operation_id: str = Field(
         ...,
         pattern=_STAGE_OPERATION_ID,
@@ -153,6 +177,52 @@ class StageResponseData(BaseModel):
     status: Literal["staged"]
     operation_id: str
     replayed: bool
+    inserted_count: int = 0
+    updated_count: int = 0
+    duplicate_count: int = 0
+    stale_count: int = 0
+    consumed_replay_count: int = 0
+
+
+class PublishMessageRefDTO(BaseModel):
+    source: str = Field(default="api", pattern=_STAGE_SOURCE)
+    external_ref: str = Field(..., min_length=1, max_length=512)
+    revision: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_source_namespace(self) -> PublishMessageRefDTO:
+        if self.source.startswith("__"):
+            raise ValueError("staged message source uses a reserved namespace")
+        return self
+
+
+class MemorizePublishRequest(BaseModel):
+    session_id: str = Field(..., min_length=1, max_length=128)
+    app_id: PathSafeId = Field(
+        default="default",
+        min_length=1,
+        max_length=128,
+        pattern=_PATH_SAFE_CHARSET,
+    )
+    project_id: PathSafeId = Field(
+        default="default",
+        min_length=1,
+        max_length=128,
+        pattern=_PATH_SAFE_CHARSET,
+    )
+    messages: list[PublishMessageRefDTO] = Field(..., min_length=1, max_length=500)
+    authority_ref: str = Field(..., min_length=1, max_length=512)
+    operation_id: str = Field(..., pattern=_PUBLISH_OPERATION_ID)
+
+
+class PublishResponseData(BaseModel):
+    message_count: int
+    status: Literal["published"]
+    operation_id: str
+    replayed: bool
+    published_count: int = 0
+    already_published_count: int = 0
+    consumed_count: int = 0
 
 
 class MemorizeFlushRequest(BaseModel):
@@ -235,7 +305,12 @@ async def stage_memory(
         result = await stage(req.model_dump())
     except MultimodalError as exc:
         raise HTTPException(status_code=415, detail=str(exc)) from exc
-    except (MemoryOperationConflictError, MemoryOperationRecoveryError) as exc:
+    except (
+        MemoryMessageConflictError,
+        MemoryMessageRecoveryError,
+        MemoryOperationConflictError,
+        MemoryOperationRecoveryError,
+    ) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return SuccessEnvelope(
         request_id=request_id,
@@ -244,6 +319,42 @@ async def stage_memory(
             status=result.status,
             operation_id=result.operation_id,
             replayed=result.replayed,
+            inserted_count=result.inserted_count,
+            updated_count=result.updated_count,
+            duplicate_count=result.duplicate_count,
+            stale_count=result.stale_count,
+            consumed_replay_count=result.consumed_replay_count,
+        ),
+    )
+
+
+@router.post("/publish", response_model_exclude_none=True)
+async def publish_memory(
+    req: Annotated[MemorizePublishRequest, ...],
+    request: Request,
+) -> SuccessEnvelope[PublishResponseData]:
+    """Authorize exact staged revisions; performs no extraction."""
+
+    request_id = getattr(request.state, "request_id", None) or _gen_request_id()
+    try:
+        result = await publish(req.model_dump())
+    except (
+        MemoryMessageConflictError,
+        MemoryMessageRecoveryError,
+        MemoryOperationConflictError,
+        MemoryOperationRecoveryError,
+    ) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return SuccessEnvelope(
+        request_id=request_id,
+        data=PublishResponseData(
+            message_count=result.message_count,
+            status=result.status,
+            operation_id=result.operation_id,
+            replayed=result.replayed,
+            published_count=result.published_count,
+            already_published_count=result.already_published_count,
+            consumed_count=result.consumed_count,
         ),
     )
 
@@ -315,7 +426,9 @@ async def memory_operation_status(
 ) -> SuccessEnvelope[MemoryOperationStatus]:
     """Inspect a write receipt without returning conversation content."""
 
-    if not re.fullmatch(r"evop1-(?:add|stage|flush)-[0-9a-f]{64}", operation_id):
+    if not re.fullmatch(
+        r"evop1-(?:add|stage|publish|flush)-[0-9a-f]{64}", operation_id
+    ):
         raise HTTPException(status_code=422, detail="invalid operation id")
     request_id = getattr(request.state, "request_id", None) or _gen_request_id()
     try:

@@ -23,6 +23,7 @@ import json
 import sqlite3
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -34,13 +35,18 @@ from everalgo.testing.fake_llm import FakeLLMClient
 from sqlmodel import SQLModel
 
 from everos.core.persistence import MarkdownReader, MemoryRoot
+from everos.memory.search.dto import FilterNode
+from everos.memory.search.manager import SearchManager
 from everos.service.memorize import (
     BackgroundFlushResult,
     MemorizeResult,
+    MemoryMessageConflictError,
     MemoryOperationConflictError,
+    PublishResult,
     StageResult,
     get_memory_operation_status,
     memorize,
+    publish,
     queue_background_flush,
     stage,
 )
@@ -62,7 +68,13 @@ def _boundary_response(boundaries: list[int]) -> str:
 
 def _episode_response(title: str = "Test Subject", content: str = "Test body") -> str:
     """Build an ``EpisodeExtractor`` JSON response (algo schema)."""
-    return json.dumps({"title": title, "content": content})
+    return json.dumps(
+        {
+            "title": title,
+            "summary": "Faithful test summary",
+            "content": content,
+        }
+    )
 
 
 def _make_fake_llm(
@@ -238,6 +250,21 @@ def _assistant(content: str, ts: int, *, sender: str = "assistant") -> dict[str,
     return _msg("assistant", content, sender_id=sender, timestamp=ts)
 
 
+def _staged(
+    message: dict[str, Any],
+    external_ref: str,
+    *,
+    revision: int = 0,
+    source: str = "web",
+) -> dict[str, Any]:
+    return {
+        **message,
+        "source": source,
+        "external_ref": external_ref,
+        "revision": revision,
+    }
+
+
 def _memcell_rows(tmp_path: Path) -> list[sqlite3.Row]:
     db = tmp_path / ".index" / "sqlite" / "system.db"
     if not db.is_file():
@@ -259,6 +286,37 @@ def _buffer_count(tmp_path: Path) -> int:
         return conn.execute(
             "SELECT COUNT(*) FROM unprocessed_buffer WHERE track='memorize'"
         ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _buffer_texts(tmp_path: Path) -> list[str | None]:
+    db = tmp_path / ".index" / "sqlite" / "system.db"
+    if not db.is_file():
+        return []
+    conn = sqlite3.connect(db)
+    try:
+        return [
+            row[0]
+            for row in conn.execute(
+                "SELECT text FROM unprocessed_buffer "
+                "WHERE track='memorize' ORDER BY timestamp, message_id"
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def _receipt_rows(tmp_path: Path) -> list[sqlite3.Row]:
+    db = tmp_path / ".index" / "sqlite" / "system.db"
+    if not db.is_file():
+        return []
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    try:
+        return list(
+            conn.execute("SELECT * FROM memory_message_receipt ORDER BY idem_key")
+        )
     finally:
         conn.close()
 
@@ -950,6 +1008,329 @@ async def test_stage_then_legacy_add_dedupes_transport_aliases(
     assert _buffer_count(tmp_path) == 2
 
 
+async def test_pending_publish_blocks_flush_then_consumes_and_late_replay_is_noop(
+    tmp_path: Path,
+    memorize_env: Callable[..., Any],
+) -> None:
+    await memorize_env(
+        mode="chat",
+        fake_llm=_make_fake_llm(boundary_responses=[[]]),
+    )
+    sid = "publish_gate"
+    messages = [
+        _staged(_user("durable user fact", 1_700_000_000_000), "msg-user"),
+        _staged(_assistant("ack", 1_700_000_001_000), "msg-assistant"),
+    ]
+
+    staged = await stage(
+        {
+            "operation_id": "evop1-stage-" + "a" * 64,
+            "session_id": sid,
+            "messages": messages,
+        }
+    )
+    assert staged.inserted_count == 2
+    assert staged.duplicate_count == 0
+    assert _buffer_count(tmp_path) == 2
+
+    blocked = await memorize({"session_id": sid, "messages": []}, is_final=True)
+    assert blocked.status == "accumulated"
+    assert _buffer_count(tmp_path) == 2
+    assert _memcell_rows(tmp_path) == []
+    assert {row["authority_state"] for row in _receipt_rows(tmp_path)} == {
+        "pending_publish"
+    }
+
+    publish_payload = {
+        "operation_id": "evop1-publish-" + "a" * 64,
+        "session_id": sid,
+        "authority_ref": "ledger:commit-publish-gate",
+        "messages": [
+            {"source": "web", "external_ref": "msg-user", "revision": 0},
+            {
+                "source": "web",
+                "external_ref": "msg-assistant",
+                "revision": 0,
+            },
+        ],
+    }
+    published = await publish(publish_payload)
+    assert published.published_count == 2
+    assert published.already_published_count == 0
+    publish_replay = await publish(publish_payload)
+    assert publish_replay.replayed is True
+    publish_receipt = await get_memory_operation_status(publish_payload["operation_id"])
+    assert publish_receipt is not None
+    assert publish_receipt.kind == "publish"
+    assert publish_receipt.stage == "messages_published"
+    assert publish_receipt.state == "completed"
+
+    flushed = await memorize({"session_id": sid, "messages": []}, is_final=True)
+    assert flushed.status == "extracted"
+    assert _buffer_count(tmp_path) == 0
+    assert len(_memcell_rows(tmp_path)) == 1
+    assert {row["authority_state"] for row in _receipt_rows(tmp_path)} == {"consumed"}
+
+    late = await stage(
+        {
+            "operation_id": "evop1-stage-" + "b" * 64,
+            "session_id": sid,
+            "messages": messages,
+        }
+    )
+    assert late.consumed_replay_count == 2
+    assert late.inserted_count == 0
+    assert _buffer_count(tmp_path) == 0
+    again = await memorize({"session_id": sid, "messages": []}, is_final=True)
+    assert again.status == "accumulated"
+    assert len(_memcell_rows(tmp_path)) == 1
+
+
+async def test_external_identity_rechunk_dedupes_across_stage_operations(
+    tmp_path: Path,
+    memorize_env: Callable[..., Any],
+) -> None:
+    await memorize_env(mode="chat", fake_llm=_make_fake_llm())
+    sid = "external_rechunk"
+    one = _staged(_user("one", 1_700_000_000_000), "ext-one")
+    overlap = _staged(_assistant("two", 1_700_000_001_000), "ext-two")
+    three = _staged(_user("three", 1_700_000_002_000), "ext-three")
+
+    first = await stage(
+        {
+            "operation_id": "evop1-stage-" + "c" * 64,
+            "session_id": sid,
+            "messages": [one, overlap],
+        }
+    )
+    second = await stage(
+        {
+            "operation_id": "evop1-stage-" + "d" * 64,
+            "session_id": sid,
+            "messages": [overlap, three],
+        }
+    )
+
+    assert first.inserted_count == 2
+    assert second.inserted_count == 1
+    assert second.duplicate_count == 1
+    assert _buffer_count(tmp_path) == 3
+    assert len(_receipt_rows(tmp_path)) == 3
+
+
+async def test_concurrent_stage_operations_share_one_message_receipt(
+    tmp_path: Path,
+    memorize_env: Callable[..., Any],
+) -> None:
+    await memorize_env(mode="chat", fake_llm=_make_fake_llm())
+    sid = "concurrent_message_receipt"
+    message = _staged(
+        _user("one logical upload", 1_700_000_000_000),
+        "concurrent-ext-1",
+    )
+
+    first, second = await asyncio.gather(
+        stage(
+            {
+                "operation_id": "evop1-stage-" + "7" * 64,
+                "session_id": sid,
+                "messages": [message],
+            }
+        ),
+        stage(
+            {
+                "operation_id": "evop1-stage-" + "6" * 64,
+                "session_id": sid,
+                "messages": [message],
+            }
+        ),
+    )
+
+    assert sorted(
+        [
+            (first.inserted_count, first.duplicate_count),
+            (second.inserted_count, second.duplicate_count),
+        ]
+    ) == [(0, 1), (1, 0)]
+    assert _buffer_count(tmp_path) == 1
+    assert len(_receipt_rows(tmp_path)) == 1
+
+
+async def test_unpublished_stage_rows_are_hidden_from_search_context(
+    memorize_env: Callable[..., Any],
+) -> None:
+    await memorize_env(mode="chat", fake_llm=_make_fake_llm())
+    sid = "search_authority_gate"
+    await stage(
+        {
+            "operation_id": "evop1-stage-" + "9" * 64,
+            "session_id": sid,
+            "messages": [
+                _staged(
+                    _user("not searchable before publish", 1_700_000_000_000),
+                    "search-hidden",
+                )
+            ],
+        }
+    )
+
+    manager = object.__new__(SearchManager)
+    req = SimpleNamespace(
+        filters=FilterNode.model_validate({"session_id": sid}),
+        app_id="default",
+        project_id="default",
+    )
+    assert await manager._load_unprocessed(req) == []
+
+    await publish(
+        {
+            "operation_id": "evop1-publish-" + "9" * 64,
+            "session_id": sid,
+            "authority_ref": "ledger:search-visible",
+            "messages": [
+                {"source": "web", "external_ref": "search-hidden", "revision": 0}
+            ],
+        }
+    )
+    visible = await manager._load_unprocessed(req)
+    assert len(visible) == 1
+    assert visible[0].content == "not searchable before publish"
+
+
+async def test_pre_stage3_ms_row_without_receipt_fails_closed(
+    tmp_path: Path,
+    memorize_env: Callable[..., Any],
+) -> None:
+    await memorize_env(mode="chat", fake_llm=_make_fake_llm())
+    sid = "legacy_staged_without_receipt"
+    await stage(
+        {
+            "operation_id": "evop1-stage-" + "8" * 64,
+            "session_id": sid,
+            "messages": [_user("old staged payload", 1_700_000_000_000)],
+        }
+    )
+    db = tmp_path / ".index" / "sqlite" / "system.db"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("DELETE FROM memory_message_receipt")
+        conn.commit()
+    finally:
+        conn.close()
+
+    blocked = await memorize({"session_id": sid, "messages": []}, is_final=True)
+    assert blocked.status == "accumulated"
+    assert _buffer_count(tmp_path) == 1
+    assert _memcell_rows(tmp_path) == []
+
+    manager = object.__new__(SearchManager)
+    req = SimpleNamespace(
+        filters=FilterNode.model_validate({"session_id": sid}),
+        app_id="default",
+        project_id="default",
+    )
+    assert await manager._load_unprocessed(req) == []
+
+
+async def test_revision_supersede_resets_authority_and_conflicts_fail_closed(
+    tmp_path: Path,
+    memorize_env: Callable[..., Any],
+) -> None:
+    await memorize_env(
+        mode="chat",
+        fake_llm=_make_fake_llm(boundary_responses=[[]]),
+    )
+    sid = "revision_gate"
+    rev0 = _staged(_user("version zero", 1_700_000_000_000), "editable", revision=0)
+    rev1 = _staged(_user("version one", 1_700_000_001_000), "editable", revision=1)
+
+    await stage(
+        {
+            "operation_id": "evop1-stage-" + "e" * 64,
+            "session_id": sid,
+            "messages": [rev0],
+        }
+    )
+    await publish(
+        {
+            "operation_id": "evop1-publish-" + "e" * 64,
+            "session_id": sid,
+            "authority_ref": "ledger:commit-rev0",
+            "messages": [{"source": "web", "external_ref": "editable", "revision": 0}],
+        }
+    )
+    assert _receipt_rows(tmp_path)[0]["authority_state"] == "published"
+
+    superseded = await stage(
+        {
+            "operation_id": "evop1-stage-" + "f" * 64,
+            "session_id": sid,
+            "messages": [rev1],
+        }
+    )
+    assert superseded.updated_count == 1
+    receipt = _receipt_rows(tmp_path)[0]
+    assert receipt["revision"] == 1
+    assert receipt["authority_state"] == "pending_publish"
+    assert receipt["authority_ref"] is None
+    assert _buffer_texts(tmp_path) == ["version one"]
+
+    blocked = await memorize({"session_id": sid, "messages": []}, is_final=True)
+    assert blocked.status == "accumulated"
+    assert len(_memcell_rows(tmp_path)) == 0
+
+    stale = await stage(
+        {
+            "operation_id": "evop1-stage-" + "1" * 63 + "0",
+            "session_id": sid,
+            "messages": [rev0],
+        }
+    )
+    assert stale.stale_count == 1
+
+    conflicting_rev1 = _staged(
+        _user("different payload same revision", 1_700_000_001_000),
+        "editable",
+        revision=1,
+    )
+    with pytest.raises(MemoryMessageConflictError, match="different payload"):
+        await stage(
+            {
+                "operation_id": "evop1-stage-" + "2" * 64,
+                "session_id": sid,
+                "messages": [conflicting_rev1],
+            }
+        )
+
+    with pytest.raises(MemoryMessageConflictError, match="exact currently staged"):
+        await publish(
+            {
+                "operation_id": "evop1-publish-" + "f" * 64,
+                "session_id": sid,
+                "authority_ref": "ledger:wrong-revision",
+                "messages": [
+                    {"source": "web", "external_ref": "editable", "revision": 0}
+                ],
+            }
+        )
+
+    final_publish = await publish(
+        {
+            "operation_id": "evop1-publish-" + "1" * 63 + "0",
+            "session_id": sid,
+            "authority_ref": "ledger:commit-rev1",
+            "messages": [{"source": "web", "external_ref": "editable", "revision": 1}],
+        }
+    )
+    assert final_publish.published_count == 1
+    flushed = await memorize({"session_id": sid, "messages": []}, is_final=True)
+    assert flushed.status == "extracted"
+    assert len(_memcell_rows(tmp_path)) == 1
+    receipt = _receipt_rows(tmp_path)[0]
+    assert receipt["revision"] == 1
+    assert receipt["authority_state"] == "consumed"
+
+
 async def test_background_flush_is_durable_and_recovered_on_scheduler_start(
     tmp_path: Path,
     memorize_env: Callable[..., Any],
@@ -958,16 +1339,40 @@ async def test_background_flush_is_durable_and_recovered_on_scheduler_start(
         mode="chat",
         fake_llm=_make_fake_llm(boundary_responses=[[]]),
     )
+    staged_messages = [
+        _staged(
+            _user("remember after restart", 1_700_000_000_000),
+            "background-user",
+        ),
+        _staged(
+            _assistant("ack", 1_700_000_001_000),
+            "background-assistant",
+        ),
+    ]
     await stage(
         {
             "operation_id": "evop1-stage-" + "4" * 64,
             "session_id": "background_recovery",
+            "messages": staged_messages,
+        }
+    )
+    published = await publish(
+        {
+            "operation_id": "evop1-publish-" + "4" * 64,
+            "session_id": "background_recovery",
+            "authority_ref": "ledger:commit-background-1",
             "messages": [
-                _user("remember after restart", 1_700_000_000_000),
-                _assistant("ack", 1_700_000_001_000),
+                {"source": "web", "external_ref": "background-user", "revision": 0},
+                {
+                    "source": "web",
+                    "external_ref": "background-assistant",
+                    "revision": 0,
+                },
             ],
         }
     )
+    assert isinstance(published, PublishResult)
+    assert published.published_count == 2
     flush_id = "evop1-flush-" + "4" * 64
     queued = await queue_background_flush(
         {

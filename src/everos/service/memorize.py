@@ -58,7 +58,16 @@ from everos.memory.strategies import (
     trigger_profile_clustering,
     trigger_skill_clustering,
 )
-from everos.service._boundary import BoundaryOutcome, prepare_cells, stage_messages
+from everos.service._boundary import (
+    BoundaryOutcome,
+    prepare_cells,
+    publish_messages,
+    stage_messages,
+)
+from everos.service._deferred_errors import (
+    MemoryMessageConflictError,
+    MemoryMessageRecoveryError,
+)
 from everos.service._session_lock import scoped_session_lock
 
 logger = get_logger(__name__)
@@ -80,6 +89,23 @@ class StageResult(BaseModel):
     status: Literal["staged"] = "staged"
     operation_id: str
     replayed: bool = False
+    inserted_count: int = 0
+    updated_count: int = 0
+    duplicate_count: int = 0
+    stale_count: int = 0
+    consumed_replay_count: int = 0
+
+
+class PublishResult(BaseModel):
+    """Content-free receipt for one explicit publish-authority transition."""
+
+    message_count: int
+    status: Literal["published"] = "published"
+    operation_id: str
+    replayed: bool = False
+    published_count: int = 0
+    already_published_count: int = 0
+    consumed_count: int = 0
 
 
 class BackgroundFlushResult(BaseModel):
@@ -94,7 +120,7 @@ class MemoryOperationStatus(BaseModel):
     """Safe, content-free view exposed by the operation query endpoint."""
 
     operation_id: str
-    kind: Literal["add", "stage", "flush"]
+    kind: Literal["add", "stage", "publish", "flush"]
     app_id: str
     project_id: str
     session_id: str
@@ -102,6 +128,7 @@ class MemoryOperationStatus(BaseModel):
     stage: Literal[
         "claimed",
         "messages_staged",
+        "messages_published",
         "queued",
         "processing",
         "memcells_committed",
@@ -288,19 +315,35 @@ async def stage(payload: dict[str, Any]) -> StageResult:
                         )
                     await memory_operation_repo.mark_running(operation_id)
                 owns_execution = True
+                raw_messages = [
+                    dict(item) for item in request_payload.get("messages", [])
+                ]
                 ingested = await ingest_process(request_payload, deferred=True)
-                staged_count = await stage_messages(
+                staged = await stage_messages(
                     ingested,
                     operation_id=operation_id,
+                    raw_messages=raw_messages,
                 )
                 return StageResult(
-                    message_count=staged_count,
+                    message_count=staged.message_count,
                     operation_id=operation_id,
+                    inserted_count=staged.inserted_count,
+                    updated_count=staged.updated_count,
+                    duplicate_count=staged.duplicate_count,
+                    stale_count=staged.stale_count,
+                    consumed_replay_count=staged.consumed_replay_count,
                 )
     except Exception as exc:
         if owns_execution and not isinstance(exc, MemoryOperationConflictError):
             retryable = not isinstance(
-                exc, (MultimodalError, MemoryOperationRecoveryError)
+                exc,
+                (
+                    MultimodalError,
+                    MemoryMessageConflictError,
+                    MemoryMessageRecoveryError,
+                    MemoryOperationRecoveryError,
+                    ValueError,
+                ),
             )
             try:
                 await memory_operation_repo.mark_failed(
@@ -311,6 +354,134 @@ async def stage(payload: dict[str, Any]) -> StageResult:
             except Exception:  # pragma: no cover - preserve original failure
                 logger.exception(
                     "memory_stage_failure_receipt_failed",
+                    extra={"operation_id": operation_id},
+                )
+        raise
+
+
+async def publish(payload: dict[str, Any]) -> PublishResult:
+    """Authorize exact staged revisions without running boundary/extraction."""
+
+    request_payload = dict(payload)
+    operation_id_raw = request_payload.pop("operation_id", None)
+    if operation_id_raw is None:
+        raise ValueError("publish requires operation_id")
+    operation_id = str(operation_id_raw)
+    kind = "publish"
+    session_id = str(request_payload["session_id"])
+    app_id = str(request_payload.get("app_id") or "default")
+    project_id = str(request_payload.get("project_id") or "default")
+    authority_ref_raw = request_payload.get("authority_ref")
+    if not isinstance(authority_ref_raw, str) or not authority_ref_raw.strip():
+        raise ValueError("publish requires authority_ref")
+    authority_ref = authority_ref_raw.strip()
+    items = [dict(item) for item in request_payload.get("messages", [])]
+    if not items:
+        raise ValueError("publish requires at least one message reference")
+
+    request_sha256 = _request_sha256(kind, request_payload)
+    settings = load_settings()
+    configured_boundary = settings.boundary_detection
+    _validate_operation_id(operation_id, kind)
+    operation, _ = await memory_operation_repo.claim(
+        MemoryOperation(
+            operation_id=operation_id,
+            kind=kind,
+            app_id=app_id,
+            project_id=project_id,
+            session_id=session_id,
+            request_sha256=request_sha256,
+            mode=settings.memorize.mode,
+            plan_version=1,
+            hard_token_limit=configured_boundary.hard_token_limit,
+            hard_msg_limit=configured_boundary.hard_msg_limit,
+            message_count=len(items),
+        )
+    )
+    _validate_operation(
+        operation,
+        kind=kind,
+        app_id=app_id,
+        project_id=project_id,
+        session_id=session_id,
+        request_sha256=request_sha256,
+    )
+    if operation.state == "completed":
+        return _publish_result_from_completed_operation(operation, replayed=True)
+    if operation.state == "failed" and not operation.retryable:
+        raise MemoryOperationRecoveryError(
+            f"operation {operation_id!r} failed permanently "
+            f"({operation.error_code or 'unknown'})"
+        )
+
+    owns_execution = False
+    try:
+        async with asyncio.timeout(settings.memorize.session_lock_timeout_seconds):
+            async with scoped_session_lock(
+                MemoryRoot.default(),
+                session_id,
+                app_id=app_id,
+                project_id=project_id,
+            ):
+                current = await memory_operation_repo.get(operation_id)
+                if current is None:  # pragma: no cover - DB invariant
+                    raise MemoryOperationRecoveryError(
+                        f"operation disappeared after claim: {operation_id!r}"
+                    )
+                _validate_operation(
+                    current,
+                    kind=kind,
+                    app_id=app_id,
+                    project_id=project_id,
+                    session_id=session_id,
+                    request_sha256=request_sha256,
+                )
+                if current.state == "completed":
+                    return _publish_result_from_completed_operation(
+                        current, replayed=True
+                    )
+                if current.state == "failed":
+                    if not current.retryable:
+                        raise MemoryOperationRecoveryError(
+                            f"operation {operation_id!r} is not retryable"
+                        )
+                    await memory_operation_repo.mark_running(operation_id)
+                owns_execution = True
+                summary = await publish_messages(
+                    session_id=session_id,
+                    app_id=app_id,
+                    project_id=project_id,
+                    items=items,
+                    authority_ref=authority_ref,
+                    operation_id=operation_id,
+                )
+                return PublishResult(
+                    message_count=summary.message_count,
+                    operation_id=operation_id,
+                    published_count=summary.published_count,
+                    already_published_count=summary.already_published_count,
+                    consumed_count=summary.consumed_count,
+                )
+    except Exception as exc:
+        if owns_execution and not isinstance(exc, MemoryOperationConflictError):
+            retryable = not isinstance(
+                exc,
+                (
+                    MemoryMessageConflictError,
+                    MemoryMessageRecoveryError,
+                    MemoryOperationRecoveryError,
+                    ValueError,
+                ),
+            )
+            try:
+                await memory_operation_repo.mark_failed(
+                    operation_id,
+                    error_code=type(exc).__name__,
+                    retryable=retryable,
+                )
+            except Exception:  # pragma: no cover - preserve original failure
+                logger.exception(
+                    "memory_publish_failure_receipt_failed",
                     extra={"operation_id": operation_id},
                 )
         raise
@@ -637,7 +808,12 @@ async def get_memory_operation_status(
     response: dict[str, Any] | None = None
     if operation.state == "completed":
         if (
-            operation.stage not in ("messages_staged", "sync_dispatch_completed")
+            operation.stage
+            not in (
+                "messages_staged",
+                "messages_published",
+                "sync_dispatch_completed",
+            )
             or operation.response_json is None
         ):
             raise MemoryOperationRecoveryError(
@@ -767,6 +943,29 @@ def _stage_result_from_completed_operation(
     except (ValueError, TypeError) as exc:
         raise MemoryOperationRecoveryError(
             "completed stage operation has an invalid response receipt"
+        ) from exc
+    return result
+
+
+def _publish_result_from_completed_operation(
+    operation: MemoryOperation, *, replayed: bool
+) -> PublishResult:
+    if operation.stage != "messages_published" or operation.response_json is None:
+        raise MemoryOperationRecoveryError(
+            "completed publish operation has an inconsistent receipt"
+        )
+    try:
+        response = json.loads(operation.response_json)
+        result = PublishResult.model_validate(
+            {
+                **response,
+                "operation_id": operation.operation_id,
+                "replayed": replayed,
+            }
+        )
+    except (ValueError, TypeError) as exc:
+        raise MemoryOperationRecoveryError(
+            "completed publish operation has an invalid response receipt"
         ) from exc
     return result
 

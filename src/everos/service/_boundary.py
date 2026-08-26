@@ -41,7 +41,6 @@ from everalgo.types import (
 )
 from everalgo.types import ToolCall as AlgoToolCall
 from sqlalchemy import delete, select
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from everos.component.utils.datetime import from_timestamp, to_timestamp_ms
 from everos.core.observability.logging import get_logger
@@ -49,13 +48,23 @@ from everos.core.persistence.sqlite import session_scope
 from everos.infra.persistence.sqlite import (
     ConversationStatus,
     Memcell,
+    MemoryMessageReceipt,
     MemoryOperation,
     UnprocessedBuffer,
     conversation_status_repo,
     get_session_factory,
+    memory_message_receipt_repo,
     unprocessed_buffer_repo,
 )
 from everos.memory import CanonicalMessage, IngestResult, ToolCall
+from everos.memory.extract.ingest.id_gen import (
+    external_idem_key,
+    staged_message_identity,
+)
+from everos.service._deferred_errors import (
+    MemoryMessageConflictError,
+    MemoryMessageRecoveryError,
+)
 
 if TYPE_CHECKING:
     from everalgo.llm.protocols import LLMClient
@@ -77,6 +86,9 @@ _RAW_TYPE_BY_MODE: dict[str, str] = {
 
 Mode = Literal["chat", "agent"]
 Status = Literal["accumulated", "extracted", "skipped"]
+_AUTH_PENDING = "pending_publish"
+_AUTH_PUBLISHED = "published"
+_AUTH_CONSUMED = "consumed"
 
 
 class BoundaryOutcome(NamedTuple):
@@ -96,6 +108,26 @@ class BoundaryOutcome(NamedTuple):
     per_cell_all_senders: list[list[str]]
     status: Status
     message_count: int
+
+
+class StageMutationSummary(NamedTuple):
+    """Content-free counters for one atomic stage transaction."""
+
+    message_count: int
+    inserted_count: int
+    updated_count: int
+    duplicate_count: int
+    stale_count: int
+    consumed_replay_count: int
+
+
+class PublishMutationSummary(NamedTuple):
+    """Content-free counters for one explicit publish transaction."""
+
+    message_count: int
+    published_count: int
+    already_published_count: int
+    consumed_count: int
 
 
 async def prepare_cells(
@@ -119,7 +151,16 @@ async def prepare_cells(
     buffer_rows = await unprocessed_buffer_repo.list_for_track(
         ingested.session_id, _TRACK, app_id=app_id, project_id=project_id
     )
-    buffered = [_row_to_canonical(r) for r in buffer_rows]
+    eligible_rows, protected_rows = await _partition_buffer_rows_by_authority(
+        buffer_rows
+    )
+    protected = [_row_to_canonical(r) for r in protected_rows]
+    # A legacy /add carrying the same logical row as an unpublished /stage
+    # must not bypass the server-side authority gate during a rolling client
+    # migration. Pending staged rows therefore act as a dedupe fence even
+    # though they are invisible to boundary/extraction.
+    fresh = _drop_fresh_aliases_of_protected(protected, fresh)
+    buffered = [_row_to_canonical(r) for r in eligible_rows]
     merged = _merge_dedupe_sort(buffered, fresh)
     if not merged:
         return _empty_outcome(status="accumulated", message_count=0)
@@ -127,12 +168,24 @@ async def prepare_cells(
     # Need a role=user anchor for downstream episode extraction; assistant-
     # only / tool-only batches sit in the buffer until a user message lands.
     if not is_final and not any(m.role == "user" for m in merged):
-        await _replace_buffer(ingested.session_id, merged, app_id, project_id)
+        await _replace_buffer(
+            ingested.session_id,
+            merged,
+            app_id,
+            project_id,
+            protected=protected,
+        )
         await _touch_last_message_ts(ingested.session_id, merged, app_id, project_id)
         return _empty_outcome(status="accumulated", message_count=len(fresh))
 
     if llm_client is None:
-        await _replace_buffer(ingested.session_id, merged, app_id, project_id)
+        await _replace_buffer(
+            ingested.session_id,
+            merged,
+            app_id,
+            project_id,
+            protected=protected,
+        )
         logger.warning(
             "memorize_no_llm_client",
             extra={"session_id": ingested.session_id, "buffered": len(merged)},
@@ -153,7 +206,13 @@ async def prepare_cells(
     if not cells:
         # boundary returned an empty cells set → roll the merged slice
         # back into the buffer (algo says it's still mid-conversation).
-        await _replace_buffer(ingested.session_id, merged, app_id, project_id)
+        await _replace_buffer(
+            ingested.session_id,
+            merged,
+            app_id,
+            project_id,
+            protected=protected,
+        )
         await _touch_last_message_ts(ingested.session_id, merged, app_id, project_id)
         return _empty_outcome(status="accumulated", message_count=len(fresh))
 
@@ -187,6 +246,7 @@ async def prepare_cells(
         app_id=app_id,
         project_id=project_id,
         tail=tail_canonical,
+        protected=protected,
         last_cell_ts=last_cell_ts,
         operation_id=operation_id,
     )
@@ -205,27 +265,142 @@ async def stage_messages(
     ingested: IngestResult,
     *,
     operation_id: str,
-) -> int:
+    raw_messages: list[dict[str, object]],
+) -> StageMutationSummary:
     """Reliably merge one deferred upload batch without running extraction.
 
-    The idempotent buffer insert and the operation's terminal receipt share one SQLite
-    transaction.  A caller therefore never observes ``staged`` unless every
-    canonical row is durable, and a crash cannot leave a committed buffer with
-    an ambiguous operation receipt.
+    Per-message receipts make idempotency independent of request chunking and
+    survive successful buffer consumption.  The buffer mutation, receipt
+    mutation, and terminal batch operation receipt share one transaction.
     """
 
     app_id = ingested.app_id
     project_id = ingested.project_id
     fresh = list(ingested.messages)
-    async with session_scope(get_session_factory()) as session:
-        if fresh:
-            rows = [_canonical_to_row(message, app_id, project_id) for message in fresh]
-            await session.execute(
-                sqlite_insert(UnprocessedBuffer)
-                .values([row.model_dump() for row in rows])
-                .on_conflict_do_nothing(index_elements=["message_id"])
-            )
+    if len(raw_messages) != len(fresh):
+        raise MemoryMessageRecoveryError(
+            "stage raw/canonical message counts do not match"
+        )
 
+    staged_items = []
+    seen_idem: set[str] = set()
+    for raw, canonical in zip(raw_messages, fresh, strict=True):
+        identity = staged_message_identity(
+            ingested.session_id,
+            dict(raw),
+            app_id=app_id,
+            project_id=project_id,
+        )
+        if identity.idem_key in seen_idem:
+            raise MemoryMessageConflictError(
+                "stage request contains the same logical message more than once"
+            )
+        seen_idem.add(identity.idem_key)
+        if canonical.message_id != identity.message_id:
+            raise MemoryMessageRecoveryError(
+                "stage canonical message id does not match durable identity"
+            )
+        staged_items.append((raw, canonical, identity))
+
+    inserted_count = 0
+    updated_count = 0
+    duplicate_count = 0
+    stale_count = 0
+    consumed_replay_count = 0
+    active_messages: list[CanonicalMessage] = []
+
+    async with session_scope(get_session_factory()) as session:
+        for _raw, canonical, identity in staged_items:
+            receipt_stmt = select(MemoryMessageReceipt).where(
+                MemoryMessageReceipt.app_id == app_id,
+                MemoryMessageReceipt.project_id == project_id,
+                MemoryMessageReceipt.idem_key == identity.idem_key,
+            )
+            receipt = (await session.execute(receipt_stmt)).scalars().first()
+
+            if receipt is None:
+                orphan = await session.get(UnprocessedBuffer, identity.message_id)
+                if orphan is not None:
+                    raise MemoryMessageRecoveryError(
+                        "staged message buffer row exists without durable receipt"
+                    )
+                session.add(
+                    MemoryMessageReceipt(
+                        receipt_id=identity.receipt_id,
+                        app_id=app_id,
+                        project_id=project_id,
+                        session_id=ingested.session_id,
+                        idem_key=identity.idem_key,
+                        message_id=identity.message_id,
+                        source=identity.source,
+                        external_ref=identity.external_ref,
+                        revision=identity.revision,
+                        payload_sha256=identity.payload_sha256,
+                        authority_state=_AUTH_PENDING,
+                    )
+                )
+                session.add(_canonical_to_row(canonical, app_id, project_id))
+                inserted_count += 1
+                active_messages.append(canonical)
+                continue
+
+            if (
+                receipt.session_id != ingested.session_id
+                or receipt.message_id != identity.message_id
+                or receipt.source != identity.source
+                or receipt.external_ref != identity.external_ref
+            ):
+                raise MemoryMessageRecoveryError(
+                    "staged message receipt identity does not match request"
+                )
+            if receipt.authority_state not in {
+                _AUTH_PENDING,
+                _AUTH_PUBLISHED,
+                _AUTH_CONSUMED,
+            }:
+                raise MemoryMessageRecoveryError(
+                    f"invalid message authority state: {receipt.authority_state!r}"
+                )
+
+            if identity.revision < receipt.revision:
+                stale_count += 1
+                continue
+
+            if identity.revision == receipt.revision:
+                if identity.payload_sha256 != receipt.payload_sha256:
+                    raise MemoryMessageConflictError(
+                        "same staged message revision has a different payload"
+                    )
+                if receipt.authority_state == _AUTH_CONSUMED:
+                    consumed_replay_count += 1
+                    continue
+                buffered = await session.get(UnprocessedBuffer, receipt.message_id)
+                if buffered is None:
+                    raise MemoryMessageRecoveryError(
+                        "active staged receipt is missing its buffer row"
+                    )
+                if _canonical_transport_identity(
+                    _row_to_canonical(buffered)
+                ) != _canonical_transport_identity(canonical):
+                    raise MemoryMessageRecoveryError(
+                        "active staged buffer payload does not match its receipt"
+                    )
+                duplicate_count += 1
+                active_messages.append(canonical)
+                continue
+
+            # Higher revisions supersede in-place but never inherit publish
+            # authority from an older payload.
+            await session.merge(_canonical_to_row(canonical, app_id, project_id))
+            receipt.revision = identity.revision
+            receipt.payload_sha256 = identity.payload_sha256
+            receipt.authority_state = _AUTH_PENDING
+            receipt.authority_ref = None
+            receipt.memcell_ids_json = "[]"
+            updated_count += 1
+            active_messages.append(canonical)
+
+        if active_messages:
             status_stmt = select(ConversationStatus).where(
                 ConversationStatus.app_id == app_id,
                 ConversationStatus.project_id == project_id,
@@ -233,7 +408,7 @@ async def stage_messages(
                 ConversationStatus.track == _TRACK,
             )
             status = (await session.execute(status_stmt)).scalars().first()
-            last_message_ts = max(message.timestamp for message in fresh)
+            last_message_ts = max(message.timestamp for message in active_messages)
             if status is None:
                 status = ConversationStatus(
                     app_id=app_id,
@@ -257,10 +432,26 @@ async def stage_messages(
                 "stage operation unexpectedly completed while executing: "
                 f"{operation_id}"
             )
+        summary = StageMutationSummary(
+            message_count=len(fresh),
+            inserted_count=inserted_count,
+            updated_count=updated_count,
+            duplicate_count=duplicate_count,
+            stale_count=stale_count,
+            consumed_replay_count=consumed_replay_count,
+        )
         operation.state = "completed"
         operation.stage = "messages_staged"
         operation.response_json = json.dumps(
-            {"message_count": len(fresh), "status": "staged"},
+            {
+                "message_count": summary.message_count,
+                "status": "staged",
+                "inserted_count": summary.inserted_count,
+                "updated_count": summary.updated_count,
+                "duplicate_count": summary.duplicate_count,
+                "stale_count": summary.stale_count,
+                "consumed_replay_count": summary.consumed_replay_count,
+            },
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -269,7 +460,125 @@ async def stage_messages(
         operation.error_code = None
         operation.retryable = False
         await session.commit()
-    return len(fresh)
+    return summary
+
+
+async def publish_messages(
+    *,
+    session_id: str,
+    app_id: str,
+    project_id: str,
+    items: list[dict[str, object]],
+    authority_ref: str,
+    operation_id: str,
+) -> PublishMutationSummary:
+    """Authorize exact staged revisions without invoking extraction."""
+
+    refs: list[tuple[str, int]] = []
+    seen_idem: set[str] = set()
+    for item in items:
+        source = item.get("source") or "api"
+        external_ref = item.get("external_ref")
+        revision = item.get("revision", 0)
+        if not isinstance(source, str) or not isinstance(external_ref, str):
+            raise MemoryMessageConflictError(
+                "publish requires source + external_ref for every message"
+            )
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise MemoryMessageConflictError(
+                "publish revision must be a non-negative integer"
+            )
+        idem_key = external_idem_key(session_id, source, external_ref)
+        if idem_key in seen_idem:
+            raise MemoryMessageConflictError(
+                "publish request contains the same logical message more than once"
+            )
+        seen_idem.add(idem_key)
+        refs.append((idem_key, revision))
+
+    published_count = 0
+    already_published_count = 0
+    consumed_count = 0
+    async with session_scope(get_session_factory()) as session:
+        for idem_key, revision in refs:
+            stmt = select(MemoryMessageReceipt).where(
+                MemoryMessageReceipt.app_id == app_id,
+                MemoryMessageReceipt.project_id == project_id,
+                MemoryMessageReceipt.idem_key == idem_key,
+            )
+            receipt = (await session.execute(stmt)).scalars().first()
+            if receipt is None:
+                raise MemoryMessageConflictError(
+                    "publish references a message that has not been staged"
+                )
+            if receipt.session_id != session_id:
+                raise MemoryMessageRecoveryError(
+                    "publish receipt session does not match request"
+                )
+            if receipt.revision != revision:
+                raise MemoryMessageConflictError(
+                    "publish must reference the exact currently staged revision"
+                )
+
+            if receipt.authority_state == _AUTH_PENDING:
+                buffered = await session.get(UnprocessedBuffer, receipt.message_id)
+                if buffered is None:
+                    raise MemoryMessageRecoveryError(
+                        "pending publish receipt is missing its buffer row"
+                    )
+                receipt.authority_state = _AUTH_PUBLISHED
+                receipt.authority_ref = authority_ref
+                published_count += 1
+            elif receipt.authority_state == _AUTH_PUBLISHED:
+                if receipt.authority_ref != authority_ref:
+                    raise MemoryMessageConflictError(
+                        "message was already published under a different authority"
+                    )
+                already_published_count += 1
+            elif receipt.authority_state == _AUTH_CONSUMED:
+                if receipt.authority_ref != authority_ref:
+                    raise MemoryMessageConflictError(
+                        "consumed message has a different publish authority"
+                    )
+                consumed_count += 1
+            else:
+                raise MemoryMessageRecoveryError(
+                    f"invalid message authority state: {receipt.authority_state!r}"
+                )
+
+        operation = await session.get(MemoryOperation, operation_id)
+        if operation is None:
+            raise KeyError(f"memory operation not found: {operation_id}")
+        if operation.state == "completed":
+            raise RuntimeError(
+                "publish operation unexpectedly completed while executing: "
+                f"{operation_id}"
+            )
+        summary = PublishMutationSummary(
+            message_count=len(refs),
+            published_count=published_count,
+            already_published_count=already_published_count,
+            consumed_count=consumed_count,
+        )
+        operation.state = "completed"
+        operation.stage = "messages_published"
+        operation.response_json = json.dumps(
+            {
+                "message_count": summary.message_count,
+                "status": "published",
+                "published_count": summary.published_count,
+                "already_published_count": summary.already_published_count,
+                "consumed_count": summary.consumed_count,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        operation.error_code = None
+        operation.retryable = False
+        await session.commit()
+    return summary
 
 
 # ── Mode-specific filter ──────────────────────────────────────────────────
@@ -418,6 +727,7 @@ async def _commit_cells_and_tail(
     app_id: str,
     project_id: str,
     tail: list[CanonicalMessage],
+    protected: list[CanonicalMessage],
     last_cell_ts: int,
     operation_id: str | None,
 ) -> None:
@@ -429,7 +739,10 @@ async def _commit_cells_and_tail(
     and the operation stage in one SQLite transaction closes that ambiguity.
     """
 
-    tail_rows = [_canonical_to_row(message, app_id, project_id) for message in tail]
+    replacement = _dedupe_messages_by_id([*protected, *tail])
+    replacement_rows = [
+        _canonical_to_row(message, app_id, project_id) for message in replacement
+    ]
     async with session_scope(get_session_factory()) as session:
         session.add_all(rows)
 
@@ -461,8 +774,43 @@ async def _commit_cells_and_tail(
                 UnprocessedBuffer.track == _TRACK,
             )
         )
-        if tail_rows:
-            session.add_all(tail_rows)
+        if replacement_rows:
+            session.add_all(replacement_rows)
+
+        # A staged receipt remains durable after its raw buffer row is
+        # consumed. This is what makes a same-revision retry after a successful
+        # flush a true no-op instead of another extraction opportunity.
+        consumed_to_memcells: dict[str, list[str]] = {}
+        for row in rows:
+            message_ids = json.loads(row.message_ids_json)
+            if not isinstance(message_ids, list) or not all(
+                isinstance(message_id, str) for message_id in message_ids
+            ):
+                raise MemoryMessageRecoveryError(
+                    f"memcell {row.memcell_id!r} has invalid message ids"
+                )
+            for message_id in message_ids:
+                consumed_to_memcells.setdefault(message_id, []).append(row.memcell_id)
+
+        if consumed_to_memcells:
+            receipt_stmt = select(MemoryMessageReceipt).where(
+                MemoryMessageReceipt.message_id.in_(tuple(consumed_to_memcells))
+            )
+            receipts = list((await session.execute(receipt_stmt)).scalars().all())
+            for receipt in receipts:
+                if receipt.authority_state != _AUTH_PUBLISHED:
+                    raise MemoryMessageRecoveryError(
+                        "boundary attempted to consume a staged message without "
+                        "published authority"
+                    )
+                receipt.authority_state = _AUTH_CONSUMED
+                receipt.memcell_ids_json = json.dumps(
+                    consumed_to_memcells[receipt.message_id],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                )
 
         if operation_id is not None:
             operation = await session.get(MemoryOperation, operation_id)
@@ -484,14 +832,67 @@ async def _replace_buffer(
     rows: list[CanonicalMessage],
     app_id: str,
     project_id: str,
+    *,
+    protected: list[CanonicalMessage] | None = None,
 ) -> None:
+    replacement = _dedupe_messages_by_id([*(protected or []), *rows])
     await unprocessed_buffer_repo.replace(
         session_id,
         _TRACK,
-        [_canonical_to_row(m, app_id, project_id) for m in rows],
+        [_canonical_to_row(m, app_id, project_id) for m in replacement],
         app_id=app_id,
         project_id=project_id,
     )
+
+
+async def _partition_buffer_rows_by_authority(
+    rows: list[UnprocessedBuffer],
+) -> tuple[list[UnprocessedBuffer], list[UnprocessedBuffer]]:
+    """Split extraction-visible rows from unpublished staged rows.
+
+    Legacy rows have no receipt and remain visible for backward compatibility.
+    ``consumed`` + buffer presence is an impossible state; fail closed rather
+    than risking duplicate extraction.
+    """
+
+    receipts = await memory_message_receipt_repo.map_by_message_ids(
+        [row.message_id for row in rows]
+    )
+    eligible: list[UnprocessedBuffer] = []
+    protected: list[UnprocessedBuffer] = []
+    for row in rows:
+        receipt = receipts.get(row.message_id)
+        if receipt is None:
+            # Pre-Stage3 deferred rows also use the ``ms_`` transport prefix
+            # but have no authority receipt.  Treat them as unpublished and
+            # preserve them fail-closed.  Ordinary legacy /add rows (``m_``)
+            # and pre-existing test/import rows remain backward compatible.
+            if row.message_id.startswith("ms_"):
+                protected.append(row)
+            else:
+                eligible.append(row)
+            continue
+        if (
+            receipt.app_id != row.app_id
+            or receipt.project_id != row.project_id
+            or receipt.session_id != row.session_id
+        ):
+            raise MemoryMessageRecoveryError(
+                "message receipt scope does not match its buffer row"
+            )
+        if receipt.authority_state == _AUTH_PUBLISHED:
+            eligible.append(row)
+        elif receipt.authority_state == _AUTH_PENDING:
+            protected.append(row)
+        elif receipt.authority_state == _AUTH_CONSUMED:
+            raise MemoryMessageRecoveryError(
+                "consumed message receipt still has a live buffer row"
+            )
+        else:
+            raise MemoryMessageRecoveryError(
+                f"invalid message authority state: {receipt.authority_state!r}"
+            )
+    return eligible, protected
 
 
 async def _touch_last_message_ts(
@@ -578,13 +979,7 @@ def _merge_dedupe_sort(
     for message in (*buffered, *new):
         if message.message_id in seen_ids:
             continue
-        identity = json.dumps(
-            message.model_dump(mode="json", exclude={"message_id"}),
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
+        identity = _canonical_transport_identity(message)
         transport = (
             "stage"
             if message.message_id.startswith("ms_")
@@ -604,6 +999,49 @@ def _merge_dedupe_sort(
         prior_transports.add(transport)
         merged.append(message)
     return sorted(merged, key=lambda m: (m.timestamp, m.message_id))
+
+
+def _drop_fresh_aliases_of_protected(
+    protected: list[CanonicalMessage],
+    fresh: list[CanonicalMessage],
+) -> list[CanonicalMessage]:
+    """Prevent legacy /add from bypassing pending stage authority."""
+
+    if not protected or not fresh:
+        return fresh
+    protected_identities = {
+        _canonical_transport_identity(message) for message in protected
+    }
+    return [
+        message
+        for message in fresh
+        if _canonical_transport_identity(message) not in protected_identities
+    ]
+
+
+def _canonical_transport_identity(message: CanonicalMessage) -> str:
+    return json.dumps(
+        message.model_dump(mode="json", exclude={"message_id"}),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _dedupe_messages_by_id(
+    messages: list[CanonicalMessage],
+) -> list[CanonicalMessage]:
+    """Preserve first occurrence while rebuilding one buffer slice."""
+
+    seen: set[str] = set()
+    result: list[CanonicalMessage] = []
+    for message in messages:
+        if message.message_id in seen:
+            continue
+        seen.add(message.message_id)
+        result.append(message)
+    return sorted(result, key=lambda m: (m.timestamp, m.message_id))
 
 
 def _slice_tail(
