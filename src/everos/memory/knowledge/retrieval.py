@@ -242,6 +242,19 @@ def retrieve_candidates(
             top_k=top_k,
         ),
     )
+    if len(legacy_ids) == len(candidates):
+        # The pre-envelope LanceDB recall order is already the engine's
+        # relevance order.  Preserve it for a homogeneous legacy pool after
+        # the common truth gate has run, so adding the gate does not change
+        # backward-compatible vector/BM25 ordering.
+        by_ranked_id = {hit.claim.claim_id: hit for hit in ranked}
+        ranked = [
+            by_ranked_id[candidate.id]
+            for candidate in candidates
+            if candidate.id in by_ranked_id
+        ]
+        if top_k >= 0:
+            ranked = ranked[:top_k]
     result: list[Candidate] = []
     for hit in ranked:
         source = by_id[hit.claim.claim_id]
