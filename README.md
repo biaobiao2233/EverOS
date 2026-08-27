@@ -14,21 +14,26 @@
 </div>
 
 > [!IMPORTANT]
-> **Production-optimized fork / 生产优化分支**
+> **`production-v2` — current accepted production-derived line / 当前已验收生产源码线**
 >
-> This branch contains production-derived reliability and security hardening
-> based on upstream commit `8f175d3`: durable idempotent writes, cross-process
-> session locks, atomic recovery checkpoints, append-once Markdown persistence,
-> OME/Cascade stability fixes, safer extraction prompts, optional API bearer
-> auth, and a sandboxed local Antigravity CLI text provider.
+> The exact accepted Stage 3 runtime source is commit `0ffd67c` and is preserved
+> by tag **`production-v2-stage3-20260826`**. This README-only status commit is
+> intentionally newer than that runtime tag; it does not change the accepted
+> runtime implementation.
 >
-> 本分支是基于真实长期运行环境整理的生产优化版。完整的原版差异、每个处理
-> 环节所用组件、部署方式、安全边界和已知限制见
-> **[PRODUCTION_OPTIMIZED.md](PRODUCTION_OPTIMIZED.md)**。
+> 这一代在第一版 production hardening 之上继续加入 Stage 1/2/3，其中 Stage 3
+> 核心是 durable deferred ingest + explicit Publish authority：未发布 staged
+> message 不进入 extraction / search；revision 冲突 fail closed；consumed receipt
+> 使同 revision 的迟到重放保持 no-op。
 >
-> This branch is based on an older upstream commit and does **not** claim 1.2.x
-> compatibility. Personal credentials, conversations, server addresses, and
-> runtime databases are not included.
+> This line still descends from older upstream `8f175d3` and does **not** claim
+> that the production changes have already been merged with or validated on
+> EverOS 1.2.x. Current upstream tracking stays on `main`; convergence is a
+> separate reviewed effort. See **[PRODUCTION_V2_STATUS.md](PRODUCTION_V2_STATUS.md)**
+> and the historical hardening details in **[PRODUCTION_OPTIMIZED.md](PRODUCTION_OPTIMIZED.md)**.
+>
+> Personal credentials, conversations, server addresses, and runtime databases
+> are not included.
 
 
 <br>
