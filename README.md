@@ -13,22 +13,24 @@
 
 </div>
 
-> [!IMPORTANT]
-> **Production-optimized fork / 生产优化分支**
+> [!WARNING]
+> **`memory-roadmap-candidate` — reviewed candidate, NOT production / 已审候选，尚未上线**
 >
-> This branch contains production-derived reliability and security hardening
-> based on upstream commit `8f175d3`: durable idempotent writes, cross-process
-> session locks, atomic recovery checkpoints, append-once Markdown persistence,
-> OME/Cascade stability fixes, safer extraction prompts, optional API bearer
-> auth, and a sandboxed local Antigravity CLI text provider.
+> The exact reviewed candidate source is commit `913e345` and is preserved by
+> tag **`memory-roadmap-candidate-20260826`**. This branch starts from the
+> accepted Stage 3 production-derived source `0ffd67c`, then adds the next memory
+> quality layer. Publishing this source does **not** mean these capabilities are
+> running in production.
 >
-> 本分支是基于真实长期运行环境整理的生产优化版。完整的原版差异、每个处理
-> 环节所用组件、部署方式、安全边界和已知限制见
-> **[PRODUCTION_OPTIMIZED.md](PRODUCTION_OPTIMIZED.md)**。
+> 主要候选能力包括 truth-aware hybrid retrieval、deterministic Memory Wiki、
+> evidence-aware promotion scoring，以及需要 repeated success + explicit
+> review/accept 的 Case → Skill lifecycle。它不会因为一次成功就自动把 Skill
+> 晋升为正式 authority。
 >
-> This branch is based on an older upstream commit and does **not** claim 1.2.x
-> compatibility. Personal credentials, conversations, server addresses, and
-> runtime databases are not included.
+> The underlying production-derived line still has the older upstream base
+> `8f175d3`; current upstream 1.2.x convergence is handled separately. See
+> **[MEMORY_ROADMAP_STATUS.md](MEMORY_ROADMAP_STATUS.md)**. Personal credentials,
+> conversations, server addresses, and runtime databases are not included.
 
 
 <br>
