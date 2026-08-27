@@ -13,10 +13,17 @@
 
 </div>
 
-> [!IMPORTANT]
-> **Production-optimized fork / 生产优化分支**
+> [!CAUTION]
+> **Legacy v1 production-optimized fork / 第一代生产优化历史分支**
 >
-> This branch contains production-derived reliability and security hardening
+> This branch is preserved as the **2026-07 first-generation production
+> hardening line**. It no longer represents the newest accepted production
+> source in this fork. The current accepted production-derived line is
+> **[`production-v2`](https://github.com/biaobiao2233/EverOS/tree/production-v2)**.
+> The exact historical v1 source is preserved by tag
+> **`production-optimized-v1-legacy-20260727`**.
+>
+> This legacy branch contains production-derived reliability and security hardening
 > based on upstream commit `8f175d3`: durable idempotent writes, cross-process
 > session locks, atomic recovery checkpoints, append-once Markdown persistence,
 > OME/Cascade stability fixes, safer extraction prompts, optional API bearer

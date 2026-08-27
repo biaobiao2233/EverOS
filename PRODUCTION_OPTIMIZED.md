@@ -2,6 +2,15 @@
 
 [中文](#中文说明) · [English](#english-summary)
 
+> [!CAUTION]
+> **Historical branch:** this document describes the first-generation
+> `production-optimized` line published in July 2026. It is retained for
+> reproducibility and comparison, but it is no longer the newest accepted
+> production-derived source in this fork. See
+> [`production-v2`](https://github.com/biaobiao2233/EverOS/tree/production-v2)
+> for the later Stage 1/2/3 line. The exact v1 snapshot is tagged
+> `production-optimized-v1-legacy-20260727`.
+
 This document describes the `production-optimized` branch. It is a
 production-derived hardening fork based on upstream commit
 [`8f175d3`](https://github.com/EverMind-AI/EverOS/commit/8f175d3f8f222fc1a26c943402ce8bb4ea877a1d).
