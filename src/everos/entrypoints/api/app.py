@@ -45,6 +45,7 @@ from .routes import (
     memorize,
     metrics,
     search,
+    wiki,
 )
 
 logger = get_logger(__name__)
@@ -167,6 +168,7 @@ def create_app(
     app.include_router(memorize.router)
     app.include_router(search.router)
     app.include_router(get.router)
+    app.include_router(wiki.router)
     app.include_router(admin.router)
 
     logger.info("app_created", docs_enabled=enable_docs)
