@@ -34,6 +34,7 @@
 <br>
 
 - [Why Ever OS](#why-ever-os)
+- [Project Continuity integration](#project-continuity-integration)
 - [Quick Start](#quick-start)
 - [Use Cases](#use-cases)
 - [Documentation](#documentation)
@@ -96,6 +97,30 @@ for fast retrieval and self-evolving reuse.
 <td>❌ Usually retrieval-only memory with little background consolidation or long-horizon improvement</td>
 </tr>
 </table>
+
+<br>
+
+## Project Continuity integration
+
+This fork is also used with [Project Continuity](https://github.com/biaobiao2233/project-continuity), a cross-session / cross-agent project-state and handoff layer.
+
+The two systems deliberately keep different responsibilities:
+
+```text
+Project A / B / C conversations and artifacts
+                    ↓
+                  EverOS
+       shared derived historical memory
+                    ↓ historical clue / source pointer
+             Project Continuity
+       per-project current state / authority
+                    ↓
+          repo / files / live verification
+```
+
+This enables **cross-project experience reuse without cross-project authority leakage**. A current project can discover an experiment, pitfall, or source pointer from another project's history through EverOS, then verify it against its own code and constraints. `PASS`, ownership, authorization, and production state stay local to each project's Project Spine and never propagate automatically from an EverOS memory result.
+
+The companion [EverOS Control Center](https://github.com/biaobiao2233/everos-control-center) provides a desktop UI for memory search, original-memory browsing, sync, and pipeline visibility. The longer integration contract and examples live in [Project Continuity's EverOS integration document](https://github.com/biaobiao2233/project-continuity/blob/main/docs/EVEROS-INTEGRATION.md).
 
 <br>
 
