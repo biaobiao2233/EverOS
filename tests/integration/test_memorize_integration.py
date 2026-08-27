@@ -4,7 +4,7 @@ Drives ``service.memorize.memorize()`` with a ``FakeLLMClient`` so the
 full chain (ingest → boundary → user / agent pipeline → md + OME emit)
 runs without real LLM calls. Each test isolates state by:
 
-- redirecting ``MemoryRoot.default()`` to a ``tmp_path``
+- redirecting ``MemoryRoot.resolve()`` to a ``tmp_path``
 - resetting service-layer lazy singletons
 - starting / stopping a per-test ``OfflineEngine``
 - patching ``get_llm_client`` (boundary + strategies) onto a fake
@@ -107,7 +107,7 @@ async def memorize_env(
     sqlite engine.
     """
     monkeypatch.setattr(
-        MemoryRoot, "default", classmethod(lambda cls: MemoryRoot(root=tmp_path))
+        MemoryRoot, "resolve", classmethod(lambda cls: MemoryRoot(root=tmp_path))
     )
     (tmp_path / ".index" / "sqlite").mkdir(parents=True, exist_ok=True)
     (tmp_path / "ome.toml").write_text("# test\n")
@@ -374,6 +374,47 @@ async def test_single_user_message_accumulates(
     assert result.status == "accumulated"
     assert _memcell_rows(tmp_path) == []
     assert _buffer_count(tmp_path) == 1
+
+
+async def test_deferred_add_persists_without_llm_then_flushes(
+    tmp_path: Path,
+    memorize_env: Callable[..., Any],
+) -> None:
+    """Deferred add is durable and cheap; flush performs the LLM extraction."""
+    calls: list[str] = []
+
+    def handler(messages: list[LLMChatMessage], **_: Any) -> ChatResponse:
+        prompt = messages[0].content
+        calls.append(prompt)
+        if "boundaries" in prompt.lower() or "memcell" in prompt.lower():
+            return ChatResponse(content=_boundary_response([]), model="fake")
+        return ChatResponse(content=_episode_response(), model="fake")
+
+    await memorize_env(mode="chat", fake_llm=FakeLLMClient(handler=handler))
+    payload = {
+        "session_id": "test_deferred",
+        "messages": [
+            _user("remember the parser preference", 1_700_000_000_000),
+            _assistant("noted", 1_700_000_001_000),
+        ],
+    }
+
+    buffered = await memorize(payload, defer_extraction=True)
+
+    assert buffered.status == "accumulated"
+    assert buffered.message_count == 2
+    assert calls == []
+    assert _buffer_count(tmp_path) == 2
+    assert _memcell_rows(tmp_path) == []
+
+    flushed = await memorize(
+        {"session_id": "test_deferred", "messages": []}, is_final=True
+    )
+
+    assert flushed.status == "extracted"
+    assert calls
+    assert _buffer_count(tmp_path) == 0
+    assert len(_memcell_rows(tmp_path)) == 1
 
 
 async def test_chat_mode_filters_tool_messages(
