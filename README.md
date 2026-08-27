@@ -1,14 +1,12 @@
 > [!IMPORTANT]
-> **Production-optimized fork / 生产优化版已开源**
+> **Fork status / 分支状态（2026-08-27）**
 >
-> The default `main` branch continues to track current upstream EverOS. The
-> production-derived implementation is published separately on
-> **[`production-optimized`](https://github.com/biaobiao2233/EverOS/tree/production-optimized)**
-> so its older upstream base is not silently mixed into the 1.2.x line.
+> - `main`：跟踪最新官方 EverOS；本次已同步到 upstream `d48963c`（2026-08-26），包含 `v1.2.3` 及其后的官方提交，再叠加本 fork 的说明文档。
+> - `production-v2`：本 fork 当前真实生产所对应的 Stage 3 源码线。已验收 runtime commit=`0ffd67c`；它基于较老 upstream `8f175d3`，**不声称与 1.2.x 已完成合并或兼容**。
+> - `memory-roadmap-candidate`：基于 `production-v2` 的下一代记忆质量候选，candidate=`913e345`；已完成 candidate review，但**尚未生产 rollout**。
+> - `production-optimized`：2026-07 的第一代生产强化分支，保留作历史/对照，不再代表当前生产最新状态。
 >
-> 完整的原版差异、每个处理环节所用组件、幂等与崩溃恢复设计、Antigravity
-> CLI 文本处理方式、安全边界和已知限制见
-> **[生产优化说明](https://github.com/biaobiao2233/EverOS/blob/production-optimized/PRODUCTION_OPTIMIZED.md)**。
+> 详细分支关系、能力差异和 upstream convergence 计划见 [FORK_STATUS.md](FORK_STATUS.md)。
 
 <div align="center" id="readme-top">
 
@@ -119,7 +117,7 @@ Project A / B / C conversations and artifacts
 
 This enables **cross-project experience reuse without cross-project authority leakage**. A current project can discover an experiment, pitfall, or source pointer from another project's history through EverOS, then verify it against its own code and constraints. `PASS`, ownership, authorization, and production state stay local to each project's Project Spine and never propagate automatically from an EverOS memory result.
 
-The companion [EverOS Control Center](https://github.com/biaobiao2233/everos-control-center) provides a desktop UI for memory search, original-memory browsing, sync, and pipeline visibility. The longer integration contract and examples live in [Project Continuity's EverOS integration document](https://github.com/biaobiao2233/project-continuity/blob/main/docs/EVEROS-INTEGRATION.md).
+The companion [EverOS Control Center](https://github.com/biaobiao2233/everos-control-center) currently has one comparatively mature day-to-day path: **sync**. Memory search, original-memory/Markdown browsing, pipeline, and run-history surfaces are still experimental; the original-memory view is especially rough and not yet a comfortable reader. The longer integration contract and examples live in [Project Continuity's EverOS integration document](https://github.com/biaobiao2233/project-continuity/blob/main/docs/EVEROS-INTEGRATION.md).
 
 <br>
 

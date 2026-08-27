@@ -1,3 +1,13 @@
+> [!IMPORTANT]
+> **本 Fork 分支状态（2026-08-27）**
+>
+> - `main`：跟踪最新官方 EverOS；已同步到 upstream `d48963c`（2026-08-26），包含 `v1.2.3` 及其后的官方提交，并保留本 fork 的说明文档。
+> - `production-v2`：当前真实生产对应的 Stage 3 源码线，已验收 runtime commit=`0ffd67c`。它基于较老 upstream `8f175d3`，**不声称已经与 1.2.x 合并或兼容**。
+> - `memory-roadmap-candidate`：基于 `production-v2` 的下一代记忆质量候选，candidate=`913e345`；源码已通过 candidate review，但**尚未生产上线**。
+> - `production-optimized`：2026-07 的第一代生产强化历史分支，不再代表当前生产最新状态。
+>
+> 详细关系见 [FORK_STATUS.md](FORK_STATUS.md)。
+
 <div align="center" id="readme-top">
 
 ![EverOS banner](https://github.com/user-attachments/assets/806e9d7f-c861-4b89-9141-11e38f8753e3)
