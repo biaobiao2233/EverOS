@@ -26,6 +26,7 @@ insert its own row per cell.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
@@ -474,33 +475,64 @@ async def publish_messages(
 ) -> PublishMutationSummary:
     """Authorize exact staged revisions without invoking extraction."""
 
-    refs: list[tuple[str, int]] = []
+    refs: list[tuple[str, int, str | None]] = []
     seen_idem: set[str] = set()
     for item in items:
-        source = item.get("source") or "api"
+        source = item.get("source")
         external_ref = item.get("external_ref")
+        payload_sha256 = item.get("payload_sha256")
         revision = item.get("revision", 0)
-        if not isinstance(source, str) or not isinstance(external_ref, str):
-            raise MemoryMessageConflictError(
-                "publish requires source + external_ref for every message"
-            )
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
             raise MemoryMessageConflictError(
                 "publish revision must be a non-negative integer"
             )
-        idem_key = external_idem_key(session_id, source, external_ref)
+
+        if payload_sha256 is not None:
+            if source is not None or external_ref is not None:
+                raise MemoryMessageConflictError(
+                    "payload_sha256 publish reference is mutually exclusive with "
+                    "source + external_ref"
+                )
+            if (
+                not isinstance(payload_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", payload_sha256) is None
+            ):
+                raise MemoryMessageConflictError(
+                    "publish payload_sha256 must be 64 lowercase hex characters"
+                )
+            if revision != 0:
+                raise MemoryMessageConflictError(
+                    "payload_sha256 publish reference requires revision 0"
+                )
+            idem_key = f"__content_hash__:{session_id}:{payload_sha256}"
+            expected_payload_sha256: str | None = payload_sha256
+        else:
+            resolved_source = source or "api"
+            if not isinstance(resolved_source, str) or not isinstance(
+                external_ref, str
+            ):
+                raise MemoryMessageConflictError(
+                    "publish requires source + external_ref or payload_sha256"
+                )
+            idem_key = external_idem_key(
+                session_id,
+                resolved_source,
+                external_ref,
+            )
+            expected_payload_sha256 = None
+
         if idem_key in seen_idem:
             raise MemoryMessageConflictError(
                 "publish request contains the same logical message more than once"
             )
         seen_idem.add(idem_key)
-        refs.append((idem_key, revision))
+        refs.append((idem_key, revision, expected_payload_sha256))
 
     published_count = 0
     already_published_count = 0
     consumed_count = 0
     async with session_scope(get_session_factory()) as session:
-        for idem_key, revision in refs:
+        for idem_key, revision, expected_payload_sha256 in refs:
             stmt = select(MemoryMessageReceipt).where(
                 MemoryMessageReceipt.app_id == app_id,
                 MemoryMessageReceipt.project_id == project_id,
@@ -514,6 +546,16 @@ async def publish_messages(
             if receipt.session_id != session_id:
                 raise MemoryMessageRecoveryError(
                     "publish receipt session does not match request"
+                )
+            if expected_payload_sha256 is not None and (
+                receipt.source != "__content_hash__"
+                or receipt.external_ref is not None
+                or receipt.payload_sha256 != expected_payload_sha256
+                or receipt.revision != 0
+            ):
+                raise MemoryMessageRecoveryError(
+                    "payload_sha256 publish reference did not resolve an exact "
+                    "legacy content-hash receipt"
                 )
             if receipt.revision != revision:
                 raise MemoryMessageConflictError(

@@ -1086,6 +1086,93 @@ async def test_pending_publish_blocks_flush_then_consumes_and_late_replay_is_noo
     assert len(_memcell_rows(tmp_path)) == 1
 
 
+async def test_legacy_content_hash_receipt_can_publish_by_exact_payload_hash(
+    tmp_path: Path,
+    memorize_env: Callable[..., Any],
+) -> None:
+    await memorize_env(
+        mode="chat",
+        fake_llm=_make_fake_llm(boundary_responses=[[]]),
+    )
+    sid = "legacy_content_hash_publish"
+    messages = [
+        _user("legacy durable user fact", 1_700_000_000_000),
+        _assistant("legacy ack", 1_700_000_001_000),
+    ]
+    staged = await stage(
+        {
+            "operation_id": "evop1-stage-" + "e" * 64,
+            "session_id": sid,
+            "messages": messages,
+        }
+    )
+    assert staged.inserted_count == 2
+    receipts = _receipt_rows(tmp_path)
+    assert len(receipts) == 2
+    assert {row["source"] for row in receipts} == {"__content_hash__"}
+    assert {row["external_ref"] for row in receipts} == {None}
+    payload_hashes = [row["payload_sha256"] for row in receipts]
+
+    publish_payload = {
+        "operation_id": "evop1-publish-" + "e" * 64,
+        "session_id": sid,
+        "authority_ref": "recovery:legacy-content-hash-pilot",
+        "messages": [
+            {"payload_sha256": payload_sha256, "revision": 0}
+            for payload_sha256 in payload_hashes
+        ],
+    }
+    published = await publish(publish_payload)
+    assert published.published_count == 2
+    assert {row["authority_state"] for row in _receipt_rows(tmp_path)} == {"published"}
+
+    replay = await publish(publish_payload)
+    assert replay.replayed is True
+    flushed = await memorize({"session_id": sid, "messages": []}, is_final=True)
+    assert flushed.status == "extracted"
+    assert _buffer_count(tmp_path) == 0
+    assert len(_memcell_rows(tmp_path)) == 1
+    assert {row["authority_state"] for row in _receipt_rows(tmp_path)} == {"consumed"}
+
+
+async def test_payload_hash_publish_does_not_alias_external_identity(
+    tmp_path: Path,
+    memorize_env: Callable[..., Any],
+) -> None:
+    await memorize_env(mode="chat", fake_llm=_make_fake_llm())
+    sid = "payload_hash_no_alias"
+    await stage(
+        {
+            "operation_id": "evop1-stage-" + "f" * 64,
+            "session_id": sid,
+            "messages": [
+                _staged(
+                    _user("stable external identity", 1_700_000_000_000),
+                    "chatgpt-stable-id",
+                    source="chatgpt",
+                )
+            ],
+        }
+    )
+    receipt = _receipt_rows(tmp_path)[0]
+    with pytest.raises(
+        MemoryMessageConflictError,
+        match="has not been staged",
+    ):
+        await publish(
+            {
+                "operation_id": "evop1-publish-" + "f" * 64,
+                "session_id": sid,
+                "authority_ref": "recovery:must-not-alias",
+                "messages": [{"payload_sha256": receipt["payload_sha256"]}],
+            }
+        )
+    after = _receipt_rows(tmp_path)[0]
+    assert after["source"] == "chatgpt"
+    assert after["external_ref"] == "chatgpt-stable-id"
+    assert after["authority_state"] == "pending_publish"
+
+
 async def test_external_identity_rechunk_dedupes_across_stage_operations(
     tmp_path: Path,
     memorize_env: Callable[..., Any],

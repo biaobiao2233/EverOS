@@ -49,6 +49,7 @@ _STAGE_OPERATION_ID = r"^evop1-stage-[0-9a-f]{64}$"
 _PUBLISH_OPERATION_ID = r"^evop1-publish-[0-9a-f]{64}$"
 _FLUSH_OPERATION_ID = r"^evop1-flush-[0-9a-f]{64}$"
 _STAGE_SOURCE = r"^[a-z0-9_.-]{1,32}$"
+_PAYLOAD_SHA256 = r"^[0-9a-f]{64}$"
 
 
 def _reject_path_traversal(value: str) -> str:
@@ -127,8 +128,8 @@ class StagedMessageItemDTO(MessageItemDTO):
     def validate_staged_identity(self) -> StagedMessageItemDTO:
         if self.source.startswith("__"):
             raise ValueError("staged message source uses a reserved namespace")
-        if self.source == "web" and self.external_ref is None:
-            raise ValueError("web staged messages require external_ref")
+        if self.source in {"web", "chatgpt"} and self.external_ref is None:
+            raise ValueError(f"{self.source} staged messages require external_ref")
         if self.revision != 0 and self.external_ref is None:
             raise ValueError("revision requires external_ref")
         return self
@@ -185,14 +186,28 @@ class StageResponseData(BaseModel):
 
 
 class PublishMessageRefDTO(BaseModel):
-    source: str = Field(default="api", pattern=_STAGE_SOURCE)
-    external_ref: str = Field(..., min_length=1, max_length=512)
+    source: str | None = Field(default=None, pattern=_STAGE_SOURCE)
+    external_ref: str | None = Field(default=None, min_length=1, max_length=512)
+    payload_sha256: str | None = Field(default=None, pattern=_PAYLOAD_SHA256)
     revision: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
-    def validate_source_namespace(self) -> PublishMessageRefDTO:
-        if self.source.startswith("__"):
+    def validate_reference(self) -> PublishMessageRefDTO:
+        if self.source is not None and self.source.startswith("__"):
             raise ValueError("staged message source uses a reserved namespace")
+        has_external_ref = self.external_ref is not None
+        has_payload_hash = self.payload_sha256 is not None
+        if has_payload_hash:
+            if self.source is not None or has_external_ref:
+                raise ValueError(
+                    "payload_sha256 publish reference is mutually exclusive with "
+                    "source + external_ref"
+                )
+            if self.revision != 0:
+                raise ValueError("payload_sha256 publish reference requires revision 0")
+            return self
+        if not has_external_ref:
+            raise ValueError("publish requires source + external_ref or payload_sha256")
         return self
 
 

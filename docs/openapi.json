@@ -1992,16 +1992,41 @@
       "PublishMessageRefDTO": {
         "properties": {
           "source": {
-            "type": "string",
-            "pattern": "^[a-z0-9_.-]{1,32}$",
-            "title": "Source",
-            "default": "api"
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-z0-9_.-]{1,32}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
           },
           "external_ref": {
-            "type": "string",
-            "maxLength": 512,
-            "minLength": 1,
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 512,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
             "title": "External Ref"
+          },
+          "payload_sha256": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payload Sha256"
           },
           "revision": {
             "type": "integer",
@@ -2011,9 +2036,6 @@
           }
         },
         "type": "object",
-        "required": [
-          "external_ref"
-        ],
         "title": "PublishMessageRefDTO"
       },
       "PublishResponseData": {
