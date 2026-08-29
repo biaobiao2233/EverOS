@@ -857,14 +857,13 @@ async def test_prune_staleness_reports_worst_kind(patched_repo: _FakeRepo) -> No
     now = time.monotonic()
     w = CascadeWorker({"a": _OkHandler(), "b": _OkHandler()})
     w._started_at = now - 100.0
-    # Both kinds had a maintenance opportunity long ago; b's cleanup stopped
-    # succeeding more recently than a's — wait, no: b pruned LONGER ago than
-    # a (90s vs 50s), so b is the worst.
+    # Both kinds have unresolved heavy cleanup incidents; b has been pending
+    # longer, so it is the worst.
     w._optimizer_states["a"] = _KindOptimizerState(
-        first_scheduled_at=now - 100.0, last_prune_at=now - 50.0
+        first_scheduled_at=now - 100.0, prune_pending_since=now - 50.0
     )
     w._optimizer_states["b"] = _KindOptimizerState(
-        first_scheduled_at=now - 100.0, last_prune_at=now - 90.0
+        first_scheduled_at=now - 100.0, prune_pending_since=now - 90.0
     )
     stale, kind = w._prune_staleness()
     assert kind == "b"
@@ -929,9 +928,12 @@ async def test_scheduled_but_failing_prune_flips_unhealthy(
     now = time.monotonic()
     w = CascadeWorker({"agent_skill": _OkHandler()})
     w._started_at = now - 300.0
-    # Scheduled once 200s ago; every heavy beat since failed (never pruned).
+    # Scheduled once 200s ago; the heavy cleanup incident has remained
+    # unresolved since then even if individual retries happened later.
     w._optimizer_states["agent_skill"] = _KindOptimizerState(
-        first_scheduled_at=now - 200.0, last_prune_attempt_at=now - 1.0
+        first_scheduled_at=now - 200.0,
+        last_prune_attempt_at=now - 1.0,
+        prune_pending_since=now - 200.0,
     )
     # An idle sibling registered by the rebuild sweep must not mask it — and
     # must not be counted itself.
@@ -946,27 +948,72 @@ async def test_scheduled_but_failing_prune_flips_unhealthy(
     assert any("version cleanup stalled" in r for r in reasons), reasons
 
 
-async def test_first_write_starts_the_staleness_clock(
+async def test_successful_prune_then_idle_does_not_age_into_unhealthy(
     patched_repo: _FakeRepo,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The clock follows the first maintenance opportunity, not boot time."""
+    """Regression: a completed heavy beat must stay healthy while idle."""
+    monkeypatch.setattr(worker_mod, "_PRUNE_STALE_SECONDS_ALERT", 1.0)
     now = time.monotonic()
     fake = _FakeLanceRepo()
-    w = CascadeWorker(
-        {"a": _OkHandlerWithRepo(fake), "b": _OkHandlerWithRepo(_FakeLanceRepo())}
-    )
+    w = CascadeWorker({"a": _OkHandlerWithRepo(fake)})
     w._started_at = now - 500.0  # daemon up for ages, silent
-    w._optimizer_states["b"] = _KindOptimizerState(first_scheduled_at=now - 400.0)
     # 'a' gets its very first write-driven schedule right now.
     w._schedule_optimize("a")
     await w._flush_optimizers()
     state = w._optimizer_states["a"]
     assert state.first_scheduled_at > 0.0
+    assert state.last_prune_at > 0.0
+    assert state.prune_pending_since == 0.0
+
+    # Simulate a long idle period after the successful prune.  There is no
+    # unresolved cleanup, so wall-clock age alone must not degrade readiness.
+    state.first_scheduled_at -= 2 * 3600.0
+    state.last_prune_at -= 2 * 3600.0
+    state.last_prune_attempt_at -= 2 * 3600.0
+    assert w._prune_staleness() == (0.0, None)
+
+    # Reviewer regression: a *new* write after the long idle period starts a
+    # fresh dirty episode.  Before its task gets CPU time, health must use the
+    # new opportunity timestamp rather than the hours-old prior episode.
+    stale_timestamp = state.first_scheduled_at
+    w._schedule_optimize("a")
+    assert state.dirty is True
+    assert state.first_scheduled_at > stale_timestamp
+    h = w.health()
+    assert h.prune_stale_seconds < 1.0
+    assert h.reasons() == []
+    await w._flush_optimizers()
+
+
+async def test_write_burst_preserves_earliest_dirty_opportunity(
+    patched_repo: _FakeRepo,
+) -> None:
+    """Repeated schedules in one dirty episode must not keep resetting age."""
+    w = CascadeWorker({"a": _OkHandlerWithRepo(_FakeLanceRepo())})
+    w._schedule_optimize("a")
+    state = w._optimizer_states["a"]
+    first = state.first_scheduled_at
+    w._schedule_optimize("a")
+    assert state.first_scheduled_at == first
+    await w._flush_optimizers()
+
+
+async def test_failed_prune_pending_clock_survives_retries(
+    patched_repo: _FakeRepo,
+) -> None:
+    """A later retry must not hide how long cleanup has been unresolved."""
+    now = time.monotonic()
+    w = CascadeWorker({"a": _OkHandler()})
+    w._started_at = now - 500.0
+    w._optimizer_states["a"] = _KindOptimizerState(
+        first_scheduled_at=now - 400.0,
+        last_prune_attempt_at=now - 5.0,
+        prune_pending_since=now - 300.0,
+    )
     stale, kind = w._prune_staleness()
-    # Worst eligible kind is 'b' (~400s); 'a' contributes ~0s. Crucially,
-    # neither is baselined at the 500s-old boot time.
-    assert kind == "b"
-    assert stale <= 401.0
+    assert kind == "a"
+    assert 299.0 <= stale <= 301.0
 
 
 def test_worker_health_reasons_thresholds() -> None:
@@ -1084,6 +1131,8 @@ async def test_failed_prune_advances_attempt_clock_next_beat_is_light(
     state = w._optimizer_states["episode"]
     assert state.last_prune_attempt_at > 0.0, "attempt clock advances on failure"
     assert state.last_prune_at == 0.0, "success clock only moves on success"
+    pending_since = state.prune_pending_since
+    assert pending_since > 0.0, "failed heavy beat starts unresolved-cleanup clock"
 
     # Beat 2 within the cadence: light compaction (not another lock-holding
     # prune attempt).
@@ -1092,6 +1141,9 @@ async def test_failed_prune_advances_attempt_clock_next_beat_is_light(
     await w._flush_optimizers()
     assert len(fake.prune_calls) == 1, "failed prune backs off the full cadence"
     assert len(fake.optimize_calls) == 1
+    assert state.prune_pending_since == pending_since, (
+        "light retry must not hide how long heavy cleanup has been unresolved"
+    )
 
 
 async def test_store_busy_deadline_error_marks_row_retryable(

@@ -268,15 +268,32 @@ class _KindOptimizerState:
     last_run_at: float = 0.0
     last_prune_attempt_at: float = 0.0
     last_prune_at: float = 0.0
-    first_scheduled_at: float = 0.0
-    """Monotonic time of the first maintenance *opportunity* for this kind —
-    the moment ``_schedule_optimize`` first targeted it (a write batch touched
-    it, or the heartbeat revived a dirty flag). ``0`` means "never scheduled".
+    prune_pending_since: float = 0.0
+    """Monotonic start of an unresolved heavy prune beat.
 
-    The prune-staleness clock baselines here rather than at worker start: a
-    state registered by the startup rebuild sweep on an idle deployment (no
-    writes → no beats) is not a stalled cleanup — nothing ever had a chance to
-    prune. Only once an opportunity exists can staleness mean anything.
+    Set immediately before the first heavy prune attempt in an unresolved
+    cleanup incident and cleared only after a prune completes successfully.
+    Repeated failed/conflicted attempts deliberately do not move this clock:
+    health needs to measure how long cleanup has failed to reach a success,
+    not how recently the last retry happened.
+
+    A completed prune followed by an idle period leaves this at ``0``.  That
+    distinction is important: time since the last successful cleanup is not
+    itself a stalled cleanup when there has been no unresolved heavy beat.
+    """
+    first_scheduled_at: float = 0.0
+    """Monotonic start of the current dirty maintenance opportunity.
+
+    ``_schedule_optimize`` refreshes this only on a clean -> dirty transition,
+    so a burst of writes preserves the earliest unresolved opportunity while a
+    new write after a long idle period gets a fresh clock. ``0`` means no
+    maintenance opportunity has ever been scheduled in this process.
+
+    Health uses this only while an optimizer is still ``dirty`` before a heavy
+    beat has begun. Once a heavy prune attempt starts, ``prune_pending_since``
+    becomes the incident clock instead. A state registered by the startup
+    rebuild sweep on an idle deployment (no writes → no beats) is therefore
+    not a stalled cleanup.
     """
     dirty: bool = False
     optimize_failures: int = 0
@@ -337,10 +354,11 @@ class CascadeWorkerHealth:
     kinds; benign light-beat commit conflicts do not count."""
 
     prune_stale_seconds: float
-    """Staleness of the **worst** kind — seconds since that kind's last
-    successful prune (version cleanup), measured from worker start if it
-    has never pruned. ``0`` when no kind has an optimizer state yet (no
-    write activity to prune).
+    """Age of the **worst unresolved** version-cleanup incident.
+
+    ``0`` means no kind currently has a dirty pre-prune optimizer or a heavy
+    prune attempt that has failed to reach a successful completion. Time since
+    a successful prune does not accumulate here while the kind is idle.
 
     Deliberately the worst kind, not the newest prune across kinds: a
     per-kind cleanup that dies grows *that table's* index dir unbounded,
@@ -656,13 +674,23 @@ class CascadeWorker:
     def _prune_staleness(self) -> tuple[float, str | None]:
         """Staleness of the **worst** kind: ``(seconds, kind)``.
 
-        Per kind, staleness is measured from its **first maintenance
-        opportunity** (:attr:`_KindOptimizerState.first_scheduled_at`) or its
-        last successful prune — whichever is newer. The worst (largest) one is
-        reported. Taking the worst rather than the newest prune across kinds
-        is what makes the signal work on a multi-kind deployment: one kind
-        whose cleanup dies grows that table's index dir unbounded, and the
-        healthy kinds pruning on schedule must not hide it.
+        Per kind, staleness is measured only while there is unresolved cleanup:
+
+        - an in-flight/lost optimizer that is still ``dirty`` and has not yet
+          reached a heavy prune attempt, measured from its first scheduling
+          opportunity; or
+        - a heavy prune incident that started but has not completed
+          successfully, measured from ``prune_pending_since``.
+
+        A successful prune followed by an idle period is *not* stale.  The
+        previous implementation measured wall-clock time since the last
+        successful prune forever, so a healthy deployment inevitably flipped
+        readiness red after the alert threshold even with an empty queue and
+        no failed maintenance work.
+
+        The worst (largest) unresolved incident is reported. Taking the worst
+        across kinds prevents one genuinely stalled cleanup from being masked
+        by healthy siblings.
 
         A kind that has **never been scheduled** (no write batch touched it,
         heartbeat never revived it) is skipped entirely: its optimizer state
@@ -684,7 +712,15 @@ class CascadeWorker:
         for kind, state in states:
             if state.first_scheduled_at == 0.0:
                 continue
-            baseline = max(state.last_prune_at, state.first_scheduled_at)
+            if state.prune_pending_since > 0.0:
+                baseline = state.prune_pending_since
+            elif state.dirty:
+                baseline = state.first_scheduled_at
+            else:
+                # No unresolved heavy cleanup.  In particular, do not turn a
+                # successful prune into a future readiness failure merely
+                # because the table stayed idle afterwards.
+                continue
             stale = max(0.0, now - baseline)
             if stale > worst_seconds:
                 worst_seconds, worst_kind = stale, kind
@@ -829,10 +865,12 @@ class CascadeWorker:
         if repo is None:
             return
         state = self._optimizer_states.setdefault(kind, _KindOptimizerState())
-        if state.first_scheduled_at == 0.0:
-            # First maintenance opportunity for this kind — the prune-staleness
-            # health clock starts here, not at worker start (see
-            # _prune_staleness: idle deployments are not stalled deployments).
+        if not state.dirty:
+            # Start (or refresh) the clock for this dirty episode.  Repeated
+            # calls while already dirty intentionally preserve the earliest
+            # unresolved opportunity.  After a completed/idle episode, a new
+            # write must not inherit an hours-old timestamp and instantly turn
+            # readiness red before its optimizer has had a chance to run.
             state.first_scheduled_at = time.monotonic()
         state.dirty = True
         if state.task is not None and not state.task.done():
@@ -954,12 +992,15 @@ class CascadeWorker:
                 # signal) advances only after the call returns.
                 if state is not None:
                     state.last_prune_attempt_at = now
+                    if state.prune_pending_since == 0.0:
+                        state.prune_pending_since = now
                 async with asyncio.timeout(_MAINTENANCE_TASK_TIMEOUT_SECONDS):
                     await repo.prune(
                         dt.timedelta(seconds=self._optimize_prune_retention)
                     )
                 if state is not None:
                     state.last_prune_at = now
+                    state.prune_pending_since = 0.0
             else:
                 # Light beat: lock-free compaction. A commit conflict here
                 # is benign — handled below.
