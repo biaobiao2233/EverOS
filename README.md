@@ -1,8 +1,8 @@
 > [!IMPORTANT]
-> **Fork status / 分支状态（2026-08-27）**
+> **Fork status / 分支状态（2026-09-07）**
 >
-> - `main`：跟踪最新官方 EverOS；本次已同步到 upstream `d48963c`（2026-08-26），包含 `v1.2.3` 及其后的官方提交，再叠加本 fork 的说明文档。
-> - `production-v2`：本 fork 当前真实生产所对应的 Stage 3 源码线。已验收 runtime commit=`0ffd67c`；它基于较老 upstream `8f175d3`，**不声称与 1.2.x 已完成合并或兼容**。
+> - `main`：跟踪最新官方 EverOS；本次已同步到 upstream `e8612b9`（2026-09-07），即官方 `v1.3.0`，再叠加本 fork 的说明文档。
+> - `production-v2`：本 fork 当前已验收生产源码 lineage；最新 source=`563ab9f`，依次包含 Stage 3、Wiki production、Publish identity repair 与 Cascade health repair。它仍基于较老 upstream `8f175d3`，**不声称与 `v1.3.0` 已完成合并或兼容**。
 > - `memory-roadmap-candidate`：基于 `production-v2` 的下一代记忆质量候选，candidate=`913e345`；已完成 candidate review，但**尚未生产 rollout**。
 > - `production-optimized`：2026-07 的第一代生产强化分支，保留作历史/对照，不再代表当前生产最新状态。
 >
@@ -31,7 +31,8 @@
 
 <br>
 
-- [Why Ever OS](#why-ever-os)
+- [Why EverOS](#why-ever-os)
+- [Ecosystem Integrations](#ecosystem-integrations)
 - [Project Continuity integration](#project-continuity-integration)
 - [Quick Start](#quick-start)
 - [Use Cases](#use-cases)
@@ -44,7 +45,7 @@
 </details>
 
 
-## Why Ever OS
+## Why EverOS
 
 EverOS is a Python library and local-first memory runtime for agents and
 makers. It gives one portable memory layer across coding assistants, apps,
@@ -97,6 +98,23 @@ for fast retrieval and self-evolving reuse.
 
 <br>
 
+## Ecosystem Integrations
+
+EverOS adds durable memory to the agent and workflow platforms below—and comes
+built into Raven. Choose an integration to open its setup guide.
+
+<table width="100%">
+<tr>
+<td width="400" align="center"><a href="https://github.com/EverMind-AI/plugins/tree/main/dsh"><img src="https://avatars.githubusercontent.com/u/148330874?s=200&amp;v=4" alt="DeepSeek Harness" width="72"><br><strong>DeepSeek Harness</strong></a></td>
+<td width="400" align="center"><a href="https://github.com/EverMind-AI/plugins/tree/main/hermes"><img src="https://github.com/user-attachments/assets/477eebc4-e615-4425-921e-368d7667e491" alt="Hermes" width="72"><br><strong>Hermes</strong></a></td>
+<td width="400" align="center"><a href="https://github.com/EverMind-AI/plugins/tree/main/openclaw"><img src="https://github.com/user-attachments/assets/01d948fe-1e2b-48e8-9b32-b8057cb3f336" alt="OpenClaw" width="72"><br><strong>OpenClaw</strong></a></td>
+<td width="400" align="center"><a href="https://github.com/EverMind-AI/Raven"><img src="https://github.com/user-attachments/assets/27e1ea63-69d4-48b3-a884-7f0355926907" alt="Raven" width="72"><br><strong>Raven</strong></a></td>
+<td width="400" align="center"><a href="https://github.com/EverMind-AI/plugins#plugins"><img src="https://raw.githubusercontent.com/langgenius/dify/280f81757d5fdea9c2dd804483c7f70c2e95cd9a/web/public/logo/logo-site.png" alt="Dify" width="112"><br><strong>Dify</strong></a></td>
+</tr>
+</table>
+
+<br>
+
 ## Project Continuity integration
 
 This fork is also used with [Project Continuity](https://github.com/biaobiao2233/project-continuity), a cross-session / cross-agent project-state and handoff layer.
@@ -117,7 +135,7 @@ Project A / B / C conversations and artifacts
 
 This enables **cross-project experience reuse without cross-project authority leakage**. A current project can discover an experiment, pitfall, or source pointer from another project's history through EverOS, then verify it against its own code and constraints. `PASS`, ownership, authorization, and production state stay local to each project's Project Spine and never propagate automatically from an EverOS memory result.
 
-The companion [EverOS Control Center](https://github.com/biaobiao2233/everos-control-center) currently has one comparatively mature day-to-day path: **sync**. Memory search, original-memory/Markdown browsing, pipeline, and run-history surfaces are still experimental; the original-memory view is especially rough and not yet a comfortable reader. The longer integration contract and examples live in [Project Continuity's EverOS integration document](https://github.com/biaobiao2233/project-continuity/blob/main/docs/EVEROS-INTEGRATION.md).
+The companion [EverOS Control Center](https://github.com/biaobiao2233/everos-control-center) now also includes the deterministic Wiki view plus multi-source sync/run-history recovery fixes. **Sync remains its most mature day-to-day path**; memory reading, search, pipeline, and history surfaces are still evolving rather than being presented as equally mature. The longer integration contract and examples live in [Project Continuity's EverOS integration document](https://github.com/biaobiao2233/project-continuity/blob/main/docs/EVEROS-INTEGRATION.md).
 
 <br>
 
@@ -340,6 +358,17 @@ external demos or integrations you can study and adapt.
 <tr>
 <td width="50%" valign="top">
 
+[![AIUI Sports Agents for Smart Glasses](https://github.com/user-attachments/assets/7a8e6bca-6a12-4284-aa57-2f59fed7a6a2)](https://github.com/EasonZhu1997/AIUI-Sports-Agents)
+
+#### AIUI Sports Agents
+
+Sports agents for smart glasses, covering running, cycling, and indoor rowing. AISmartRun includes an optional memory-backend contract for post-run summaries; connecting it to EverOS requires a separately configured backend.
+
+[Code](https://github.com/EasonZhu1997/AIUI-Sports-Agents)
+
+</td>
+<td width="50%" valign="top">
+
 [![banner-gif](https://github.com/user-attachments/assets/840470d7-a838-4c05-8685-dd797d4e9cdf)](https://evermind.ai/usecase_reunite)
 
 #### Reunite - Find With EverOS
@@ -349,6 +378,9 @@ Parents describe what they remember. Children describe what they recall. Reunite
 [Learn more](https://evermind.ai/usecase_reunite)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/7282b38b-56bf-4356-aa7b-06a845e7683d)](https://github.com/tt-a1i/hive)
@@ -360,9 +392,6 @@ Browser-native hive-mind for CLI coding agents - Claude Code, Codex, Gemini, and
 [Code](https://github.com/tt-a1i/hive)
 
 </td>
-</tr>
-
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/867d9329-ce9a-496f-ab1e-15c77974e5fa)](https://github.com/tt-a1i/evermemos-mcp)
@@ -374,6 +403,9 @@ Universal long-term memory layer for AI coding assistants, powered by EverOS.
 [Code](https://github.com/tt-a1i/evermemos-mcp)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/a4f0fd86-1c81-4445-bebc-e51eb5e33b30)](https://github.com/yuansui123/AI-Data-Technician-EverMemOS)
@@ -385,9 +417,6 @@ An agentic AI system that learns from scientist interaction to inspect, analyze,
 [Code](https://github.com/yuansui123/AI-Data-Technician-EverMemOS)
 
 </td>
-</tr>
-
-<tr>
 <td width="50%" valign="top">
 
 ![banner-gif](https://github.com/user-attachments/assets/650b901b-c9ba-4001-bac7-626b009df830)
@@ -399,6 +428,15 @@ Connect to EverOS within Rokid Glasses enabling long-term memory for all of your
 Coming soon
 
 </td>
+</tr>
+
+<tr>
+<td colspan="2" align="right">
+<a href="#readme-top"><img src="https://img.shields.io/badge/-Back_to_top-gray?style=flat-square" alt="Back to top"></a>
+</td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 ![banner-gif](https://github.com/user-attachments/assets/85b338b2-e48e-4a65-9f30-0bc6998df872)
@@ -410,15 +448,6 @@ Creative assistant with long-term memory, so your creative context stays availab
 Coming soon
 
 </td>
-</tr>
-
-<tr>
-<td colspan="2" align="right">
-<a href="#readme-top"><img src="https://img.shields.io/badge/-Back_to_top-gray?style=flat-square" alt="Back to top"></a>
-</td>
-</tr>
-
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/f30617a1-adc0-4271-bc0e-c3a0b28cb903)](https://github.com/xunyud/Earth-Online)
@@ -430,6 +459,9 @@ Earth Online is a memory-aware productivity game that turns everyday planning in
 [Code](https://github.com/xunyud/Earth-Online)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/57d8cda7-35a5-4561-b794-5520dffc917b)](https://github.com/golutra/golutra)
@@ -441,8 +473,6 @@ Golutra presents a multi-agent workforce for engineering teams, extending the ID
 [Code](https://github.com/golutra/golutra)
 
 </td>
-</tr>
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/75f19db5-30f6-4eed-9b1e-c9c6a0e6b7de)](https://github.com/Yangtze-Seventh/taste-verse)
@@ -454,6 +484,9 @@ Record, visualize, and explore your tasting journey through an immersive 3D star
 [Code](https://github.com/Yangtze-Seventh/taste-verse)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/93ac2a68-4f18-4fcb-8d87-80aeb00a9d7c)](https://github.com/kellyvv/OpenHer)
@@ -465,9 +498,6 @@ Build AI that feels. Open-source persona engine - personality emerges from neura
 [Code](https://github.com/kellyvv/OpenHer)
 
 </td>
-</tr>
-
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/550071c1-dc39-4964-9f67-ffdfad792345)](https://chromewebstore.google.com/detail/ruminer-browser-agent/lbccjohfpdpimbhpckljimgolndfmfif)
@@ -479,17 +509,6 @@ Ruminer brings persistent memory to a browser agent so it can carry personal con
 [Plugin](https://chromewebstore.google.com/detail/ruminer-browser-agent/lbccjohfpdpimbhpckljimgolndfmfif)
 
 </td>
-<td width="50%" valign="top">
-
-[![banner-gif](https://github.com/user-attachments/assets/c258a6c4-fe70-497a-98d1-3dade4a932f6)](https://github.com/nanxingw/EverMem)
-
-#### EverMem Sync With EverOS
-
-One command to connect any AI coding CLI to EverMemOS long-term memory.
-
-[Code](https://github.com/nanxingw/EverMem)
-
-</td>
 </tr>
 
 <tr>
@@ -499,6 +518,17 @@ One command to connect any AI coding CLI to EverMemOS long-term memory.
 </tr>
 
 <tr>
+<td width="50%" valign="top">
+
+[![banner-gif](https://github.com/user-attachments/assets/c258a6c4-fe70-497a-98d1-3dade4a932f6)](https://github.com/nanxingw/EverMem)
+
+#### EverMem Sync With EverOS
+
+One command to connect any AI coding CLI to EverOS (formerly called EverMemOS) for long-term memory.
+
+[Code](https://github.com/nanxingw/EverMem)
+
+</td>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/39274473-ceb3-48fb-a031-e22230decbe2)](https://github.com/mco-org/mco)
@@ -510,6 +540,9 @@ MCO equips your primary agent with an agent team that can work together to solve
 [Code](https://github.com/mco-org/mco)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/314c9126-8e08-4688-bbbb-8555ad58cf67)](https://github.com/onenewborn/StudyBuddy-public)
@@ -521,9 +554,6 @@ Study proactively with an agent that has self-evolving memory.
 [Code](https://github.com/onenewborn/StudyBuddy-public)
 
 </td>
-</tr>
-
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/21da76aa-9a8b-48e0-9134-42429d7390e7)](https://github.com/TonyLiangDesign/MemoCare)
@@ -535,6 +565,9 @@ Empowering individuals with advanced memory support and daily assistance.
 [Code](https://github.com/TonyLiangDesign/MemoCare)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/e2428df3-ea11-4e88-8f9c-dad437dd8998)](https://github.com/AlexL1024/NeuralConnect)
@@ -546,9 +579,6 @@ An iOS sci-fi mystery game where players explore and uncover the truth.
 [Code](https://github.com/AlexL1024/NeuralConnect)
 
 </td>
-</tr>
-
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/e6eaf308-a874-483f-8874-6934bf95a78f)](https://github.com/elontusk5219-prog/Mobi)
@@ -560,6 +590,15 @@ An iOS app where users create, nurture, and live with a personalized AI companio
 [Code](https://github.com/elontusk5219-prog/Mobi)
 
 </td>
+</tr>
+
+<tr>
+<td colspan="2" align="right">
+<a href="#readme-top"><img src="https://img.shields.io/badge/-Back_to_top-gray?style=flat-square" alt="Back to top"></a>
+</td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/9aabcaa9-f97a-49d2-9109-0b5bb696ed41)](https://github.com/JaMesLiMers/EvermemCompetition-Spiro)
@@ -571,14 +610,6 @@ A context-native AI wearable that listens to everyday life and converts conversa
 [Code](https://github.com/JaMesLiMers/EvermemCompetition-Spiro)
 
 </td>
-</tr>
-
-<tr>
-<td colspan="2" align="right">
-<a href="#readme-top"><img src="https://img.shields.io/badge/-Back_to_top-gray?style=flat-square" alt="Back to top"></a>
-</td>
-</tr>
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/df9677ec-386f-4c56-a428-08bca25c54dc)](docs/migration-to-1.0.0.md)
@@ -590,6 +621,9 @@ Archived pre-1.0.0 plugin reference. New integrations should use the current Eve
 [Learn more](docs/migration-to-1.0.0.md)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/3a2357a1-c0c3-464a-8979-0d1cdfc9b0d4)](https://github.com/TEN-framework/ten-framework/tree/04cb80601374fa9e35b4e544b2dbd23286ca7763/ai_agents/agents/examples/voice-assistant-with-EverMemOS)
@@ -601,8 +635,6 @@ Add long-term memory to a real-time Live2D character, powered by [TEN Framework]
 [Code](https://github.com/TEN-framework/ten-framework/tree/04cb80601374fa9e35b4e544b2dbd23286ca7763/ai_agents/agents/examples/voice-assistant-with-EverMemOS)
 
 </td>
-</tr>
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/c36bdc04-97d3-4fe9-97d9-4b93b475595a)](https://screenshot-analysis-vercel.vercel.app/)
@@ -614,6 +646,9 @@ Run screenshot-based analysis with computer-use and store the results in memory.
 [Live Demo](https://screenshot-analysis-vercel.vercel.app/)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/54a7cf8f-62c4-4fbc-9d50-b214d034e051)](use-cases/game-of-throne-demo)
@@ -625,8 +660,6 @@ A demonstration of AI memory infrastructure through an interactive Q&A experienc
 [Code](use-cases/game-of-throne-demo)
 
 </td>
-</tr>
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/af37c1f6-7ba5-430c-b99d-2a7e7eac618f)](use-cases/claude-code-plugin)
@@ -638,6 +671,9 @@ Persistent memory for Claude Code. Automatically saves and recalls context from 
 [Code](use-cases/claude-code-plugin)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/d521d28c-0ccd-44ff-aecc-828245e2f973)](https://main.d2j21qxnymu6wl.amplifyapp.com/graph.html)
@@ -649,6 +685,7 @@ Explore stored entities and relationships in a graph interface. Frontend demo; b
 [Live Demo](https://main.d2j21qxnymu6wl.amplifyapp.com/graph.html)
 
 </td>
+<td width="50%" valign="top"></td>
 </tr>
 </table>
 
@@ -770,7 +807,7 @@ Contributions are welcome across the whole repository: memory methods, benchmark
 >
 > Help make EverOS better. Code, documentation, benchmark reports, use-case write-ups, and integration examples are all valuable. Share your projects on social media to inspire others.
 >
-> Connect with one of the EverOS maintainers [@elliotchen200](https://x.com/elliotchen200) on 𝕏 or [@cyfyifanchen](https://github.com/cyfyifanchen) on GitHub for project updates, discussions, and collaboration opportunities.
+> Connect with one of the EverOS maintainers [@elliotchen100](https://x.com/elliotchen100) on 𝕏 or [@cyfyifanchen](https://github.com/cyfyifanchen) on GitHub for project updates, discussions, and collaboration opportunities.
 
 ![divider](https://github.com/user-attachments/assets/2e2bbcc6-e6d8-4227-83c6-0620fc96f761#gh-light-mode-only)
 ![divider](https://github.com/user-attachments/assets/d57fad08-4f49-4a1c-bdfc-f659a5d86150#gh-dark-mode-only)

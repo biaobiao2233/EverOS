@@ -1,8 +1,8 @@
 > [!IMPORTANT]
-> **本 Fork 分支状态（2026-08-27）**
+> **本 Fork 分支状态（2026-09-07）**
 >
-> - `main`：跟踪最新官方 EverOS；已同步到 upstream `d48963c`（2026-08-26），包含 `v1.2.3` 及其后的官方提交，并保留本 fork 的说明文档。
-> - `production-v2`：当前真实生产对应的 Stage 3 源码线，已验收 runtime commit=`0ffd67c`。它基于较老 upstream `8f175d3`，**不声称已经与 1.2.x 合并或兼容**。
+> - `main`：跟踪最新官方 EverOS；已同步到 upstream `e8612b9`（2026-09-07），即官方 `v1.3.0`，并保留本 fork 的说明文档。
+> - `production-v2`：当前已验收生产源码 lineage，最新 source=`563ab9f`，依次包含 Stage 3、Wiki production、Publish identity repair 与 Cascade health repair。它基于较老 upstream `8f175d3`，**不声称已经与 `v1.3.0` 合并或兼容**。
 > - `memory-roadmap-candidate`：基于 `production-v2` 的下一代记忆质量候选，candidate=`913e345`；源码已通过 candidate review，但**尚未生产上线**。
 > - `production-optimized`：2026-07 的第一代生产强化历史分支，不再代表当前生产最新状态。
 >
@@ -32,6 +32,7 @@
 <br>
 
 - [为什么选择 EverOS](#为什么选择-everos)
+- [生态集成](#生态集成)
 - [快速开始](#快速开始)
 - [使用场景](#使用场景)
 - [文档](#文档)
@@ -91,6 +92,23 @@ agent trajectories 保存为可读 Markdown，并同步本地 SQLite 与 LanceDB
 <td><strong>Reflection</strong></td>
 <td>✅ 离线记忆进化：在 session 之间合并 episode clusters，并持续改进 profiles 和 skills</td>
 <td>❌ 通常只是 retrieval-only memory，缺少后台 consolidation 和长周期改进</td>
+</tr>
+</table>
+
+<br>
+
+## 生态集成
+
+EverOS 为下列 Agent 与工作流平台提供持久记忆，并已内置于 Raven。选择一个
+集成即可查看安装指南。
+
+<table width="100%">
+<tr>
+<td width="400" align="center"><a href="https://github.com/EverMind-AI/plugins/tree/main/dsh"><img src="https://avatars.githubusercontent.com/u/148330874?s=200&amp;v=4" alt="DeepSeek Harness" width="72"><br><strong>DeepSeek Harness</strong></a></td>
+<td width="400" align="center"><a href="https://github.com/EverMind-AI/plugins/tree/main/hermes"><img src="https://github.com/user-attachments/assets/477eebc4-e615-4425-921e-368d7667e491" alt="Hermes" width="72"><br><strong>Hermes</strong></a></td>
+<td width="400" align="center"><a href="https://github.com/EverMind-AI/plugins/tree/main/openclaw"><img src="https://github.com/user-attachments/assets/01d948fe-1e2b-48e8-9b32-b8057cb3f336" alt="OpenClaw" width="72"><br><strong>OpenClaw</strong></a></td>
+<td width="400" align="center"><a href="https://github.com/EverMind-AI/Raven"><img src="https://github.com/user-attachments/assets/27e1ea63-69d4-48b3-a884-7f0355926907" alt="Raven" width="72"><br><strong>Raven</strong></a></td>
+<td width="400" align="center"><a href="https://github.com/EverMind-AI/plugins#plugins"><img src="https://raw.githubusercontent.com/langgenius/dify/280f81757d5fdea9c2dd804483c7f70c2e95cd9a/web/public/logo/logo-site.png" alt="Dify" width="112"><br><strong>Dify</strong></a></td>
 </tr>
 </table>
 
@@ -314,6 +332,17 @@ make test
 <tr>
 <td width="50%" valign="top">
 
+[![AIUI Sports Agents for Smart Glasses](https://github.com/user-attachments/assets/7a8e6bca-6a12-4284-aa57-2f59fed7a6a2)](https://github.com/EasonZhu1997/AIUI-Sports-Agents)
+
+#### AIUI Sports Agents
+
+面向智能眼镜的运动 agents，覆盖跑步、骑行和室内划船。AISmartRun 提供用于跑后总结的可选记忆后端接口；接入 EverOS 需要单独配置后端服务。
+
+[代码](https://github.com/EasonZhu1997/AIUI-Sports-Agents)
+
+</td>
+<td width="50%" valign="top">
+
 [![banner-gif](https://github.com/user-attachments/assets/840470d7-a838-4c05-8685-dd797d4e9cdf)](https://evermind.ai/usecase_reunite)
 
 #### Reunite - 用 EverOS 找回连接
@@ -323,6 +352,9 @@ make test
 [了解更多](https://evermind.ai/usecase_reunite)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/7282b38b-56bf-4356-aa7b-06a845e7683d)](https://github.com/tt-a1i/hive)
@@ -334,9 +366,6 @@ make test
 [代码](https://github.com/tt-a1i/hive)
 
 </td>
-</tr>
-
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/867d9329-ce9a-496f-ab1e-15c77974e5fa)](https://github.com/tt-a1i/evermemos-mcp)
@@ -348,6 +377,9 @@ make test
 [代码](https://github.com/tt-a1i/evermemos-mcp)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/a4f0fd86-1c81-4445-bebc-e51eb5e33b30)](https://github.com/yuansui123/AI-Data-Technician-EverMemOS)
@@ -359,9 +391,6 @@ make test
 [代码](https://github.com/yuansui123/AI-Data-Technician-EverMemOS)
 
 </td>
-</tr>
-
-<tr>
 <td width="50%" valign="top">
 
 ![banner-gif](https://github.com/user-attachments/assets/650b901b-c9ba-4001-bac7-626b009df830)
@@ -373,6 +402,15 @@ make test
 即将推出
 
 </td>
+</tr>
+
+<tr>
+<td colspan="2" align="right">
+<a href="#readme-top"><img src="https://img.shields.io/badge/-Back_to_top-gray?style=flat-square" alt="Back to top"></a>
+</td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 ![banner-gif](https://github.com/user-attachments/assets/85b338b2-e48e-4a65-9f30-0bc6998df872)
@@ -384,15 +422,6 @@ make test
 即将推出
 
 </td>
-</tr>
-
-<tr>
-<td colspan="2" align="right">
-<a href="#readme-top"><img src="https://img.shields.io/badge/-Back_to_top-gray?style=flat-square" alt="Back to top"></a>
-</td>
-</tr>
-
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/f30617a1-adc0-4271-bc0e-c3a0b28cb903)](https://github.com/xunyud/Earth-Online)
@@ -404,6 +433,9 @@ Earth Online 是一款 memory-aware productivity game，把日常计划变成一
 [代码](https://github.com/xunyud/Earth-Online)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/57d8cda7-35a5-4561-b794-5520dffc917b)](https://github.com/golutra/golutra)
@@ -415,8 +447,6 @@ Golutra 为工程团队提供 multi-agent workforce，把 IDE 从单一 assistan
 [代码](https://github.com/golutra/golutra)
 
 </td>
-</tr>
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/75f19db5-30f6-4eed-9b1e-c9c6a0e6b7de)](https://github.com/Yangtze-Seventh/taste-verse)
@@ -428,6 +458,9 @@ Golutra 为工程团队提供 multi-agent workforce，把 IDE 从单一 assistan
 [代码](https://github.com/Yangtze-Seventh/taste-verse)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/93ac2a68-4f18-4fcb-8d87-80aeb00a9d7c)](https://github.com/kellyvv/OpenHer)
@@ -439,9 +472,6 @@ Golutra 为工程团队提供 multi-agent workforce，把 IDE 从单一 assistan
 [代码](https://github.com/kellyvv/OpenHer)
 
 </td>
-</tr>
-
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/550071c1-dc39-4964-9f67-ffdfad792345)](https://chromewebstore.google.com/detail/ruminer-browser-agent/lbccjohfpdpimbhpckljimgolndfmfif)
@@ -453,17 +483,6 @@ Ruminer 为 browser agent 带来持久记忆，让它能在不同网页任务之
 [插件](https://chromewebstore.google.com/detail/ruminer-browser-agent/lbccjohfpdpimbhpckljimgolndfmfif)
 
 </td>
-<td width="50%" valign="top">
-
-[![banner-gif](https://github.com/user-attachments/assets/c258a6c4-fe70-497a-98d1-3dade4a932f6)](https://github.com/nanxingw/EverMem)
-
-#### EverMem 与 EverOS 同步
-
-一条命令，把任意 AI coding CLI 连接到 EverMemOS 长期记忆。
-
-[代码](https://github.com/nanxingw/EverMem)
-
-</td>
 </tr>
 
 <tr>
@@ -473,6 +492,17 @@ Ruminer 为 browser agent 带来持久记忆，让它能在不同网页任务之
 </tr>
 
 <tr>
+<td width="50%" valign="top">
+
+[![banner-gif](https://github.com/user-attachments/assets/c258a6c4-fe70-497a-98d1-3dade4a932f6)](https://github.com/nanxingw/EverMem)
+
+#### EverMem 与 EverOS 同步
+
+一条命令，把任意 AI coding CLI 连接到 EverOS（原名 EverMemOS），获得长期记忆。
+
+[代码](https://github.com/nanxingw/EverMem)
+
+</td>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/39274473-ceb3-48fb-a031-e22230decbe2)](https://github.com/mco-org/mco)
@@ -484,6 +514,9 @@ MCO 为你的主 Agent 配备一个 agent team，让它们可以一起处理复�
 [代码](https://github.com/mco-org/mco)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/314c9126-8e08-4688-bbbb-8555ad58cf67)](https://github.com/onenewborn/StudyBuddy-public)
@@ -495,9 +528,6 @@ MCO 为你的主 Agent 配备一个 agent team，让它们可以一起处理复�
 [代码](https://github.com/onenewborn/StudyBuddy-public)
 
 </td>
-</tr>
-
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/21da76aa-9a8b-48e0-9134-42429d7390e7)](https://github.com/TonyLiangDesign/MemoCare)
@@ -509,6 +539,9 @@ MCO 为你的主 Agent 配备一个 agent team，让它们可以一起处理复�
 [代码](https://github.com/TonyLiangDesign/MemoCare)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/e2428df3-ea11-4e88-8f9c-dad437dd8998)](https://github.com/AlexL1024/NeuralConnect)
@@ -520,9 +553,6 @@ MCO 为你的主 Agent 配备一个 agent team，让它们可以一起处理复�
 [代码](https://github.com/AlexL1024/NeuralConnect)
 
 </td>
-</tr>
-
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/e6eaf308-a874-483f-8874-6934bf95a78f)](https://github.com/elontusk5219-prog/Mobi)
@@ -534,6 +564,15 @@ MCO 为你的主 Agent 配备一个 agent team，让它们可以一起处理复�
 [代码](https://github.com/elontusk5219-prog/Mobi)
 
 </td>
+</tr>
+
+<tr>
+<td colspan="2" align="right">
+<a href="#readme-top"><img src="https://img.shields.io/badge/-Back_to_top-gray?style=flat-square" alt="Back to top"></a>
+</td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/9aabcaa9-f97a-49d2-9109-0b5bb696ed41)](https://github.com/JaMesLiMers/EvermemCompetition-Spiro)
@@ -545,14 +584,6 @@ MCO 为你的主 Agent 配备一个 agent team，让它们可以一起处理复�
 [代码](https://github.com/JaMesLiMers/EvermemCompetition-Spiro)
 
 </td>
-</tr>
-
-<tr>
-<td colspan="2" align="right">
-<a href="#readme-top"><img src="https://img.shields.io/badge/-Back_to_top-gray?style=flat-square" alt="Back to top"></a>
-</td>
-</tr>
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/df9677ec-386f-4c56-a428-08bca25c54dc)](docs/migration-to-1.0.0.md)
@@ -564,6 +595,9 @@ MCO 为你的主 Agent 配备一个 agent team，让它们可以一起处理复�
 [了解更多](docs/migration-to-1.0.0.md)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/3a2357a1-c0c3-464a-8979-0d1cdfc9b0d4)](https://github.com/TEN-framework/ten-framework/tree/04cb80601374fa9e35b4e544b2dbd23286ca7763/ai_agents/agents/examples/voice-assistant-with-EverMemOS)
@@ -575,8 +609,6 @@ MCO 为你的主 Agent 配备一个 agent team，让它们可以一起处理复�
 [代码](https://github.com/TEN-framework/ten-framework/tree/04cb80601374fa9e35b4e544b2dbd23286ca7763/ai_agents/agents/examples/voice-assistant-with-EverMemOS)
 
 </td>
-</tr>
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/c36bdc04-97d3-4fe9-97d9-4b93b475595a)](https://screenshot-analysis-vercel.vercel.app/)
@@ -588,6 +620,9 @@ MCO 为你的主 Agent 配备一个 agent team，让它们可以一起处理复�
 [在线演示](https://screenshot-analysis-vercel.vercel.app/)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/54a7cf8f-62c4-4fbc-9d50-b214d034e051)](use-cases/game-of-throne-demo)
@@ -599,8 +634,6 @@ MCO 为你的主 Agent 配备一个 agent team，让它们可以一起处理复�
 [代码](use-cases/game-of-throne-demo)
 
 </td>
-</tr>
-<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/af37c1f6-7ba5-430c-b99d-2a7e7eac618f)](use-cases/claude-code-plugin)
@@ -612,6 +645,9 @@ Claude Code 的持久记忆插件。自动保存并回忆过去 coding sessions 
 [代码](use-cases/claude-code-plugin)
 
 </td>
+</tr>
+
+<tr>
 <td width="50%" valign="top">
 
 [![banner-gif](https://github.com/user-attachments/assets/d521d28c-0ccd-44ff-aecc-828245e2f973)](https://main.d2j21qxnymu6wl.amplifyapp.com/graph.html)
@@ -623,6 +659,7 @@ Claude Code 的持久记忆插件。自动保存并回忆过去 coding sessions 
 [在线演示](https://main.d2j21qxnymu6wl.amplifyapp.com/graph.html)
 
 </td>
+<td width="50%" valign="top"></td>
 </tr>
 </table>
 
@@ -745,7 +782,7 @@ EverMind 将记忆研究、可直接使用的产品与实际集成连接为一�
 > 一起让 EverOS 变得更好。代码、文档、benchmark reports、use-case write-ups
 > 和 integration examples 都很有价值。也欢迎在社交媒体上分享你的项目，启发更多人。
 >
-> 你可以在 𝕏 上联系 EverOS maintainer [@elliotchen200](https://x.com/elliotchen200)，
+> 你可以在 𝕏 上联系 EverOS maintainer [@elliotchen100](https://x.com/elliotchen100)，
 > 或在 GitHub 上联系 [@cyfyifanchen](https://github.com/cyfyifanchen)，获取项目更新、
 > 讨论和协作机会。
 

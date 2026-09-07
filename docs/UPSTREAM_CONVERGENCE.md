@@ -1,13 +1,14 @@
 # Upstream convergence plan
 
-Updated: 2026-08-27
+Updated: 2026-09-07
 
-Goal: converge the fork's accepted `production-v2` capabilities onto current upstream EverOS **without** treating an old production branch as if it were already compatible with upstream 1.2.x.
+Goal: converge the fork's accepted `production-v2` capabilities onto current upstream EverOS **without** treating an old production branch as if it were already compatible with upstream `v1.3.0`.
 
 ## Baselines
 
-- Current upstream anchor: `d48963c` (2026-08-26; includes tag `v1.2.3` plus later upstream commits).
-- Accepted production-derived Stage 3 anchor: `0ffd67c`.
+- Current upstream anchor: `e8612b9` (2026-09-07; official tag `v1.3.0`).
+- Current accepted production source lineage: `0ffd67c → 638dcd6 → 64c0ff7 → 563ab9f`.
+- Stage 3 boundary: `0ffd67c`; latest accepted source: `563ab9f`.
 - Memory-roadmap candidate: `913e345`, based on Stage 3 and not yet production.
 - Historical production-v2 common upstream base: `8f175d3`.
 
@@ -15,7 +16,7 @@ Goal: converge the fork's accepted `production-v2` capabilities onto current ups
 
 ### 1. Stage 1 production-hardening classification
 
-Compare the old production hardening against upstream 1.2.1–1.2.3 first. Upstream has since added substantial Cascade/LanceDB hardening, path-safety work, retry/backoff, background-loop supervision, Agent Skill rescue, health readiness, rebuild/backfill tooling, and capability degradation.
+Compare the old production hardening against current upstream through `v1.3.0`. Upstream has added substantial Cascade/LanceDB hardening, path-safety work, retry/backoff, background-loop supervision, Agent Skill rescue, health readiness, rebuild/backfill tooling, capability degradation, a derived-index abstraction, and optional Milvus support.
 
 For each old Stage 1 delta, classify it as:
 
@@ -44,9 +45,9 @@ Port the durable receipt and explicit publish-authority model as a bounded featu
 
 This slice is expected to remain materially unique to the fork and should receive dedicated API/SQLite/integration tests on the new upstream baseline.
 
-### 4. Production-only operational extensions
+### 4. Wiki, ingest-repair, and production-only operational extensions
 
-Reassess older fork-only additions such as private admin APIs, optional bearer protection, local CLI provider integration, and deployment-specific recovery helpers. Keep generic reusable capability separate from workstation/server-specific configuration.
+Reassess the deterministic Wiki surface, the Publish-identity/recovery repair, the Cascade-health repair, and older fork-only additions such as private admin APIs, optional bearer protection, local CLI provider integration, and deployment-specific recovery helpers. Keep generic reusable capability separate from workstation/server-specific configuration.
 
 ### 5. Memory roadmap only after runtime convergence
 
