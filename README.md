@@ -14,21 +14,24 @@
 </div>
 
 > [!IMPORTANT]
-> **Production-optimized fork / 生产优化分支**
+> **`production-v2` — accepted production source lineage / 已验收生产源码线**
 >
-> This branch contains production-derived reliability and security hardening
-> based on upstream commit `8f175d3`: durable idempotent writes, cross-process
-> session locks, atomic recovery checkpoints, append-once Markdown persistence,
-> OME/Cascade stability fixes, safer extraction prompts, optional API bearer
-> auth, and a sandboxed local Antigravity CLI text provider.
+> Latest accepted source lineage: **`563ab9f`** (2026-08-30), descending from
+> Stage 3 `0ffd67c` → Wiki production `638dcd6` → ingest identity repair
+> `64c0ff7` → Cascade health repair `563ab9f`. The immutable source tag is
+> **`production-v2-source-20260830`**; the older Stage 3 boundary remains tagged
+> **`production-v2-stage3-20260826`**.
 >
-> 本分支是基于真实长期运行环境整理的生产优化版。完整的原版差异、每个处理
-> 环节所用组件、部署方式、安全边界和已知限制见
-> **[PRODUCTION_OPTIMIZED.md](PRODUCTION_OPTIMIZED.md)**。
+> 这条分支公开的是当前已验收的生产源码 lineage：Stage 3 deferred ingest、
+> deterministic Memory Wiki、Publish identity repair，以及 Cascade health 修复。
+> 生产环境按 reviewed file set 分阶段上线，因此这个 Git 分支是**已验收源码线**，
+> 不是服务器文件系统或运行时数据库的镜像。详见
+> **[PRODUCTION_V2_STATUS.md](PRODUCTION_V2_STATUS.md)**。
 >
-> This branch is based on an older upstream commit and does **not** claim 1.2.x
-> compatibility. Personal credentials, conversations, server addresses, and
-> runtime databases are not included.
+> This source line still descends from older upstream `8f175d3` and does **not**
+> claim convergence or compatibility with current upstream EverOS `v1.3.0`.
+> Upstream tracking stays on `main`. Personal credentials, conversations,
+> server addresses, `.env` runtime configuration, and databases are not included.
 
 
 <br>
