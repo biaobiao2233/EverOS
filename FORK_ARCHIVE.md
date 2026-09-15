@@ -8,7 +8,7 @@ repository rewrote its architecture.
 | Branch | Base | Purpose |
 | --- | --- | --- |
 | `main` | Current `EverMind-AI/EverOS` main | Upstream-compatible mirror with this archive notice |
-| `fix/api-key-rotator-and-profile-scene` | `0f14d05` (pre-rewrite) | Two fixes for the old `methods/EverCore/...` architecture |
+| `fix/api-key-rotator-and-profile-scene` | `0f14d05` (pre-rewrite) | Two fixes for the pre-rewrite `methods/` architecture |
 
 ## Preserved fixes
 

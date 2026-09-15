@@ -51,9 +51,13 @@ def _default_range() -> str:
 
 
 def _commit_rows(commit_range: str) -> list[tuple[str, str, str]]:
+    log_args = ["log"]
+    if os.getenv("GITHUB_EVENT_NAME") == "push":
+        # Do not re-lint commits imported through a merge's secondary parents.
+        log_args.append("--first-parent")
     output = _run_git(
         [
-            "log",
+            *log_args,
             "--format=%H%x00%s%x00%P",
             commit_range,
         ]
